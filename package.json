@@ -1,0 +1,36 @@
+{
+  "name": "agent-framework-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.1.3",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "lint": "eslint .",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
+    "demo": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo dev",
+    "demo:complex": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo complex",
+    "demo:ark": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo ark:glm"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.0",
+    "@babel/plugin-proposal-decorators": "^7.29.0",
+    "@babel/preset-typescript": "^7.28.5",
+    "@eslint/js": "^10.0.1",
+    "@types/babel__core": "^7.20.5",
+    "@types/node": "^25.9.1",
+    "eslint": "^10.4.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.6.0",
+    "prettier": "^3.8.3",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.4",
+    "vite": "^8.0.13",
+    "vite-node": "^6.0.0"
+  }
+}

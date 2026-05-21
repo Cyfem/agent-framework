@@ -1,0 +1,21 @@
+{
+  "name": "@manee/agent-framework-demo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite-node src/main.ts",
+    "complex": "vite-node src/complex.ts",
+    "ark:glm": "vite-node src/ark-glm.ts",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@manee/agent-framework": "workspace:*",
+    "zod": "^4.4.3"
+  }
+}
