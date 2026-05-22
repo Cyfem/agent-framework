@@ -98,6 +98,8 @@ async function runArkGlmDemo(apiKey: string): Promise<void> {
     console.log(`status: failed raw=${rawContext.length} context=${context.length}`);
   });
 
+  agent.init();
+
   console.log(`ark demo: baseURL=${baseURL} model=${modelName}`);
 
   const finalContext = await agent.agent(

@@ -20,6 +20,34 @@ const defaultArkModel = 'glm-5.1';
 
 let memoryDescriptionBuilds = 0;
 
+class QualityReviewAgent extends Agent {
+  static name = 'quality-reviewer';
+  static description = 'Reviews the parent agent demo state and returns a concise quality summary.';
+
+  @Tool({
+    name: 'review-checklist',
+    description:
+      'Review a demo artifact against a short checklist and return a compact pass/fail summary.',
+    parameters: z.object({
+      artifact: z.string().min(1),
+      checklist: z.array(z.string().min(1)).min(1),
+    }),
+  })
+  #reviewChecklist(parameters: unknown): Record<string, unknown> {
+    const { artifact, checklist } = parameters as {
+      artifact: string;
+      checklist: string[];
+    };
+
+    return {
+      artifact,
+      checked: checklist,
+      passed: true,
+      summary: `reviewed ${artifact} with ${checklist.length} checklist item(s)`,
+    };
+  }
+}
+
 class ArkComplexDemoAgent extends Agent {
   #nextTicketId = 1;
   #tickets = new Map<string, Ticket>();
@@ -215,8 +243,27 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   const modelName = process.env.ARK_MODEL ?? defaultArkModel;
   const toolErrors: string[] = [];
   const modelResponses: string[] = [];
+  const calledTools = new Set<string>();
   let runtimeInjectionDone = false;
   let unsubscribedModelResponses = 0;
+  let runtimeStateReportCalls = 0;
+  const restoredContext: AgentContext[] = [
+    {
+      role: 'user',
+      content: 'Previous Ark demo warm-up request.',
+    },
+    {
+      role: 'assistant',
+      content: 'Previous Ark demo warm-up response.',
+    },
+  ];
+  const restoredHistory: AgentContext[] = [
+    ...restoredContext,
+    {
+      role: 'user',
+      content: 'Raw history can include messages outside the active context.',
+    },
+  ];
 
   const agent = new ArkComplexDemoAgent({
     llm: new OpenAIModel({
@@ -224,6 +271,9 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
       baseURL,
       model: modelName,
     }),
+    initContext: restoredContext,
+    initRawContext: restoredHistory,
+    subAgents: [QualityReviewAgent],
     // maxIterations: 12,
     systemPrompts: [
       'You are running an automated integration demo for a Node.js agent framework through Ark Coding Plan.',
@@ -236,10 +286,12 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
         '5. call estimate-effort with ticketId "T-1", points 3, confidence 0.8.',
         '6. call search-memory with query "tool" and limit 3.',
         '7. call summarize-board.',
-        '8. call risky-operation with operation "delete-demo-state"; this is expected to be canceled.',
-        '9. call unstable-tool with reason "intentional calling-stage failure"; this is expected to fail.',
-        '10. call summarize-board again.',
-        '11. after all tool results have been observed, call end-agent by itself.',
+        '8. call runtime-state-report.',
+        '9. call agent with agentName "quality-reviewer", input asking it to review ticket T-1 and the framework demo coverage, and outputDescription "A concise quality review summary string."',
+        '10. call risky-operation with operation "delete-demo-state"; this is expected to be canceled.',
+        '11. call unstable-tool with reason "intentional calling-stage failure"; this is expected to fail.',
+        '12. call summarize-board again.',
+        '13. after all tool results have been observed, call end-agent by itself.',
       ].join('\n'),
       'Do not ask follow-up questions. Do not finish with natural language only.',
     ],
@@ -260,10 +312,26 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
     ],
   });
 
+  agent.tools.push({
+    name: 'runtime-state-report',
+    description:
+      'Runtime-only tool pushed directly into agent.tools before init. It reports context, history, and static tool metadata.',
+    handler: () => {
+      runtimeStateReportCalls += 1;
+
+      return {
+        contextMessages: agent.getContext().length,
+        historyMessages: agent.getHistory().length,
+        staticTools: ArkComplexDemoAgent.toolsDefinition.map((tool) => tool.name),
+        subAgentStaticTools: QualityReviewAgent.toolsDefinition.map((tool) => tool.name),
+      };
+    },
+  });
+
   agent.addSystemPrompts('This system prompt was added before the first Ark model request.');
   agent.addSkill({
     name: 'runtime-skill-before-run',
-    description: 'Added before the first model request and visible in get-skill descriptions.',
+    description: 'Added before the first model request and visible in the skill system prompt.',
   });
 
   const unsubscribeModelResponse = agent.onModelResponse(() => {
@@ -298,6 +366,31 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   agent.onAgentStatusChanged('failed', (rawContext, context) => {
     console.log(`status failed: raw=${rawContext.length}, context=${context.length}`);
   });
+
+  for (const toolName of [
+    'get-skill',
+    'read-project-config',
+    'create-ticket',
+    'append-ticket-note',
+    'estimate-effort',
+    'search-memory',
+    'summarize-board',
+    'runtime-state-report',
+    'agent',
+    'risky-operation',
+    'unstable-tool',
+    'end-agent',
+  ]) {
+    agent.onBeforeToolCall(
+      toolName,
+      () => {
+        calledTools.add(toolName);
+      },
+      {
+        await: true,
+      },
+    );
+  }
 
   agent.onBeforeToolCall(
     'create-ticket',
@@ -371,12 +464,21 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
     console.log(`agent error event: ${error.message}`);
   });
 
+  agent.init();
+
   console.log(`ark complex demo: baseURL=${baseURL} model=${modelName}`);
+  console.log(`restored context messages before run=${agent.getContext().length}`);
+  console.log(`restored history messages before run=${agent.getHistory().length}`);
+  console.log(
+    `static tools: parent=${ArkComplexDemoAgent.toolsDefinition
+      .map((tool) => tool.name)
+      .join(',')} sub=${QualityReviewAgent.toolsDefinition.map((tool) => tool.name).join(',')}`,
+  );
 
   const finalContext = await agent.agent(
     [
       'Run the complex Ark Coding Plan integration demo.',
-      'Please exercise the listed tools and expected error paths.',
+      'Please exercise the listed tools, the quality-reviewer sub-agent, runtime tool, restored context/history, and expected error paths.',
       'When the scenario is complete, call end-agent alone.',
     ].join('\n'),
   );
@@ -390,9 +492,11 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   console.log(`dynamic description builds=${memoryDescriptionBuilds}`);
   console.log(`model responses=${modelResponses.length}`);
   console.log(`tool errors observed=${toolErrors.length}`);
+  console.log(`tools called=${[...calledTools].sort().join(',')}`);
+  console.log(`runtime-state-report calls=${runtimeStateReportCalls}`);
   console.log(`unsubscribed model responses=${unsubscribedModelResponses}`);
 
-  console.log('context:',agent.getContext());
+  console.log('context:', agent.getContext());
 
   await runExpectedAgentErrorDemo(agent);
 }

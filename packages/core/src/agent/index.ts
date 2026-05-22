@@ -1,9 +1,10 @@
 import { z } from 'zod';
 
-import { getDecoratedTools, Tool } from './decorators';
+import { getToolDefinitions, Tool } from './decorators';
 import { getDefaultToolParametersSchema, toOpenAIToolParameters } from './schema';
 import type {
   AfterToolCallCallback,
+  AgentConstructor,
   AgentContext,
   AgentErrorCallback,
   AgentOptions,
@@ -16,6 +17,7 @@ import type {
   ModelResponseCallback,
   ModelToolDefinition,
   ToolCallErrorCallback,
+  ToolDefinition,
   ToolEventOptions,
   ToolRuntimeDefinition,
   Unsubscribe,
@@ -35,17 +37,29 @@ interface AgentStatusListener {
 const beforeToolErrorPrefix = '函数调用的前置工作出现异常，异常为：';
 const internalEndAgentPrompt =
   '框架约束：当任务完成时，必须单独调用 end-agent 工具结束任务；不能仅用自然语言回答表示结束，也不能把 end-agent 与其他工具放在同一轮调用。';
+const toolsStorageKey: unique symbol = Symbol('agent.tools');
+
+interface ToolsStorageCarrier {
+  [toolsStorageKey]?: ToolRuntimeDefinition[];
+}
 
 export class Agent {
+  get tools(): ToolRuntimeDefinition[] {
+    return getToolsStorage(this);
+  }
+
+  set tools(tools: ToolRuntimeDefinition[]) {
+    setToolsStorage(this, tools);
+  }
+
   #rawContext: AgentContext[] = [];
   #context: AgentContext[] = [];
   #skills: AgentSkill[] = [];
-  #tools: ToolRuntimeDefinition[] = [];
-  #toolsCollected = false;
   #systemPrompts: string[] = [];
   #status: AgentStatus = 'idle';
   #maxIterations: number | undefined;
   #llm: AgentOptions['llm'];
+  #initialized = false;
 
   #beforeToolListeners: ToolEventListener<BeforeToolCallCallback>[] = [];
   #afterToolListeners: ToolEventListener<AfterToolCallCallback>[] = [];
@@ -55,9 +69,93 @@ export class Agent {
 
   #agentErrorListeners: AgentErrorCallback[] = [];
 
+  static description?: string; // agent 的描述
+  subAgents: AgentConstructor[] = []; // agent 的子 agent 列表
+
+  static get toolsDefinition(): readonly ToolDefinition[] {
+    return getToolDefinitions(this);
+  }
+
+  @Tool({
+    name: 'agent',
+    description: ({ subAgents }) => {
+      const agentList =
+        subAgents.length === 0
+          ? '当前没有可调度的子代理。'
+          : subAgents.map(formatSubAgentDescription).join('\n\n');
+
+      return [
+        '这是一个子代理调度工具，当你需要调用一个子代理来完成某个任务时，请使用这个工具。调用时请在参数中说明需要调用的子代理名称和输入子代理的内容。',
+        '每次调度同一子代理都是全新的代理，并且可以同时调度多个相同子代理。',
+        '调度子代理时，需要指定任务的描述，以及需要子代理最后汇报你的东西的描述。比如如果是一个任务，那需要汇报你任务的报告；如果是需要一个问题的答案，则是问题的回答。',
+        '以下是当前可用的子代理列表：',
+        agentList,
+      ].join('\n\n');
+    },
+    parameters: z.object({
+      agentName: z.string().describe('要调用的子代理名称'),
+      input: z.string().describe('输入子代理的内容'),
+      outputDescription: z
+        .string()
+        .describe('需要让子代理最后交付你的东西的描述，比如任务的报告、问题的回答'),
+    }),
+  })
+  async #toolSubAgent(parameters: unknown): Promise<string> {
+    const { agentName, input, outputDescription } = parameters as {
+      agentName: string;
+      input: string;
+      outputDescription: string;
+    };
+    const TargetAgent = this.subAgents.find((agent) => agent.name === agentName);
+
+    if (!TargetAgent) {
+      return `没有找到名称为 ${agentName} 的子代理。`;
+    }
+
+    let agentResult: string | undefined;
+    const BaseSubAgent = TargetAgent as typeof Agent;
+
+    class RuntimeSubAgent extends BaseSubAgent {
+      @Tool({
+        name: 'agent-result',
+        description: `这是一个结果汇报工具，你需要在完成任务后调用这个工具把结果汇报回来`,
+        parameters: z.object({
+          result: z.string().describe(outputDescription),
+        }),
+      })
+      #reportResult(parameters: unknown): string {
+        const { result } = parameters as { result: string };
+
+        agentResult = result;
+        return result;
+      }
+    }
+
+    const subAgent = new RuntimeSubAgent({
+      llm: this.#llm,
+      systemPrompts: [
+        `你现在是被主代理调度的子代理：${agentName}。`,
+        `主代理输入给你的任务：\n${input}`,
+        [
+          '完成任务后，调用 end-agent 前必须先调用 agent-result 工具把结果汇报回来。',
+          `agent-result.result 必须满足如下交付描述：\n${outputDescription}`,
+        ].join('\n'),
+      ],
+    });
+
+    subAgent.init();
+    await subAgent.agent(input);
+
+    return agentResult ?? '子代理已结束但未通过 agent-result 汇报结果。';
+  }
+
   constructor(options: AgentOptions) {
     this.#llm = options.llm;
     this.#maxIterations = options.maxIterations;
+    this.#context = [...(options.initContext ?? options.initRawContext ?? [])];
+    this.#rawContext = [...(options.initRawContext ?? options.initContext ?? [])];
+    this.tools ??= [];
+    this.subAgents = [...(options.subAgents ?? [])];
 
     if (
       this.#maxIterations !== undefined &&
@@ -76,6 +174,15 @@ export class Agent {
 
   getContext(): readonly AgentContext[] {
     return [...this.#context];
+  }
+
+  init(): this {
+    this.#initialized = false;
+    this.#assertUniqueToolNames();
+    this.#assertUniqueSubAgentNames();
+    this.#initialized = true;
+
+    return this;
   }
 
   addSystemPrompts(...prompts: string[]): this {
@@ -138,22 +245,7 @@ export class Agent {
 
   @Tool({
     name: 'get-skill',
-    description: ({ skills }) => {
-      const skillList =
-        skills.length === 0
-          ? '当前没有可查询的技能手册。'
-          : skills
-              .map(
-                (skill, index) =>
-                  `技能手册${index}：\n名称：${skill.name}\n描述：${skill.description}`,
-              )
-              .join('\n\n');
-
-      return [
-        '这是一个技能手册查询工具，当正在执行的任务匹配到如下的技能手册描述时，应当先使用该工具查询手册具体内容，然后看手册内有无具体解决该任务的工作流；如果匹配到具体工作流，则使用该工作流解决问题。',
-        skillList,
-      ].join('\n\n');
-    },
+    description: '获取指定下标的技能手册完整内容。',
     parameters: z.object({
       index: z.number().int().nonnegative(),
     }),
@@ -189,9 +281,9 @@ export class Agent {
   }
 
   async toolCall(callInfo: AgentToolCall): Promise<AgentToolMessage> {
-    this.#ensureToolsCollected();
+    this.#assertInitialized();
 
-    const tool = this.#tools.find((candidate) => candidate.name === callInfo.name);
+    const tool = this.tools.find((candidate) => candidate.name === callInfo.name);
     const fallbackParameters: unknown = {};
 
     if (!tool) {
@@ -231,13 +323,18 @@ export class Agent {
   }
 
   async agent(message: string, stream = false): Promise<AgentContext[]> {
+    let shouldFailOnError = true;
+
     try {
-      if (stream) {
-        throw new Error('Agent streaming is not supported in this version.');
-      }
+      this.#assertInitialized();
 
       if (this.#status === 'running') {
+        shouldFailOnError = false;
         throw new Error('Agent is already running.');
+      }
+
+      if (stream) {
+        throw new Error('Agent streaming is not supported in this version.');
       }
 
       this.#appendMessage({
@@ -278,7 +375,7 @@ export class Agent {
     } catch (error) {
       const agentError = toError(error);
 
-      if (this.#status !== 'ended') {
+      if (shouldFailOnError && this.#status !== 'ended') {
         this.#changeStatus('failed');
       }
 
@@ -288,45 +385,69 @@ export class Agent {
     }
   }
 
-  #collectTools(): ToolRuntimeDefinition[] {
-    const tools = getDecoratedTools(this);
+  #assertUniqueToolNames(): void {
+    this.tools ??= [];
     const seen = new Set<string>();
 
-    for (const tool of tools) {
+    for (const tool of this.tools) {
       if (seen.has(tool.name)) {
         throw new Error(`Duplicate tool name: ${tool.name}`);
       }
 
       seen.add(tool.name);
     }
-
-    return tools;
   }
 
-  #ensureToolsCollected(): void {
-    if (this.#toolsCollected) {
-      return;
-    }
+  #assertUniqueSubAgentNames(): void {
+    const seen = new Set<string>();
 
-    this.#tools = this.#collectTools();
-    this.#toolsCollected = true;
+    for (const agent of this.subAgents) {
+      if (seen.has(agent.name)) {
+        throw new Error(`Duplicate sub-agent name: ${agent.name}`);
+      }
+
+      seen.add(agent.name);
+    }
+  }
+
+  #assertInitialized(): void {
+    if (!this.#initialized) {
+      throw new Error('Agent has not been initialized. Call init() before agent().');
+    }
   }
 
   #buildMessagesForModel(): AgentContext[] {
-    const systemMessages: AgentContext[] = [internalEndAgentPrompt, ...this.#systemPrompts].map(
-      (content) => ({
-        role: 'system',
-        content,
-      }),
-    );
+    const systemMessages: AgentContext[] = [
+      internalEndAgentPrompt,
+      this.#buildSkillPrompt(),
+      ...this.#systemPrompts,
+    ].map((content) => ({
+      role: 'system',
+      content,
+    }));
 
     return [...systemMessages, ...this.#context];
   }
 
-  #buildToolsForModel(): ModelToolDefinition[] {
-    this.#ensureToolsCollected();
+  #buildSkillPrompt(): string {
+    const skillList =
+      this.#skills.length === 0
+        ? '当前没有可查询的技能手册，不要调用 get-skill。'
+        : this.#skills
+            .map(
+              (skill, index) =>
+                `技能手册${index}：\n名称：${skill.name}\n描述：${skill.description}`,
+            )
+            .join('\n\n');
 
-    return this.#tools.map((tool) => {
+    return [
+      '框架技能约束：当正在执行的任务匹配到如下技能手册描述时，必须先调用 get-skill 工具获取对应下标的完整手册内容，然后检查手册内是否有具体工作流；如果匹配到具体工作流，必须按照该工作流执行。',
+      skillList,
+    ].join('\n\n');
+  }
+
+  #buildToolsForModel(): ModelToolDefinition[] {
+    return this.tools.map((tool) => {
       const toolContext: {
         name: string;
         parameters?: NonNullable<ToolRuntimeDefinition['parameters']>;
@@ -342,6 +463,7 @@ export class Agent {
         typeof tool.description === 'function'
           ? tool.description({
               skills: [...this.#skills],
+              subAgents: [...this.subAgents],
               context: [...this.#context],
               history: [...this.#rawContext],
               systemPrompts: [...this.#systemPrompts],
@@ -604,6 +726,42 @@ function normalizeErrorMessage(error: unknown): string {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function getToolsStorage(agent: object): ToolRuntimeDefinition[] {
+  const carrier = agent as ToolsStorageCarrier;
+
+  carrier[toolsStorageKey] ??= [];
+
+  return carrier[toolsStorageKey];
+}
+
+function setToolsStorage(agent: object, tools: ToolRuntimeDefinition[]): void {
+  const carrier = agent as ToolsStorageCarrier;
+
+  carrier[toolsStorageKey] = tools;
+}
+
+function formatSubAgentDescription(agent: AgentConstructor, index: number): string {
+  const toolList =
+    agent.toolsDefinition.length === 0
+      ? '    当前子代理没有声明工具能力。'
+      : agent.toolsDefinition.map(formatStaticToolDescription).join('\n');
+
+  return [
+    `子代理${index + 1}：`,
+    `  名称：${agent.name || '未命名代理'}`,
+    `  描述：${agent.description ?? '未提供描述。'}`,
+    '  工具能力：',
+    toolList,
+  ].join('\n');
+}
+
+function formatStaticToolDescription(tool: ToolDefinition, index: number): string {
+  return [
+    `    - 工具${index + 1}：${tool.name}`,
+    `      描述：${typeof tool.description === 'function' ? '动态描述，运行时生成。' : tool.description}`,
+  ].join('\n');
 }
 
 export { Tool };

@@ -66,6 +66,7 @@ export interface AgentSkill {
 
 export interface ToolDescriptionContext {
   skills: readonly AgentSkill[];
+  subAgents: readonly AgentConstructor[];
   context: readonly AgentContext[];
   history: readonly AgentContext[];
   systemPrompts: readonly string[];
@@ -115,12 +116,27 @@ export interface ModelChatResponse {
   raw?: unknown;
 }
 
+export interface AgentInstance {
+  init(): this;
+  agent(message: string, stream?: boolean): Promise<AgentContext[]>;
+}
+
+export interface AgentConstructor<TAgent extends AgentInstance = AgentInstance> {
+  new (options: AgentOptions): TAgent;
+  readonly name: string;
+  readonly description?: string;
+  readonly toolsDefinition: readonly ToolDefinition[];
+}
+
 export interface AgentOptions {
   llm: {
     chat(request: ModelChatRequest): Promise<ModelChatResponse>;
   };
   skills?: readonly AgentSkill[];
+  subAgents?: readonly AgentConstructor[];
   systemPrompts?: readonly string[];
+  initContext?: readonly AgentContext[];
+  initRawContext?: readonly AgentContext[];
   maxIterations?: number;
 }
 

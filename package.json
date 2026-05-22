@@ -15,7 +15,8 @@
     "format:check": "prettier . --check",
     "demo": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo dev",
     "demo:complex": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo complex",
-    "demo:ark": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo ark:glm"
+    "demo:ark": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo ark:full",
+    "demo:ark:smoke": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo ark:smoke"
   },
   "devDependencies": {
     "@babel/core": "^7.29.0",

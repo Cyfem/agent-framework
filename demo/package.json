@@ -9,6 +9,8 @@
   "scripts": {
     "dev": "vite-node src/main.ts",
     "complex": "vite-node src/complex.ts",
+    "ark:full": "vite-node src/complex.ts",
+    "ark:smoke": "vite-node src/ark-glm.ts",
     "ark:glm": "vite-node src/ark-glm.ts",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
