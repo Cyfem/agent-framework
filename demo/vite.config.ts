@@ -5,6 +5,7 @@ import { defineConfig, type Plugin } from 'vite';
 const entry = fileURLToPath(new URL('./src/main.ts', import.meta.url));
 const coreEntry = fileURLToPath(new URL('../packages/core/src/index.ts', import.meta.url));
 
+/** 使用与发布包一致的 Babel 转换链处理 demo 中的 2023-11 decorators。 */
 function decoratorsBabelPlugin(): Plugin {
   return {
     name: 'babel-2023-11-decorators',
@@ -38,6 +39,7 @@ export default defineConfig({
   plugins: [decoratorsBabelPlugin()],
   resolve: {
     alias: {
+      // 在工作区内直接验证 core 源码，不要求先将本地包发布到 npm。
       '@manee/agent-framework': coreEntry,
     },
   },

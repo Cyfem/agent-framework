@@ -45,7 +45,7 @@ $env:ARK_WINDOWS_DEMO_INTERACTIVE="1"
 pnpm demo:windows
 ```
 
-Windows demo 默认连接方舟 `api/v3` endpoint 和 `doubao-seed-2-0-pro-260215`，截图会通过 Files API 上传并以 `input_image.file_id` 进入后续 Responses input，不会把 base64 图像塞入工具结果。
+Windows demo 默认连接方舟 `api/coding/v3` 接口和 `doubao-seed-2-0-pro-260215`，截图会通过 Files API 上传并以 `input_image.file_id` 进入后续 Responses input，不会把 base64 图像塞入工具结果。
 
 ## 示例
 
@@ -56,3 +56,7 @@ Windows demo 默认连接方舟 `api/v3` endpoint 和 `doubao-seed-2-0-pro-26021
 - `demo/src/finance-news-smoke.ts`：离线新闻工具链回归。
 
 发布包用户文档位于 [packages/core/README.md](./packages/core/README.md)。
+
+## 注释与声明
+
+`packages/core/src` 的公开 API 使用中文 TSDoc，构建出的类型声明会携带这些说明；`demo/src` 中的模块级注释用于说明各验证场景的数据流和安全边界。

@@ -3,5 +3,6 @@ dist/
 coverage/
 .vite/
 .artifacts/
+demo/.env
 *.log
 .DS_Store

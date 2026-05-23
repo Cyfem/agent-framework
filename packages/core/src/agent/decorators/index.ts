@@ -7,10 +7,10 @@ interface ToolInitializerReceiver {
 }
 
 /**
- * Declare an Agent method as a callable tool.
+ * 将 Agent 方法声明为可被模型调用的工具。
  *
- * The decorator stores static metadata on the class for `toolsDefinition` and
- * registers a bound runtime handler on each instance.
+ * 装饰器在类级 metadata 中记录 `toolsDefinition` 静态定义，并为每个实例
+ * 注册绑定后的运行时 handler。
  */
 export function Tool(definition: ToolDefinition) {
   return function (value: unknown, context: ClassMethodDecoratorContext) {
@@ -20,12 +20,13 @@ export function Tool(definition: ToolDefinition) {
 
     const method = value as (this: object, parameters: unknown) => unknown | Promise<unknown>;
 
-    // 2023-11 decorator metadata is class-level. Copy inherited arrays before
-    // appending so subclass tools do not mutate parent `toolsDefinition`.
+    // 2023-11 decorator metadata 位于类级别；写入前复制继承数组，避免子类工具
+    // 污染父类的 `toolsDefinition`。
     registerToolDefinition(context.metadata as Record<PropertyKey, unknown>, {
       ...definition,
     });
 
+    // initializer 绑定当前实例，使 private method 也能安全作为运行时工具执行。
     context.addInitializer(function (this: unknown) {
       if (typeof this !== 'object' || this === null) {
         return;
@@ -42,7 +43,7 @@ export function Tool(definition: ToolDefinition) {
   };
 }
 
-/** Return shallow-copied static tool definitions for a class constructor. */
+/** 获取类构造器的静态工具定义浅拷贝，避免外部修改内部定义数组。 */
 export function getToolDefinitions(target: object): ToolDefinition[] {
   const metadata = (target as Record<PropertyKey, unknown>)[getMetadataSymbol()] as
     | Record<PropertyKey, unknown>

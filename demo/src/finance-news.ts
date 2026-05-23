@@ -1,3 +1,6 @@
+/**
+ * 真实金融新闻 demo：让方舟模型调度 RSS 工具链，生成带来源链接的中文市场简报。
+ */
 import { OpenAIModel, type AgentResponseOutputItem } from '@manee/agent-framework';
 
 import { FinanceMarketNewsAgent } from './finance-news/agent';
@@ -19,6 +22,7 @@ if (!apiKey) {
   await runFinanceNewsDemo(apiKey);
 }
 
+/** 连接真实模型，记录工具轨迹并在 briefing 产出后打印最终 Markdown。 */
 async function runFinanceNewsDemo(apiKey: string): Promise<void> {
   const baseURL = process.env.ARK_BASE_URL ?? defaultArkBaseURL;
   const modelName = process.env.ARK_MODEL ?? defaultArkModel;

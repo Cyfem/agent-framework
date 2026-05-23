@@ -38,8 +38,8 @@ interface AgentStatusListener {
 const beforeToolErrorPrefix = '函数调用的前置工作出现异常，异常为：';
 const internalEndAgentPrompt =
   '框架约束：当任务完成时，必须单独调用 end-agent 工具结束任务；不能仅用自然语言回答表示结束，也不能把 end-agent 与其他工具放在同一轮调用。';
-// Decorator initializers run before class field initializers, so tools are kept
-// behind a symbol-backed accessor instead of a public array field.
+// 装饰器 initializer 早于类字段 initializer 执行，因此借助 symbol-backed
+// 存储和公开访问器保留实例工具，避免工具数组被字段初始化覆盖。
 const toolsStorageKey: unique symbol = Symbol('agent.tools');
 
 interface ToolsStorageCarrier {
@@ -47,18 +47,17 @@ interface ToolsStorageCarrier {
 }
 
 /**
- * Node.js Agent runtime.
+ * 运行于 Node.js 的 Agent 主执行器。
  *
- * An Agent owns conversation context, tool definitions, skills, sub-agents and
- * lifecycle events. Call `init()` after configuring runtime tools/sub-agents and
- * before calling `agent()` or `toolCall()`.
+ * Agent 管理 Responses 上下文、工具、技能、子代理与生命周期事件。配置完运行时
+ * 工具或子代理后，必须先调用 `init()`，再调用 `agent()` 或 `toolCall()`。
  */
 export class Agent {
   /**
-   * Runtime tools available to this Agent instance.
+   * 当前 Agent 实例可调用的运行时工具集合。
    *
-   * Decorated tools are inserted automatically during construction. You may push
-   * additional tools before `init()` to expose runtime-only functionality.
+   * 装饰器工具会在实例构造阶段自动注册；也可以在 `init()` 前追加仅在本实例
+   * 生效的工具。
    */
   get tools(): ToolRuntimeDefinition[] {
     return getToolsStorage(this);
@@ -85,13 +84,13 @@ export class Agent {
 
   #agentErrorListeners: AgentErrorCallback[] = [];
 
-  /** Human-readable description used when this class is exposed as a sub-agent. */
+  /** 该类作为子代理暴露时使用的人类可读说明。 */
   static description?: string;
 
-  /** Sub-agent classes callable through the built-in `agent` tool. */
+  /** 可由内置 `agent` 工具调度的子代理类集合。 */
   subAgents: AgentConstructor[] = [];
 
-  /** Static tool definitions declared by decorators on this class and its parents. */
+  /** 当前类及其父类通过装饰器声明的静态工具定义。 */
   static get toolsDefinition(): readonly ToolDefinition[] {
     return getToolDefinitions(this);
   }
@@ -135,6 +134,7 @@ export class Agent {
     let agentResult: string | undefined;
     const BaseSubAgent = TargetAgent as typeof Agent;
 
+    // 为本次调度创建临时子类，仅向这一轮子代理执行暴露 `agent-result`。
     class RuntimeSubAgent extends BaseSubAgent {
       @Tool({
         name: 'agent-result',
@@ -151,6 +151,7 @@ export class Agent {
       }
     }
 
+    // 子代理复用模型适配器，但拥有独立上下文，并在启动前走同样的配置校验。
     const subAgent = new RuntimeSubAgent({
       llm: this.#llm,
       systemPrompts: [
@@ -169,7 +170,7 @@ export class Agent {
     return agentResult ?? '子代理已结束但未通过 agent-result 汇报结果。';
   }
 
-  /** Create an Agent instance with an LLM adapter and optional runtime configuration. */
+  /** 使用模型适配器及可选运行配置创建 Agent 实例。 */
   constructor(options: AgentOptions) {
     this.#llm = options.llm;
     this.#maxIterations = options.maxIterations;
@@ -189,20 +190,21 @@ export class Agent {
     this.addSystemPrompts(...(options.systemPrompts ?? []));
   }
 
-  /** Return raw history. The returned array is shallow-copied. */
+  /** 获取完整历史记录；返回的数组为浅拷贝。 */
   getHistory(): readonly AgentContext[] {
     return [...this.#rawContext];
   }
 
-  /** Return active context used for model calls, excluding transient system prompts. */
+  /** 获取模型请求使用的活动上下文，不包含临时注入的内部系统提示词。 */
   getContext(): readonly AgentContext[] {
     return [...this.#context];
   }
 
   /**
-   * Validate runtime configuration.
+   * 校验运行时配置并将 Agent 标记为已初始化。
    *
-   * Call this after mutating `tools` or `subAgents` and before starting the Agent.
+   * 修改 `tools` 或 `subAgents` 后应重新调用本方法；重复调用只重新校验配置，
+   * 不会清空历史或事件监听。
    */
   init(): this {
     this.#initialized = false;
@@ -213,7 +215,7 @@ export class Agent {
     return this;
   }
 
-  /** Append non-empty user system prompts. They are prepended after framework prompts. */
+  /** 追加非空系统提示词；请求模型时它们排在框架内部提示词之后。 */
   addSystemPrompts(...prompts: string[]): this {
     for (const prompt of prompts) {
       if (prompt.trim().length > 0) {
@@ -224,24 +226,24 @@ export class Agent {
     return this;
   }
 
-  /** Append skill handbooks. New skills are visible from the next model request. */
+  /** 追加技能手册；新增技能会从下一次模型请求开始对模型可见。 */
   addSkill(...skills: AgentSkill[]): this {
     this.#skills.push(...skills);
     return this;
   }
 
-  /** Append a text or multimodal message to raw history and active context. */
+  /** 向完整历史和活动上下文同时追加文本或多模态消息。 */
   appendContext(message: AgentContext): this {
     this.#appendMessage(message);
     return this;
   }
 
-  /** Listen to the complete model output array before any output item is appended to context. */
+  /** 在任一模型输出 item 写入上下文前，监听该轮完整 output 数组。 */
   onModelResponse(callback: ModelResponseCallback): Unsubscribe {
     return addListener(this.#modelResponseListeners, callback);
   }
 
-  /** Listen before a named tool call. Use options to await or cancel on listener error. */
+  /** 监听指定工具的调用前阶段；可通过 options 等待回调或在异常时取消调用。 */
   onBeforeToolCall(
     toolName: string,
     callback: BeforeToolCallCallback,
@@ -254,7 +256,7 @@ export class Agent {
     });
   }
 
-  /** Listen after a named tool handler returns. Listener errors are reported and ignored. */
+  /** 监听指定工具处理器返回后的阶段；回调异常会上报，但不会中断主流程。 */
   onAfterToolCall(
     toolName: string,
     callback: AfterToolCallCallback,
@@ -267,12 +269,12 @@ export class Agent {
     });
   }
 
-  /** Listen to before/calling/after tool errors. */
+  /** 监听工具在 `before`、`calling` 或 `after` 阶段发生的异常。 */
   onToolCallError(callback: ToolCallErrorCallback): Unsubscribe {
     return addListener(this.#toolCallErrorListeners, callback);
   }
 
-  /** Listen when the Agent enters a specific status. */
+  /** 监听 Agent 进入指定状态的事件。 */
   onAgentStatusChanged(status: AgentStatus, callback: AgentStatusChangedCallback): Unsubscribe {
     return addListener(this.#statusListeners, {
       status,
@@ -280,7 +282,7 @@ export class Agent {
     });
   }
 
-  /** Listen to errors thrown by `agent()`. Listener errors do not affect Agent state. */
+  /** 监听 `agent()` 抛出的错误；listener 自身异常不会影响 Agent 状态。 */
   onAgentError(callback: AgentErrorCallback): Unsubscribe {
     return addListener(this.#agentErrorListeners, callback);
   }
@@ -322,7 +324,12 @@ export class Agent {
     return 'Agent 已结束。';
   }
 
-  /** Execute one parsed tool call and return the tool result message. */
+  /**
+   * 执行一个已解析的模型函数调用，并返回本地结果 item。
+   *
+   * 成功结果会先写入上下文，再触发 after listener，使 listener 追加的消息
+   * 排在对应的 `function_call_output` 之后。
+   */
   async toolCall(callInfo: AgentFunctionCallItem): Promise<AgentFunctionCallOutputItem> {
     this.#assertInitialized();
 
@@ -376,10 +383,11 @@ export class Agent {
   }
 
   /**
-   * Run the Agent task loop.
+   * 启动 Agent 任务循环。
    *
-   * The Agent ends only when the built-in `end-agent` tool changes status to `ended`.
-   * Streaming is reserved for a future version and currently throws.
+   * 每轮先原样保存完整模型 output，再按顺序执行其中的 `function_call`。
+   * 只有内置 `end-agent` 工具把状态改为 `ended` 后任务才结束；当前版本
+   * 尚不支持流式调用。
    */
   async agent(message: string, stream = false): Promise<AgentContext[]> {
     let shouldFailOnError = true;
@@ -417,6 +425,7 @@ export class Agent {
 
         await this.#emitModelResponse(response.output);
 
+        // 模型 output 带有提供方元数据，必须整批原样保存后再执行本地工具。
         for (const outputItem of response.output) {
           this.#appendMessage(outputItem);
         }
@@ -478,7 +487,7 @@ export class Agent {
   }
 
   #buildInputForModel(): AgentContext[] {
-    // Internal prompts guide the framework protocol but are never persisted in context/history.
+    // 框架协议提示词仅在请求模型时临时前置，不写入 context/history。
     const systemMessages: AgentContext[] = [
       internalEndAgentPrompt,
       this.#buildSkillPrompt(),
@@ -497,7 +506,7 @@ export class Agent {
   }
 
   #buildSkillPrompt(): string {
-    // Skill selection lives in a system prompt so the get-skill tool description stays compact.
+    // 技能选择指引放在 system prompt 中，让 `get-skill` 的工具描述保持精简。
     const skillList =
       this.#skills.length === 0
         ? '当前没有可查询的技能手册，不要调用 get-skill。'
@@ -637,7 +646,7 @@ export class Agent {
       } catch (error) {
         await this.#emitToolCallError(toolName, 'before', error, parameters, message);
 
-        // Before listeners are the only observers allowed to cancel the real tool call.
+        // 只有 before listener 可以通过异常取消真实工具调用。
         if (listener.options.errorCancel) {
           return {
             canceled: true,
@@ -670,7 +679,7 @@ export class Agent {
           });
         }
       } catch (error) {
-        // After listener failures are observable but never interrupt the Agent loop.
+        // after listener 的失败可以被观察，但不能中断 Agent 主循环。
         await this.#emitToolCallError(toolName, 'after', error, parameters, message, result);
       }
     }
@@ -681,7 +690,7 @@ export class Agent {
       try {
         await listener(output);
       } catch {
-        // Model response listeners are observers and should not break the agent loop.
+        // 模型响应 listener 仅用于观察，不应打断 Agent 主循环。
       }
     }
   }
@@ -698,7 +707,7 @@ export class Agent {
       try {
         await listener(name, triggerType, error, parameters, message, result);
       } catch {
-        // Tool error listeners are observers and should not create new tool errors.
+        // 工具错误 listener 仅用于观察，不应产生新的工具错误。
       }
     }
   }
@@ -710,12 +719,11 @@ export class Agent {
 
         void Promise.resolve(result).catch((listenerError: unknown) => {
           void listenerError;
-          // console.error('Error in agent error listener:', listenerError);
+          // 错误 listener 属于非阻塞观察者；暂不向控制台重复输出其异常。
         });
       } catch (listenerError) {
         void listenerError;
-        // Agent error listeners are observers and should not create new errors
-        // console.error('Error in agent error listener:', listenerError);
+        // Agent 错误 listener 仅用于观察，不应制造新的 Agent 错误。
       }
     }
   }
@@ -740,7 +748,7 @@ export class Agent {
     for (const listener of this.#statusListeners.filter((item) => item.status === status)) {
       void Promise.resolve(listener.callback([...this.#rawContext], [...this.#context])).catch(
         () => {
-          // Status listeners are observers and should not break state transitions.
+          // 状态 listener 仅用于观察，不应打断状态迁移。
         },
       );
     }

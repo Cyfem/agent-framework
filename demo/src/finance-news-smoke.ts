@@ -1,3 +1,7 @@
+/**
+ * 金融新闻离线冒烟 demo：以固定 RSS fixture 和固定模型调用顺序验证抓取、
+ * 筛选、排序、简报生成及结束工具的完整链路。
+ */
 import {
   Model,
   type ModelResponsesRequest,
@@ -21,6 +25,7 @@ const requiredTools = [
   'end-agent',
 ];
 
+/** 逐轮返回预期工具调用，使离线测试不依赖网络或真实 LLM。 */
 class FinanceNewsSmokeModel extends Model {
   #round = 0;
 
@@ -77,6 +82,7 @@ class FinanceNewsSmokeModel extends Model {
   }
 }
 
+// fixture transport 取代远程 RSS 请求，使解析和排序断言完全可重复。
 const fixtureByUrl = new Map(
   defaultFinanceNewsSources.map((source) => [source.url, buildFixtureFeed(source.id)]),
 );
@@ -105,6 +111,7 @@ const mockTransport: FinanceNewsTransport = async (url) => {
   };
 };
 
+// 以下执行段既收集工具调用顺序，也核验最终简报已写入 Agent context。
 const agent = new FinanceMarketNewsAgent(
   {
     llm: new FinanceNewsSmokeModel(),

@@ -4,6 +4,7 @@ import { defineConfig, type Plugin } from 'vite';
 
 const entry = fileURLToPath(new URL('./src/index.ts', import.meta.url));
 
+/** 使用 Babel 在库构建前转换 TypeScript 源码中的 2023-11 decorators。 */
 function decoratorsBabelPlugin(): Plugin {
   return {
     name: 'babel-2023-11-decorators',
@@ -39,6 +40,7 @@ export default defineConfig({
     target: 'node22',
     sourcemap: true,
     rollupOptions: {
+      // 核心包面向 Node.js 运行时，保留依赖和 Node 内置模块为外部引用。
       external: ['openai', 'zod', 'zod-to-json-schema', /^node:/],
     },
     lib: {

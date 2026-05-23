@@ -15,15 +15,15 @@ import type {
 } from '../agent/types';
 import { Model } from './base';
 
-/** Extra file-upload options accepted by Ark's Files API. */
+/** 方舟 Files API 接受的附加上传选项。 */
 export interface ArkFileUploadOptions {
-  /** Ark generic upload purpose. Defaults to `user_data`. */
+  /** 方舟通用上传用途，默认值为 `user_data`。 */
   purpose?: 'user_data';
-  /** Ark media preprocessing options, such as video frame sampling configuration. */
+  /** 方舟媒体预处理选项，例如视频抽帧配置。 */
   preprocess_configs?: Record<string, unknown>;
 }
 
-/** File metadata returned by Ark's Files API. */
+/** 方舟 Files API 返回的文件元数据。 */
 export interface ArkFileObject {
   id: string;
   object?: string;
@@ -38,23 +38,23 @@ export interface ArkFileObject {
   [key: string]: unknown;
 }
 
-/** Options for the OpenAI SDK-backed Responses adapter. */
+/** 基于 OpenAI SDK 的 Responses 适配器配置。 */
 export interface OpenAIModelOptions extends ClientOptions {
-  /** Model name passed to `responses.create`. */
+  /** 传给 `responses.create` 的模型名称。 */
   model: string;
-  /** Optional preconfigured OpenAI client. When omitted, one is created from ClientOptions. */
+  /** 可选的已配置 OpenAI client；省略时使用其余 ClientOptions 创建实例。 */
   client?: OpenAI;
-  /** Default non-streaming Responses parameters merged into every request. */
+  /** 合并到每次请求中的非流式 Responses 默认参数。 */
   defaultParams?: Omit<ResponseCreateParamsNonStreaming, 'input' | 'model' | 'stream' | 'tools'>;
 }
 
-/** Model adapter backed by the OpenAI SDK Responses and Files APIs. */
+/** 基于 OpenAI SDK Responses 与 Files API 的模型适配器。 */
 export class OpenAIModel extends Model {
   #openai: OpenAI;
   #model: string;
   #defaultParams: OpenAIModelOptions['defaultParams'];
 
-  /** Create an adapter for OpenAI or a Responses-compatible provider such as Ark. */
+  /** 创建 OpenAI 或方舟等 Responses 兼容服务的适配器。 */
   constructor(options: OpenAIModelOptions) {
     super();
 
@@ -66,10 +66,9 @@ export class OpenAIModel extends Model {
   }
 
   /**
-   * Send one non-streaming Responses request.
+   * 发送一次非流式 Responses 请求。
    *
-   * Output items are intentionally returned without projection so an Agent can persist
-   * and resend provider response metadata verbatim on later turns.
+   * 输出 item 不做投影转换，以便 Agent 在后续轮次原样保存并回传提供方的响应元数据。
    */
   async responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse> {
     const params: ResponseCreateParamsNonStreaming = {
@@ -91,9 +90,9 @@ export class OpenAIModel extends Model {
   }
 
   /**
-   * Upload a local file for subsequent use by Ark Responses input parts.
+   * 上传本地文件，供后续方舟 Responses 输入内容块通过 `file_id` 引用。
    *
-   * `preprocess_configs` is an Ark extension and is adapted only at this SDK boundary.
+   * `preprocess_configs` 是方舟扩展字段，只在此 SDK 适配边界处理。
    */
   async uploadFile(filePath: string, options: ArkFileUploadOptions = {}): Promise<ArkFileObject> {
     const body = {

@@ -1,3 +1,9 @@
+/**
+ * Windows 微信多模态控制 demo：通过 Win32 消息工具驱动桌面窗口，将截图上传到
+ * 方舟 Files API 后以视觉输入追加进 Responses 上下文，并由技能手册约束发送流程。
+ *
+ * 交互类工具仅在显式启用环境开关时可执行，默认运行只允许观察窗口状态。
+ */
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -105,6 +111,7 @@ type BitmapInfo = {
   bmiColors: number[];
 };
 
+/** demo 需要使用的 Win32 FFI 最小函数集合，句柄在 TypeScript 侧统一表示为 bigint。 */
 type Win32Api = {
   EnumWindows(callback: (hwnd: bigint, lParam: bigint) => boolean, lParam: bigint): boolean;
   IsWindow(hwnd: bigint): boolean;
@@ -147,11 +154,13 @@ type Win32Api = {
   GetLastError(): number;
 };
 
+/** 从窗口 DC 读取到的像素内容及实际采用的截图方式。 */
 interface WindowCapture {
   png: PNG;
   captureMethod: 'PrintWindow' | 'BitBlt';
 }
 
+/** 顶层窗口枚举结果；对模型暴露的 `hwnd` 固定使用十六进制字符串。 */
 interface WindowCandidate {
   hwnd: string;
   processId: number;
@@ -194,6 +203,11 @@ type CaptureWindowResult = {
   captureMethod: WindowCapture['captureMethod'];
 };
 
+/**
+ * 调试模型包装器：完整落盘每次 Responses 请求、摘要和响应，便于排查上下文顺序。
+ *
+ * 包装器不会修改 input/output，仅用于观察真实请求内容。
+ */
 class DebugDumpModel extends Model {
   #inner: Model;
   #debugRoot: string;
@@ -227,6 +241,7 @@ class DebugDumpModel extends Model {
   }
 }
 
+/** 移植到 demo 工具命名体系下的微信搜索、验证与发送操作手册。 */
 const weixinWindowsSkill: AgentSkill = {
   name: 'Windows 微信联系人搜索与消息发送',
   description:
@@ -262,6 +277,12 @@ const weixinWindowsSkill: AgentSkill = {
   ],
 };
 
+/**
+ * 对模型暴露窗口查找、截图、多模态引用和输入操作的 Windows Agent。
+ *
+ * 多模态工具先暂存内容块，随后由 after hook 在函数结果之后追加 user input；
+ * 截图则由 after hook 直接上传 PNG 并追加可供视觉判断的图片输入。
+ */
 class WindowsControlAgent extends Agent {
   #api: Win32Api;
   #interactiveEnabled: boolean;
@@ -273,6 +294,7 @@ class WindowsControlAgent extends Agent {
     this.#interactiveEnabled = interactiveEnabled;
   }
 
+  /** 取出一次多模态工具登记的输入内容；成功消费后立即清除暂存数据。 */
   takeMultimodalInput(id: string): MultimodalContentPart[] | undefined {
     const content = this.#multimodalInputs.get(id);
 
@@ -643,6 +665,10 @@ class WindowsControlAgent extends Agent {
     return rect;
   }
 
+  /**
+   * 优先通过 `PrintWindow` 捕获窗口画面；不可用时回退到 `BitBlt`，最终将
+   * BGRA 像素转换为可保存的 PNG 数据。
+   */
   #captureWindowPixels(
     hwnd: bigint,
     width: number,
@@ -754,6 +780,7 @@ if (process.platform !== 'win32') {
   await runWindowsDemo(process.env.ARK_API_KEY);
 }
 
+/** 为侧通道中的多模态内容生成便于日志关联的短标识。 */
 function createMultimodalInputId(): string {
   return `id${randomUUID().replaceAll('-', '').slice(0, 12)}`;
 }
@@ -770,6 +797,7 @@ function getMediaKindLabel(kind: MultimodalKind): string {
   return '音频';
 }
 
+// 工具结果已由 core 写入上下文；此处再追加多模态 user input，保证请求顺序合法。
 function appendMultimodalToolResult(agent: WindowsControlAgent, result: unknown): void {
   if (!isMultimodalToolResult(result)) {
     return;
@@ -787,6 +815,11 @@ function appendMultimodalToolResult(agent: WindowsControlAgent, result: unknown)
   });
 }
 
+/**
+ * 将截图文件上传到 Files API 后，以 `input_image.file_id` 注入视觉消息。
+ *
+ * 上传失败时只追加阻止后续危险交互的文本提示，并把异常交还给工具错误事件。
+ */
 async function appendScreenshotToolResult(
   agent: WindowsControlAgent,
   model: OpenAIModel,
@@ -871,11 +904,13 @@ function isCaptureWindowResult(result: unknown): result is CaptureWindowResult {
   );
 }
 
+/** 将调试请求与响应以可审阅的 JSON 形式落盘。 */
 async function writeJsonFile(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
 }
 
+// 摘要日志仅保留结构和 file_id，不会把上传的媒体二进制内容复制进日志。
 function summarizeModelRequest(request: ModelResponsesRequest): Record<string, unknown> {
   return {
     inputCount: request.input.length,
@@ -994,6 +1029,11 @@ function serializeError(error: unknown): Record<string, unknown> {
   };
 }
 
+/**
+ * 按环境变量装配模型、技能和安全开关，并运行一次微信窗口操作任务。
+ *
+ * `ARK_WINDOWS_DEMO_INTERACTIVE=1` 是允许发出键盘、文字和鼠标消息的明确授权。
+ */
 async function runWindowsDemo(apiKey: string): Promise<void> {
   const baseURL = process.env.ARK_BASE_URL ?? defaultArkBaseURL;
   const modelName = process.env.ARK_MODEL ?? defaultArkModel;
@@ -1124,6 +1164,9 @@ async function runWindowsDemo(apiKey: string): Promise<void> {
   console.log(`windows demo complete: messages=${finalContext.length}`);
 }
 
+/**
+ * 在单一边界内绑定 user32、gdi32 与 kernel32，避免 FFI 类型细节散落在工具实现中。
+ */
 function createWin32Api(): Win32Api {
   const rectType = koffi.struct('RECT', {
     left: 'long',
@@ -1254,6 +1297,7 @@ function createWin32Api(): Win32Api {
   };
 }
 
+/** 枚举顶层窗口并合并 PowerShell 读取到的进程名称，供 `find-window` 过滤。 */
 async function listTopLevelWindows(api: Win32Api): Promise<WindowCandidate[]> {
   const processNames = await listProcessNameMap();
   const candidates: WindowCandidate[] = [];
@@ -1385,6 +1429,7 @@ function sanitizeFileName(value: string): string {
   return sanitized || 'window';
 }
 
+/** 创建自顶向下读取的 32 位位图描述，避免保存截图时发生垂直翻转。 */
 function createBitmapInfo(width: number, height: number): BitmapInfo {
   return {
     bmiHeader: {
@@ -1404,6 +1449,7 @@ function createBitmapInfo(width: number, height: number): BitmapInfo {
   };
 }
 
+/** 将 GDI 返回的 BGRA 像素重排为 PNG 所需的 RGBA 像素。 */
 function bgraToPng(buffer: Buffer, width: number, height: number): PNG {
   const png = new PNG({ width, height });
 

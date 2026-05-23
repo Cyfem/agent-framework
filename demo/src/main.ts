@@ -1,3 +1,7 @@
+/**
+ * 离线回归 demo：以确定性的 MockModel 覆盖 Responses 上下文透传、技能提示词、
+ * 装饰器工具、子代理调度、事件异常处理和并发调用保护。
+ */
 import {
   Agent,
   Model,
@@ -9,6 +13,7 @@ import {
 } from '@manee/agent-framework';
 import { z } from 'zod';
 
+/** 按固定轮次产生工具调用，并验证提供方 output 字段在下一轮请求中未丢失。 */
 class MockModel extends Model {
   #round = 0;
 
@@ -64,6 +69,7 @@ class MockModel extends Model {
   }
 }
 
+/** 用 private 装饰器工具验证实例注册以及 before-cancel 工具结果写入。 */
 class DemoAgent extends Agent {
   @Tool({
     name: 'save-note',
@@ -78,6 +84,7 @@ class DemoAgent extends Agent {
   }
 }
 
+/** 分别驱动父代理与 worker 子代理的离线模型，用于覆盖 agent-result 汇报流程。 */
 class SubAgentDemoModel extends Model {
   #parentRound = 0;
   #workerRound = 0;
@@ -119,6 +126,7 @@ class SubAgentDemoModel extends Model {
   }
 }
 
+/** 暂停首个请求，以稳定复现并发触发第二次 `agent()` 的场景。 */
 class ConcurrentDemoModel extends Model {
   #markStarted: (() => void) | undefined;
   #release: (() => void) | undefined;
@@ -146,6 +154,7 @@ class ConcurrentDemoModel extends Model {
   }
 }
 
+/** 供内置 `agent` 工具调度的最小子代理。 */
 class WorkerAgent extends Agent {
   static name = 'worker';
   static description = 'A small worker agent used by the local sub-agent demo.';
@@ -163,6 +172,7 @@ class WorkerAgent extends Agent {
   }
 }
 
+// 先恢复一段包含响应元数据的历史，后续轮次会验证其透传行为。
 const restoredHistory: AgentContext[] = [
   {
     role: 'user',
@@ -202,6 +212,7 @@ agent.tools.push({
   handler: () => 'runtime note ready',
 });
 
+// 初始化失败和未初始化调用分别覆盖配置校验与生命周期入口保护。
 try {
   const invalidAgent = new Agent({
     llm: new MockModel(),
@@ -260,6 +271,7 @@ agent.addSkill({
   description: 'Added after construction to verify dynamic skill descriptions.',
 });
 
+// 事件组合覆盖写入顺序、before 取消工具和工具错误观察能力。
 agent.onModelResponse((output) => {
   assertDemo(
     output.every((item) => !agent.getContext().includes(item)),
@@ -304,6 +316,7 @@ const finalContext = await agent.agent('Run the demo task.');
 
 console.log(`Demo ready: final context messages=${finalContext.length}`);
 
+// 独立执行子代理调度流程，避免与主场景的上下文互相影响。
 const subAgentDemo = new Agent({
   llm: new SubAgentDemoModel(),
   subAgents: [WorkerAgent],
@@ -316,6 +329,7 @@ const subAgentContext = await subAgentDemo.agent('Run the sub-agent demo task.')
 
 console.log(`Sub-agent demo ready: final context messages=${subAgentContext.length}`);
 
+// 第二次并发调用应被拒绝，但不得把仍在执行的首次任务标记为失败。
 const concurrentModel = new ConcurrentDemoModel();
 const concurrentAgent = new Agent({
   llm: concurrentModel,

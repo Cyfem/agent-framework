@@ -15,6 +15,8 @@ npm install @manee/agent-framework zod
 
 要求 Node.js >= 22。使用 `@Tool` 装饰器时，项目构建链需要支持 2023-11 decorators。
 
+公开类、方法与核心类型均提供中文 TSDoc；发布包中的声明文件会携带这些说明，便于在 TypeScript IDE 中直接查阅行为边界。
+
 ## 快速开始
 
 ```ts
@@ -200,7 +202,7 @@ agent.onToolCallError((name, triggerType, error, parameters, call, result) => {
 });
 ```
 
-`onModelResponse` 每次模型响应触发一次，收到完整 `output` 数组，并且触发时该批 item 尚未写入 context。异步 `before` listener 若希望异常取消真实工具调用，必须同时设置 `{ await: true, errorCancel: true }`；`await: false` 的异步 rejection 只会上报 `onToolCallError`。`after` listener 的异常会被上报，但不会中断 Agent。
+`onModelResponse` 每次模型响应触发一次，收到完整 `output` 数组，并且触发时该批 item 尚未写入 context。异步 `before` listener 若希望异常取消真实工具调用，必须同时设置 `{ await: true, errorCancel: true }`；`await: false` 的异步 rejection 只会上报 `onToolCallError`。工具成功返回后，框架先写入对应 `function_call_output`，再触发 `after` listener；`after` listener 的异常会被上报，但不会中断 Agent。
 
 ## 生命周期
 

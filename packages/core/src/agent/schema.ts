@@ -5,12 +5,12 @@ import type { JsonObject, ToolParametersSchema } from './types';
 
 const emptyParametersSchema = z.object({});
 
-/** Default empty object schema for tools without parameters. */
+/** 为没有声明参数的工具提供默认空对象 schema。 */
 export function getDefaultToolParametersSchema(): ToolParametersSchema {
   return emptyParametersSchema;
 }
 
-/** Convert a Zod-compatible tool schema into OpenAI function tool parameters. */
+/** 将兼容 Zod 的工具 schema 转换为 Responses 函数工具参数 JSON Schema。 */
 export function toOpenAIToolParameters(schema: ToolParametersSchema): JsonObject {
   const converted = normalizeRootSchema(convertWithZodToJsonSchema(schema));
 
@@ -54,7 +54,7 @@ function normalizeRootSchema(schema: unknown): JsonObject | null {
   const resolved = resolveLocalRootRef(root);
   const normalized = stripSchemaKeyword(resolved);
 
-  // OpenAI function tools require an object root. Reject primitive/array roots early.
+  // 函数工具的参数必须以对象为根；在发送请求前拦截原始值或数组 schema。
   if (normalized.type !== 'object') {
     return null;
   }

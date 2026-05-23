@@ -1,3 +1,7 @@
+/**
+ * 方舟完整能力 demo：在真实 Responses 对话中组合动态工具描述、运行时工具、
+ * 恢复历史、子代理以及 before/calling/after 错误事件路径。
+ */
 import {
   Agent,
   OpenAIModel,
@@ -26,6 +30,7 @@ const defaultArkModel = 'doubao-seed-2-0-pro-260215';
 
 let memoryDescriptionBuilds = 0;
 
+/** 由父代理调度的质量复核子代理，用于验证 `agent-result` 汇报协议。 */
 class QualityReviewAgent extends Agent {
   static name = 'quality-reviewer';
   static description = 'Reviews the parent agent demo state and returns a concise quality summary.';
@@ -54,6 +59,7 @@ class QualityReviewAgent extends Agent {
   }
 }
 
+/** 以内存工单为业务载体，集中暴露框架主要能力的父代理。 */
 class ArkComplexDemoAgent extends Agent {
   #nextTicketId = 1;
   #tickets = new Map<string, Ticket>();
@@ -244,6 +250,7 @@ if (!apiKey) {
   await runArkComplexDemo(apiKey);
 }
 
+/** 组装真实方舟场景，并通过日志呈现每一条功能覆盖路径。 */
 async function runArkComplexDemo(apiKey: string): Promise<void> {
   const baseURL = process.env.ARK_BASE_URL ?? defaultArkBaseURL;
   const modelName = process.env.ARK_MODEL ?? defaultArkModel;
@@ -288,7 +295,6 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
     initContext: restoredContext,
     initRawContext: restoredHistory,
     subAgents: [QualityReviewAgent],
-    // maxIterations: 12,
     systemPrompts: [
       'You are running an automated integration demo for a Node.js agent framework through Ark Coding Plan.',
       [
@@ -326,6 +332,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
     ],
   });
 
+  // 运行时追加的工具必须在 `init()` 前完成，以纳入同一轮配置校验。
   agent.tools.push({
     name: 'runtime-state-report',
     description:
@@ -353,6 +360,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   });
   unsubscribeModelResponse();
 
+  // 首轮响应后注入提示词与技能，验证下一次请求即可读取动态变更。
   agent.onModelResponse((output) => {
     const summary = summarizeOutput(output);
 
@@ -406,6 +414,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
     );
   }
 
+  // 三类 hook 分别展示 await-before、非阻塞 rejection 与显式取消调用。
   agent.onBeforeToolCall(
     'create-ticket',
     async (parameters) => {

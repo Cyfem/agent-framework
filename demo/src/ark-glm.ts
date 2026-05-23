@@ -1,9 +1,14 @@
+/**
+ * 方舟 Responses 冒烟 demo：通过一次真实模型对话验证工具调用、事件通知与
+ * `end-agent` 生命周期结束流程。
+ */
 import { Agent, OpenAIModel, Tool, type AgentResponseOutputItem } from '@manee/agent-framework';
 import { z } from 'zod';
 
 const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/v3';
 const defaultArkModel = 'doubao-seed-2-0-pro-260215';
 
+/** 保存一条模型生成事实的最小 Agent，用来证明真实函数调用闭环可运行。 */
 class ArkGlmDemoAgent extends Agent {
   #facts: string[] = [];
 
@@ -36,6 +41,7 @@ if (!apiKey) {
   await runArkGlmDemo(apiKey);
 }
 
+/** 创建方舟模型连接、挂载观测事件并运行单次真实冒烟任务。 */
 async function runArkGlmDemo(apiKey: string): Promise<void> {
   const baseURL = process.env.ARK_BASE_URL ?? defaultArkBaseURL;
   const modelName = process.env.ARK_MODEL ?? defaultArkModel;

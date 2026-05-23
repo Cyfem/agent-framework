@@ -1,9 +1,15 @@
+/**
+ * 金融新闻 Agent 实现：将 RSS 获取、XML 归一化、筛选、影响力排序和 Markdown
+ * 简报渲染拆成模型可调度的工具，同时保留可注入 transport 的离线测试边界。
+ */
 import { Agent, Tool, type AgentOptions } from '@manee/agent-framework';
 import { XMLParser } from 'fast-xml-parser';
 import { z } from 'zod';
 
+/** demo 关注的市场分组。 */
 export type FinanceMarket = 'us-equities' | 'macro' | 'crypto';
 
+/** 一个可抓取的公开 RSS 新闻源。 */
 export interface NewsSource {
   id: string;
   name: string;
@@ -11,6 +17,7 @@ export interface NewsSource {
   url: string;
 }
 
+/** 从 RSS 条目归一化得到的新闻记录。 */
 export interface MarketNewsItem {
   id: string;
   sourceId: string;
@@ -21,6 +28,7 @@ export interface MarketNewsItem {
   summary: string;
 }
 
+/** 一轮抓取的成功条目与按源记录的错误。 */
 export interface MarketNewsFetchResult {
   fetchedAt: string;
   items: MarketNewsItem[];
@@ -30,11 +38,13 @@ export interface MarketNewsFetchResult {
   }>;
 }
 
+/** 增加启发式影响评分和命中理由后的新闻记录。 */
 export interface RankedMarketNewsItem extends MarketNewsItem {
   score: number;
   reasons: string[];
 }
 
+/** 可替代 `fetch` 的最小响应契约，便于 smoke demo 注入 fixture。 */
 export interface FinanceNewsTransportResponse {
   ok: boolean;
   status: number;
@@ -42,6 +52,7 @@ export interface FinanceNewsTransportResponse {
   text(): Promise<string>;
 }
 
+/** 新闻获取传输层函数，可在真实网络与离线 fixture 间替换。 */
 export type FinanceNewsTransport = (
   url: string,
   init?: {
@@ -50,6 +61,7 @@ export type FinanceNewsTransport = (
   },
 ) => Promise<FinanceNewsTransportResponse>;
 
+/** 金融新闻业务能力的可替换依赖。 */
 export interface FinanceMarketNewsAgentOptions {
   sources?: readonly NewsSource[];
   transport?: FinanceNewsTransport;
@@ -64,6 +76,7 @@ const xmlParser = new XMLParser({
   trimValues: true,
 });
 
+/** 默认的公开 RSS 来源；真实 demo 和离线 smoke 共用同一份来源配置。 */
 export const defaultFinanceNewsSources: readonly NewsSource[] = [
   {
     id: 'fed-press',
@@ -91,6 +104,11 @@ export const defaultFinanceNewsSources: readonly NewsSource[] = [
   },
 ];
 
+/**
+ * 以工具链组织金融市场新闻调研的 Agent。
+ *
+ * 工具运行状态仅保存在本实例中，模型需要依次抓取、筛选和排序后再构建简报。
+ */
 export class FinanceMarketNewsAgent extends Agent {
   #sources: NewsSource[];
   #transport: FinanceNewsTransport;
@@ -342,6 +360,7 @@ export class FinanceMarketNewsAgent extends Agent {
   }
 }
 
+/** 真实运行默认使用平台 `fetch` 获取 RSS 内容。 */
 async function defaultTransport(
   url: string,
   init?: {
@@ -360,6 +379,7 @@ function makeTimeoutSignal(timeoutMs: number): AbortSignal | undefined {
   return undefined;
 }
 
+// RSS 与 Atom 的字段形态不同；解析层先统一成内部 MarketNewsItem，再交给工具筛选。
 function parseFeedItems(xml: string, source: NewsSource): MarketNewsItem[] {
   const parsed = xmlParser.parse(xml) as unknown;
   const feed = getFeedRoot(parsed);
@@ -495,6 +515,7 @@ function matchesQuery(item: MarketNewsItem, query: string | undefined): boolean 
   return `${item.title}\n${item.summary}`.toLowerCase().includes(normalized);
 }
 
+// demo 使用透明的关键词打分展示“影响排序”步骤，不将其包装为投资建议。
 function rankItem(item: MarketNewsItem): RankedMarketNewsItem {
   const text = `${item.title}\n${item.summary}`.toLowerCase();
   const rules: Array<{
@@ -560,6 +581,7 @@ function groupByMarket(
   return grouped;
 }
 
+// 渲染层只消费归一化和排序后的结果，便于测试直接断言最终 Markdown。
 function buildObservationLines(
   items: readonly RankedMarketNewsItem[],
   notes: readonly string[],
