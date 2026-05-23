@@ -1,8 +1,8 @@
-import { Agent, OpenAIModel, Tool, type AgentContext } from '@manee/agent-framework';
+import { Agent, OpenAIModel, Tool, type AgentResponseOutputItem } from '@manee/agent-framework';
 import { z } from 'zod';
 
-const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/coding/v3';
-const defaultArkModel = 'glm-5.1';
+const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/v3';
+const defaultArkModel = 'doubao-seed-2-0-pro-260215';
 
 class ArkGlmDemoAgent extends Agent {
   #facts: string[] = [];
@@ -53,8 +53,8 @@ async function runArkGlmDemo(apiKey: string): Promise<void> {
     ],
   });
 
-  agent.onModelResponse((message) => {
-    console.log(`model: ${summarizeMessage(message)}`);
+  agent.onModelResponse((output) => {
+    console.log(`model: ${summarizeOutput(output)}`);
   });
 
   agent.onBeforeToolCall(
@@ -114,14 +114,20 @@ async function runArkGlmDemo(apiKey: string): Promise<void> {
   console.log(`ark demo complete: messages=${finalContext.length}`);
 }
 
-function summarizeMessage(message: AgentContext): string {
-  if (message.role === 'assistant') {
-    const toolNames = message.toolCalls?.map((toolCall) => toolCall.name).join(', ') ?? 'none';
-    const content = message.content?.replace(/\s+/g, ' ').trim() ?? '';
-    return `assistant content=${JSON.stringify(content)} tools=${toolNames}`;
-  }
+function summarizeOutput(output: readonly AgentResponseOutputItem[]): string {
+  return output
+    .map((item) => {
+      if (item.type === 'function_call' && 'name' in item) {
+        return `function_call:${String(item.name)}`;
+      }
 
-  return message.role;
+      if (item.type === 'message' && 'role' in item) {
+        return `message:${String(item.role)}`;
+      }
+
+      return item.type;
+    })
+    .join(', ');
 }
 
 function toErrorMessage(error: unknown): string {

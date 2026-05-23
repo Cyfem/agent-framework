@@ -5,11 +5,22 @@
   "type": "module",
   "license": "MIT",
   "sideEffects": false,
+  "keywords": [
+    "agent",
+    "ai-agent",
+    "llm",
+    "openai",
+    "tool-calling",
+    "typescript",
+    "decorators",
+    "zod"
+  ],
   "engines": {
     "node": ">=22"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",

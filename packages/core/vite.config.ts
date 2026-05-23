@@ -39,7 +39,7 @@ export default defineConfig({
     target: 'node22',
     sourcemap: true,
     rollupOptions: {
-      external: ['openai', 'zod', 'zod-to-json-schema'],
+      external: ['openai', 'zod', 'zod-to-json-schema', /^node:/],
     },
     lib: {
       entry,

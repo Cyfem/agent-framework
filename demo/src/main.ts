@@ -3,31 +3,34 @@ import {
   Model,
   Tool,
   type AgentContext,
-  type ModelChatRequest,
-  type ModelChatResponse,
+  type AgentInputMessage,
+  type ModelResponsesRequest,
+  type ModelResponsesResponse,
 } from '@manee/agent-framework';
 import { z } from 'zod';
 
 class MockModel extends Model {
   #round = 0;
 
-  async chat(request: ModelChatRequest): Promise<ModelChatResponse> {
+  async responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse> {
     this.#round += 1;
 
-    const systemMessages = request.messages.filter((message) => message.role === 'system');
-    const skillPrompt = systemMessages.find((message) => message.content.includes('框架技能约束'));
-    const getSkillTool = request.tools.find((tool) => tool.function.name === 'get-skill');
+    const systemMessages = request.input.filter(isSystemInputMessage);
+    const skillPrompt = systemMessages.find((message) =>
+      readInputText(message).includes('get-skill'),
+    );
+    const getSkillTool = request.tools.find((tool) => tool.name === 'get-skill');
 
     assertDemo(Boolean(skillPrompt), 'Expected skill system prompt to be present.');
     assertDemo(
       Boolean(
-        skillPrompt?.content.includes('demo-skill') &&
-        skillPrompt.content.includes('runtime-skill'),
+        readInputText(skillPrompt).includes('demo-skill') &&
+        readInputText(skillPrompt).includes('runtime-skill'),
       ),
       'Expected skill system prompt to include current skills.',
     );
     assertDemo(
-      getSkillTool?.function.description === '获取指定下标的技能手册完整内容。',
+      getSkillTool?.description === '获取指定下标的技能手册完整内容。',
       'Expected get-skill description to stay static.',
     );
 
@@ -35,73 +38,29 @@ class MockModel extends Model {
       `round ${this.#round}: ${systemMessages.length} system prompt(s), ${request.tools.length} tool(s)`,
     );
 
+    if (this.#round === 2) {
+      assertDemo(
+        hasPreservedFunctionCall(request.input, 'call_get_skill'),
+        'Expected model output fields to be preserved in the next Responses input.',
+      );
+    }
+
+    if (this.#round === 3) {
+      assertDemo(
+        hasPreservedFunctionCall(request.input, 'call_save_note'),
+        'Expected later model output fields to be preserved in Responses input.',
+      );
+    }
+
     if (this.#round === 1) {
-      return {
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: null,
-              toolCalls: [
-                {
-                  id: 'call_get_skill',
-                  name: 'get-skill',
-                  arguments: JSON.stringify({
-                    index: 0,
-                  }),
-                },
-              ],
-            },
-            finishReason: 'tool_calls',
-          },
-        ],
-      };
+      return toolResponse('call_get_skill', 'get-skill', { index: 0 });
     }
 
     if (this.#round === 2) {
-      return {
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: null,
-              toolCalls: [
-                {
-                  id: 'call_save_note',
-                  name: 'save-note',
-                  arguments: JSON.stringify({
-                    note: 'demo note',
-                  }),
-                },
-              ],
-            },
-            finishReason: 'tool_calls',
-          },
-        ],
-      };
+      return toolResponse('call_save_note', 'save-note', { note: 'demo note' });
     }
 
-    return {
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: 'assistant',
-            content: null,
-            toolCalls: [
-              {
-                id: 'call_end_agent',
-                name: 'end-agent',
-                arguments: '{}',
-              },
-            ],
-          },
-          finishReason: 'tool_calls',
-        },
-      ],
-    };
+    return toolResponse('call_end_agent', 'end-agent', {});
   }
 }
 
@@ -123,8 +82,8 @@ class SubAgentDemoModel extends Model {
   #parentRound = 0;
   #workerRound = 0;
 
-  async chat(request: ModelChatRequest): Promise<ModelChatResponse> {
-    const toolNames = request.tools.map((tool) => tool.function.name);
+  async responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse> {
+    const toolNames = request.tools.map((tool) => tool.name);
 
     if (toolNames.includes('agent-result')) {
       this.#workerRound += 1;
@@ -172,7 +131,7 @@ class ConcurrentDemoModel extends Model {
     });
   }
 
-  async chat(): Promise<ModelChatResponse> {
+  async responses(): Promise<ModelResponsesResponse> {
     this.#markStarted?.();
 
     await new Promise<void>((resolve) => {
@@ -207,11 +166,14 @@ class WorkerAgent extends Agent {
 const restoredHistory: AgentContext[] = [
   {
     role: 'user',
-    content: 'Previous demo request.',
+    content: [{ type: 'input_text', text: 'Previous demo request.' }],
   },
   {
+    type: 'message',
+    id: 'msg_previous',
     role: 'assistant',
-    content: 'Previous demo response.',
+    status: 'completed',
+    content: [{ type: 'output_text', text: 'Previous demo response.' }],
   },
 ];
 
@@ -269,7 +231,8 @@ try {
 
 try {
   await uninitializedAgent.toolCall({
-    id: 'call_uninitialized',
+    type: 'function_call',
+    call_id: 'call_uninitialized',
     name: 'missing',
     arguments: '{}',
   });
@@ -287,7 +250,7 @@ console.log(`runtime tool visible=${agent.tools.some((tool) => tool.name === 'ru
 console.log(`restored context messages=${agent.getContext().length}`);
 restoredHistory.push({
   role: 'user',
-  content: 'This external mutation should not affect the agent.',
+  content: [{ type: 'input_text', text: 'This external mutation should not affect the agent.' }],
 });
 console.log(`restored context after external mutation=${agent.getContext().length}`);
 
@@ -297,8 +260,12 @@ agent.addSkill({
   description: 'Added after construction to verify dynamic skill descriptions.',
 });
 
-agent.onModelResponse((message) => {
-  console.log(`model response: ${message.role}`);
+agent.onModelResponse((output) => {
+  assertDemo(
+    output.every((item) => !agent.getContext().includes(item)),
+    'Expected onModelResponse before output items are appended.',
+  );
+  console.log(`model response: ${output.map((item) => item.type).join(',')}`);
 });
 
 agent.onAfterToolCall(
@@ -401,26 +368,55 @@ assertDemo(concurrentEndedStatuses === 1, 'Expected first concurrent agent run t
 
 console.log(`Concurrent demo ready: final context messages=${concurrentContext.length}`);
 
-function toolResponse(id: string, name: string, parameters: unknown): ModelChatResponse {
+function toolResponse(id: string, name: string, parameters: unknown): ModelResponsesResponse {
   return {
-    choices: [
+    output: [
       {
-        index: 0,
-        message: {
-          role: 'assistant',
-          content: null,
-          toolCalls: [
-            {
-              id,
-              name,
-              arguments: JSON.stringify(parameters),
-            },
-          ],
-        },
-        finishReason: 'tool_calls',
+        type: 'reasoning',
+        id: `rs_${id}`,
+        status: 'completed',
+        summary: [{ type: 'summary_text', text: `considering ${name}` }],
+        providerMarker: `reasoning:${id}`,
+      },
+      {
+        type: 'function_call',
+        id: `fc_${id}`,
+        call_id: id,
+        name,
+        arguments: JSON.stringify(parameters),
+        status: 'completed',
+        providerMarker: `preserved:${id}`,
       },
     ],
   };
+}
+
+function hasPreservedFunctionCall(input: readonly AgentContext[], callId: string): boolean {
+  return input.some(
+    (item) =>
+      item.type === 'function_call' &&
+      'call_id' in item &&
+      item.call_id === callId &&
+      'status' in item &&
+      item.status === 'completed' &&
+      'providerMarker' in item &&
+      item.providerMarker === `preserved:${callId}`,
+  );
+}
+
+function isSystemInputMessage(message: AgentContext): message is AgentInputMessage {
+  return 'role' in message && message.role === 'system';
+}
+
+function readInputText(message: AgentInputMessage | undefined): string {
+  if (!message) {
+    return '';
+  }
+
+  return message.content
+    .filter((part) => part.type === 'input_text')
+    .map((part) => part.text)
+    .join('\n');
 }
 
 function assertDemo(condition: boolean, message: string): void {

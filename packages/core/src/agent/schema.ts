@@ -5,10 +5,12 @@ import type { JsonObject, ToolParametersSchema } from './types';
 
 const emptyParametersSchema = z.object({});
 
+/** Default empty object schema for tools without parameters. */
 export function getDefaultToolParametersSchema(): ToolParametersSchema {
   return emptyParametersSchema;
 }
 
+/** Convert a Zod-compatible tool schema into OpenAI function tool parameters. */
 export function toOpenAIToolParameters(schema: ToolParametersSchema): JsonObject {
   const converted = normalizeRootSchema(convertWithZodToJsonSchema(schema));
 
@@ -52,6 +54,7 @@ function normalizeRootSchema(schema: unknown): JsonObject | null {
   const resolved = resolveLocalRootRef(root);
   const normalized = stripSchemaKeyword(resolved);
 
+  // OpenAI function tools require an object root. Reject primitive/array roots early.
   if (normalized.type !== 'object') {
     return null;
   }

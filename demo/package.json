@@ -12,12 +12,19 @@
     "ark:full": "vite-node src/complex.ts",
     "ark:smoke": "vite-node src/ark-glm.ts",
     "ark:glm": "vite-node src/ark-glm.ts",
+    "windows": "vite-node src/windows.ts",
+    "finance-news": "vite-node src/finance-news.ts",
+    "finance-news:smoke": "vite-node src/finance-news-smoke.ts",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "start": "node dist/main.js"
   },
   "dependencies": {
     "@manee/agent-framework": "workspace:*",
+    "@types/pngjs": "^6.0.5",
+    "fast-xml-parser": "^5.8.0",
+    "koffi": "^3.0.1",
+    "pngjs": "^7.0.0",
     "zod": "^4.4.3"
   }
 }

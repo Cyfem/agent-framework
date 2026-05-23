@@ -1,37 +1,60 @@
+import { createReadStream } from 'node:fs';
+
 import OpenAI, { type ClientOptions } from 'openai';
+import type { FileCreateParams } from 'openai/resources/files';
 import type {
-  ChatCompletionAssistantMessageParam,
-  ChatCompletionCreateParamsNonStreaming,
-  ChatCompletionMessage,
-  ChatCompletionMessageFunctionToolCall,
-  ChatCompletionMessageParam,
-  ChatCompletionMessageToolCall,
-  ChatCompletionTool,
-} from 'openai/resources/chat/completions';
+  ResponseCreateParamsNonStreaming,
+  ResponseInput,
+  Tool as ResponseTool,
+} from 'openai/resources/responses/responses';
 
 import type {
-  AgentAssistantMessage,
-  AgentContext,
-  AgentToolCall,
-  ModelChatRequest,
-  ModelChatResponse,
+  AgentResponseOutputItem,
+  ModelResponsesRequest,
+  ModelResponsesResponse,
 } from '../agent/types';
 import { Model } from './base';
 
-export interface OpenAIModelOptions extends ClientOptions {
-  model: string;
-  client?: OpenAI;
-  defaultParams?: Omit<
-    ChatCompletionCreateParamsNonStreaming,
-    'messages' | 'model' | 'stream' | 'tools'
-  >;
+/** Extra file-upload options accepted by Ark's Files API. */
+export interface ArkFileUploadOptions {
+  /** Ark generic upload purpose. Defaults to `user_data`. */
+  purpose?: 'user_data';
+  /** Ark media preprocessing options, such as video frame sampling configuration. */
+  preprocess_configs?: Record<string, unknown>;
 }
 
+/** File metadata returned by Ark's Files API. */
+export interface ArkFileObject {
+  id: string;
+  object?: string;
+  purpose?: string;
+  filename?: string;
+  bytes?: number;
+  mime_type?: string;
+  created_at?: number;
+  expire_at?: number;
+  status?: string;
+  preprocess_configs?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+/** Options for the OpenAI SDK-backed Responses adapter. */
+export interface OpenAIModelOptions extends ClientOptions {
+  /** Model name passed to `responses.create`. */
+  model: string;
+  /** Optional preconfigured OpenAI client. When omitted, one is created from ClientOptions. */
+  client?: OpenAI;
+  /** Default non-streaming Responses parameters merged into every request. */
+  defaultParams?: Omit<ResponseCreateParamsNonStreaming, 'input' | 'model' | 'stream' | 'tools'>;
+}
+
+/** Model adapter backed by the OpenAI SDK Responses and Files APIs. */
 export class OpenAIModel extends Model {
   #openai: OpenAI;
   #model: string;
   #defaultParams: OpenAIModelOptions['defaultParams'];
 
+  /** Create an adapter for OpenAI or a Responses-compatible provider such as Ark. */
   constructor(options: OpenAIModelOptions) {
     super();
 
@@ -42,91 +65,49 @@ export class OpenAIModel extends Model {
     this.#openai = client ?? new OpenAI(clientOptions);
   }
 
-  async chat(request: ModelChatRequest): Promise<ModelChatResponse> {
-    const params: ChatCompletionCreateParamsNonStreaming = {
+  /**
+   * Send one non-streaming Responses request.
+   *
+   * Output items are intentionally returned without projection so an Agent can persist
+   * and resend provider response metadata verbatim on later turns.
+   */
+  async responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse> {
+    const params: ResponseCreateParamsNonStreaming = {
       ...this.#defaultParams,
       model: this.#model,
-      messages: request.messages.map(toOpenAIMessage),
+      input: request.input as unknown as ResponseInput,
     };
 
     if (request.tools.length > 0) {
-      params.tools = request.tools as ChatCompletionTool[];
+      params.tools = request.tools as unknown as ResponseTool[];
     }
 
-    const completion = await this.#openai.chat.completions.create(params);
+    const response = await this.#openai.responses.create(params);
 
     return {
-      choices: completion.choices.map((choice) => ({
-        index: choice.index,
-        message: fromOpenAIMessage(choice.message),
-        finishReason: choice.finish_reason,
-        raw: choice,
-      })),
-      raw: completion,
-    };
-  }
-}
-
-function toOpenAIMessage(message: AgentContext): ChatCompletionMessageParam {
-  if (message.role === 'system' || message.role === 'user') {
-    return {
-      role: message.role,
-      content: message.content,
+      output: response.output as unknown as readonly AgentResponseOutputItem[],
+      raw: response,
     };
   }
 
-  if (message.role === 'tool') {
-    return {
-      role: 'tool',
-      content: message.content,
-      tool_call_id: message.toolCallId,
+  /**
+   * Upload a local file for subsequent use by Ark Responses input parts.
+   *
+   * `preprocess_configs` is an Ark extension and is adapted only at this SDK boundary.
+   */
+  async uploadFile(filePath: string, options: ArkFileUploadOptions = {}): Promise<ArkFileObject> {
+    const body = {
+      file: createReadStream(filePath),
+      purpose: options.purpose ?? 'user_data',
+      ...(options.preprocess_configs
+        ? {
+            preprocess_configs: options.preprocess_configs,
+          }
+        : {}),
     };
+
+    const file = await this.#openai.files.create(body as unknown as FileCreateParams);
+
+    return file as unknown as ArkFileObject;
   }
-
-  const assistantMessage: ChatCompletionAssistantMessageParam = {
-    role: 'assistant',
-  };
-
-  if (message.content !== null || !message.toolCalls?.length) {
-    assistantMessage.content = message.content;
-  }
-
-  if (message.toolCalls?.length) {
-    assistantMessage.tool_calls = message.toolCalls.map(toOpenAIToolCall);
-  }
-
-  return assistantMessage;
-}
-
-function toOpenAIToolCall(toolCall: AgentToolCall): ChatCompletionMessageToolCall {
-  return {
-    id: toolCall.id,
-    type: 'function',
-    function: {
-      name: toolCall.name,
-      arguments: toolCall.arguments,
-    },
-  };
-}
-
-function fromOpenAIMessage(message: ChatCompletionMessage): AgentAssistantMessage {
-  const assistantMessage: AgentAssistantMessage = {
-    role: 'assistant',
-    content: typeof message.content === 'string' ? message.content : null,
-  };
-
-  if (message.tool_calls?.length) {
-    assistantMessage.toolCalls = message.tool_calls
-      .filter(
-        (toolCall): toolCall is ChatCompletionMessageFunctionToolCall =>
-          toolCall.type === 'function',
-      )
-      .map((toolCall) => ({
-        id: toolCall.id,
-        name: toolCall.function.name,
-        arguments: toolCall.function.arguments,
-      }));
-  }
-
-  return assistantMessage;
 }

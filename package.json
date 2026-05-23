@@ -16,7 +16,10 @@
     "demo": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo dev",
     "demo:complex": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo complex",
     "demo:ark": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo ark:full",
-    "demo:ark:smoke": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo ark:smoke"
+    "demo:ark:smoke": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo ark:smoke",
+    "demo:windows": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo windows",
+    "demo:finance-news": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo finance-news",
+    "demo:finance-news:smoke": "pnpm --filter @manee/agent-framework build && pnpm --filter @manee/agent-framework-demo finance-news:smoke"
   },
   "devDependencies": {
     "@babel/core": "^7.29.0",

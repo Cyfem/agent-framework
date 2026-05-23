@@ -1,7 +1,9 @@
-import type { ModelChatRequest, ModelChatResponse } from '../agent/types';
+import type { ModelResponsesRequest, ModelResponsesResponse } from '../agent/types';
 
+/** Base class for Responses-based LLM adapters used by Agent. */
 export abstract class Model {
-  abstract chat(request: ModelChatRequest): Promise<ModelChatResponse>;
+  /** Return one non-streaming Responses API result. */
+  abstract responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse>;
 }
 
-export type { ModelChatRequest, ModelChatResponse } from '../agent/types';
+export type { ModelResponsesRequest, ModelResponsesResponse } from '../agent/types';

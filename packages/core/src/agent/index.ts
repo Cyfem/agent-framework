@@ -7,12 +7,13 @@ import type {
   AgentConstructor,
   AgentContext,
   AgentErrorCallback,
+  AgentFunctionCallItem,
+  AgentFunctionCallOutputItem,
   AgentOptions,
+  AgentResponseOutputItem,
   AgentSkill,
   AgentStatus,
   AgentStatusChangedCallback,
-  AgentToolCall,
-  AgentToolMessage,
   BeforeToolCallCallback,
   ModelResponseCallback,
   ModelToolDefinition,
@@ -37,13 +38,28 @@ interface AgentStatusListener {
 const beforeToolErrorPrefix = '函数调用的前置工作出现异常，异常为：';
 const internalEndAgentPrompt =
   '框架约束：当任务完成时，必须单独调用 end-agent 工具结束任务；不能仅用自然语言回答表示结束，也不能把 end-agent 与其他工具放在同一轮调用。';
+// Decorator initializers run before class field initializers, so tools are kept
+// behind a symbol-backed accessor instead of a public array field.
 const toolsStorageKey: unique symbol = Symbol('agent.tools');
 
 interface ToolsStorageCarrier {
   [toolsStorageKey]?: ToolRuntimeDefinition[];
 }
 
+/**
+ * Node.js Agent runtime.
+ *
+ * An Agent owns conversation context, tool definitions, skills, sub-agents and
+ * lifecycle events. Call `init()` after configuring runtime tools/sub-agents and
+ * before calling `agent()` or `toolCall()`.
+ */
 export class Agent {
+  /**
+   * Runtime tools available to this Agent instance.
+   *
+   * Decorated tools are inserted automatically during construction. You may push
+   * additional tools before `init()` to expose runtime-only functionality.
+   */
   get tools(): ToolRuntimeDefinition[] {
     return getToolsStorage(this);
   }
@@ -69,9 +85,13 @@ export class Agent {
 
   #agentErrorListeners: AgentErrorCallback[] = [];
 
-  static description?: string; // agent 的描述
-  subAgents: AgentConstructor[] = []; // agent 的子 agent 列表
+  /** Human-readable description used when this class is exposed as a sub-agent. */
+  static description?: string;
 
+  /** Sub-agent classes callable through the built-in `agent` tool. */
+  subAgents: AgentConstructor[] = [];
+
+  /** Static tool definitions declared by decorators on this class and its parents. */
   static get toolsDefinition(): readonly ToolDefinition[] {
     return getToolDefinitions(this);
   }
@@ -149,6 +169,7 @@ export class Agent {
     return agentResult ?? '子代理已结束但未通过 agent-result 汇报结果。';
   }
 
+  /** Create an Agent instance with an LLM adapter and optional runtime configuration. */
   constructor(options: AgentOptions) {
     this.#llm = options.llm;
     this.#maxIterations = options.maxIterations;
@@ -168,14 +189,21 @@ export class Agent {
     this.addSystemPrompts(...(options.systemPrompts ?? []));
   }
 
+  /** Return raw history. The returned array is shallow-copied. */
   getHistory(): readonly AgentContext[] {
     return [...this.#rawContext];
   }
 
+  /** Return active context used for model calls, excluding transient system prompts. */
   getContext(): readonly AgentContext[] {
     return [...this.#context];
   }
 
+  /**
+   * Validate runtime configuration.
+   *
+   * Call this after mutating `tools` or `subAgents` and before starting the Agent.
+   */
   init(): this {
     this.#initialized = false;
     this.#assertUniqueToolNames();
@@ -185,6 +213,7 @@ export class Agent {
     return this;
   }
 
+  /** Append non-empty user system prompts. They are prepended after framework prompts. */
   addSystemPrompts(...prompts: string[]): this {
     for (const prompt of prompts) {
       if (prompt.trim().length > 0) {
@@ -195,15 +224,24 @@ export class Agent {
     return this;
   }
 
+  /** Append skill handbooks. New skills are visible from the next model request. */
   addSkill(...skills: AgentSkill[]): this {
     this.#skills.push(...skills);
     return this;
   }
 
+  /** Append a text or multimodal message to raw history and active context. */
+  appendContext(message: AgentContext): this {
+    this.#appendMessage(message);
+    return this;
+  }
+
+  /** Listen to the complete model output array before any output item is appended to context. */
   onModelResponse(callback: ModelResponseCallback): Unsubscribe {
     return addListener(this.#modelResponseListeners, callback);
   }
 
+  /** Listen before a named tool call. Use options to await or cancel on listener error. */
   onBeforeToolCall(
     toolName: string,
     callback: BeforeToolCallCallback,
@@ -216,6 +254,7 @@ export class Agent {
     });
   }
 
+  /** Listen after a named tool handler returns. Listener errors are reported and ignored. */
   onAfterToolCall(
     toolName: string,
     callback: AfterToolCallCallback,
@@ -228,10 +267,12 @@ export class Agent {
     });
   }
 
+  /** Listen to before/calling/after tool errors. */
   onToolCallError(callback: ToolCallErrorCallback): Unsubscribe {
     return addListener(this.#toolCallErrorListeners, callback);
   }
 
+  /** Listen when the Agent enters a specific status. */
   onAgentStatusChanged(status: AgentStatus, callback: AgentStatusChangedCallback): Unsubscribe {
     return addListener(this.#statusListeners, {
       status,
@@ -239,6 +280,7 @@ export class Agent {
     });
   }
 
+  /** Listen to errors thrown by `agent()`. Listener errors do not affect Agent state. */
   onAgentError(callback: AgentErrorCallback): Unsubscribe {
     return addListener(this.#agentErrorListeners, callback);
   }
@@ -280,7 +322,8 @@ export class Agent {
     return 'Agent 已结束。';
   }
 
-  async toolCall(callInfo: AgentToolCall): Promise<AgentToolMessage> {
+  /** Execute one parsed tool call and return the tool result message. */
+  async toolCall(callInfo: AgentFunctionCallItem): Promise<AgentFunctionCallOutputItem> {
     this.#assertInitialized();
 
     const tool = this.tools.find((candidate) => candidate.name === callInfo.name);
@@ -289,22 +332,26 @@ export class Agent {
     if (!tool) {
       const error = new Error(`Unknown tool: ${callInfo.name}`);
       await this.#emitToolCallError(callInfo.name, 'calling', error, fallbackParameters, callInfo);
-      return createToolMessage(callInfo.id, normalizeErrorMessage(error));
+      return this.#appendToolMessage(
+        createToolMessage(callInfo.call_id, normalizeErrorMessage(error)),
+      );
     }
 
     const parsedArguments = await this.#parseToolArguments(tool, callInfo);
 
     if (!parsedArguments.ok) {
-      return createToolMessage(callInfo.id, parsedArguments.message);
+      return this.#appendToolMessage(createToolMessage(callInfo.call_id, parsedArguments.message));
     }
 
     const parameters = parsedArguments.parameters;
     const beforeResult = await this.#runBeforeToolListeners(tool.name, parameters, callInfo);
 
     if (beforeResult.canceled) {
-      return createToolMessage(
-        callInfo.id,
-        `${beforeToolErrorPrefix}${normalizeErrorMessage(beforeResult.error)}`,
+      return this.#appendToolMessage(
+        createToolMessage(
+          callInfo.call_id,
+          `${beforeToolErrorPrefix}${normalizeErrorMessage(beforeResult.error)}`,
+        ),
       );
     }
 
@@ -314,14 +361,26 @@ export class Agent {
       result = await tool.handler(parameters);
     } catch (error) {
       await this.#emitToolCallError(tool.name, 'calling', error, parameters, callInfo);
-      return createToolMessage(callInfo.id, normalizeErrorMessage(error));
+      return this.#appendToolMessage(
+        createToolMessage(callInfo.call_id, normalizeErrorMessage(error)),
+      );
     }
+
+    const resultMessage = this.#appendToolMessage(
+      createToolMessage(callInfo.call_id, serializeToolResult(result)),
+    );
 
     await this.#runAfterToolListeners(tool.name, parameters, callInfo, result);
 
-    return createToolMessage(callInfo.id, serializeToolResult(result));
+    return resultMessage;
   }
 
+  /**
+   * Run the Agent task loop.
+   *
+   * The Agent ends only when the built-in `end-agent` tool changes status to `ended`.
+   * Streaming is reserved for a future version and currently throws.
+   */
   async agent(message: string, stream = false): Promise<AgentContext[]> {
     let shouldFailOnError = true;
 
@@ -339,7 +398,12 @@ export class Agent {
 
       this.#appendMessage({
         role: 'user',
-        content: message,
+        content: [
+          {
+            type: 'input_text',
+            text: message,
+          },
+        ],
       });
 
       this.#changeStatus('running');
@@ -349,21 +413,18 @@ export class Agent {
         this.#maxIterations === undefined || iteration < this.#maxIterations;
         iteration += 1
       ) {
-        const response = await this.#chatWithEmptyChoiceRetry();
-        const choice = response.choices[0];
+        const response = await this.#responsesWithEmptyOutputRetry();
 
-        if (!choice) {
-          throw new Error('Model returned no choices.');
+        await this.#emitModelResponse(response.output);
+
+        for (const outputItem of response.output) {
+          this.#appendMessage(outputItem);
         }
 
-        await this.#emitModelResponse(choice.message);
-        this.#appendMessage(choice.message);
-
-        const toolCalls = choice.message.toolCalls ?? [];
-
-        for (const toolCall of toolCalls) {
-          const resultMessage = await this.toolCall(toolCall);
-          this.#appendMessage(resultMessage);
+        for (const outputItem of response.output) {
+          if (isFunctionCallItem(outputItem)) {
+            await this.toolCall(outputItem);
+          }
         }
 
         if (this.#status === 'ended') {
@@ -416,20 +477,27 @@ export class Agent {
     }
   }
 
-  #buildMessagesForModel(): AgentContext[] {
+  #buildInputForModel(): AgentContext[] {
+    // Internal prompts guide the framework protocol but are never persisted in context/history.
     const systemMessages: AgentContext[] = [
       internalEndAgentPrompt,
       this.#buildSkillPrompt(),
       ...this.#systemPrompts,
     ].map((content) => ({
       role: 'system',
-      content,
+      content: [
+        {
+          type: 'input_text',
+          text: content,
+        },
+      ],
     }));
 
     return [...systemMessages, ...this.#context];
   }
 
   #buildSkillPrompt(): string {
+    // Skill selection lives in a system prompt so the get-skill tool description stays compact.
     const skillList =
       this.#skills.length === 0
         ? '当前没有可查询的技能手册，不要调用 get-skill。'
@@ -473,29 +541,28 @@ export class Agent {
 
       return {
         type: 'function',
-        function: {
-          name: tool.name,
-          description,
-          parameters: toOpenAIToolParameters(tool.parameters ?? getDefaultToolParametersSchema()),
-        },
+        name: tool.name,
+        description,
+        parameters: toOpenAIToolParameters(tool.parameters ?? getDefaultToolParametersSchema()),
+        strict: true,
       };
     });
   }
 
-  async #chatWithEmptyChoiceRetry() {
-    let lastResponseText = 'Model returned no choices.';
+  async #responsesWithEmptyOutputRetry() {
+    let lastResponseText = 'Model returned no output.';
 
     for (let attempt = 0; attempt <= 3; attempt += 1) {
-      const response = await this.#llm.chat({
-        messages: this.#buildMessagesForModel(),
+      const response = await this.#llm.responses({
+        input: this.#buildInputForModel(),
         tools: this.#buildToolsForModel(),
       });
 
-      if (response.choices.length > 0) {
+      if (response.output.length > 0) {
         return response;
       }
 
-      lastResponseText = `Model returned no choices after ${attempt + 1} attempt(s).`;
+      lastResponseText = `Model returned no output after ${attempt + 1} attempt(s).`;
     }
 
     throw new Error(lastResponseText);
@@ -503,7 +570,7 @@ export class Agent {
 
   async #parseToolArguments(
     tool: ToolRuntimeDefinition,
-    callInfo: AgentToolCall,
+    callInfo: AgentFunctionCallItem,
   ): Promise<
     | {
         ok: true;
@@ -546,7 +613,7 @@ export class Agent {
   async #runBeforeToolListeners(
     toolName: string,
     parameters: unknown,
-    message: AgentToolCall,
+    message: AgentFunctionCallItem,
   ): Promise<
     | {
         canceled: true;
@@ -570,6 +637,7 @@ export class Agent {
       } catch (error) {
         await this.#emitToolCallError(toolName, 'before', error, parameters, message);
 
+        // Before listeners are the only observers allowed to cancel the real tool call.
         if (listener.options.errorCancel) {
           return {
             canceled: true,
@@ -587,7 +655,7 @@ export class Agent {
   async #runAfterToolListeners(
     toolName: string,
     parameters: unknown,
-    message: AgentToolCall,
+    message: AgentFunctionCallItem,
     result: unknown,
   ): Promise<void> {
     for (const listener of this.#afterToolListeners.filter((item) => item.toolName === toolName)) {
@@ -602,15 +670,16 @@ export class Agent {
           });
         }
       } catch (error) {
+        // After listener failures are observable but never interrupt the Agent loop.
         await this.#emitToolCallError(toolName, 'after', error, parameters, message, result);
       }
     }
   }
 
-  async #emitModelResponse(message: AgentContext): Promise<void> {
+  async #emitModelResponse(output: readonly AgentResponseOutputItem[]): Promise<void> {
     for (const listener of this.#modelResponseListeners) {
       try {
-        await listener(message);
+        await listener(output);
       } catch {
         // Model response listeners are observers and should not break the agent loop.
       }
@@ -622,7 +691,7 @@ export class Agent {
     triggerType: 'before' | 'calling' | 'after',
     error: unknown,
     parameters: unknown,
-    message: AgentToolCall,
+    message: AgentFunctionCallItem,
     result?: unknown,
   ): Promise<void> {
     for (const listener of this.#toolCallErrorListeners) {
@@ -654,6 +723,11 @@ export class Agent {
   #appendMessage(message: AgentContext): void {
     this.#rawContext.push(message);
     this.#context.push(message);
+  }
+
+  #appendToolMessage(message: AgentFunctionCallOutputItem): AgentFunctionCallOutputItem {
+    this.#appendMessage(message);
+    return message;
   }
 
   #changeStatus(status: AgentStatus): void {
@@ -692,12 +766,21 @@ function normalizeToolEventOptions(options?: ToolEventOptions): Required<ToolEve
   };
 }
 
-function createToolMessage(toolCallId: string, content: string): AgentToolMessage {
+function createToolMessage(callId: string, content: string): AgentFunctionCallOutputItem {
   return {
-    role: 'tool',
-    content,
-    toolCallId,
+    type: 'function_call_output',
+    call_id: callId,
+    output: content,
   };
+}
+
+function isFunctionCallItem(item: AgentResponseOutputItem): item is AgentFunctionCallItem {
+  return (
+    item.type === 'function_call' &&
+    typeof item.call_id === 'string' &&
+    typeof item.name === 'string' &&
+    typeof item.arguments === 'string'
+  );
 }
 
 function serializeToolResult(result: unknown): string {

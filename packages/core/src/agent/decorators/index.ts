@@ -6,6 +6,12 @@ interface ToolInitializerReceiver {
   tools?: ToolRuntimeDefinition[];
 }
 
+/**
+ * Declare an Agent method as a callable tool.
+ *
+ * The decorator stores static metadata on the class for `toolsDefinition` and
+ * registers a bound runtime handler on each instance.
+ */
 export function Tool(definition: ToolDefinition) {
   return function (value: unknown, context: ClassMethodDecoratorContext) {
     if (context.kind !== 'method' || typeof value !== 'function') {
@@ -14,6 +20,8 @@ export function Tool(definition: ToolDefinition) {
 
     const method = value as (this: object, parameters: unknown) => unknown | Promise<unknown>;
 
+    // 2023-11 decorator metadata is class-level. Copy inherited arrays before
+    // appending so subclass tools do not mutate parent `toolsDefinition`.
     registerToolDefinition(context.metadata as Record<PropertyKey, unknown>, {
       ...definition,
     });
@@ -34,6 +42,7 @@ export function Tool(definition: ToolDefinition) {
   };
 }
 
+/** Return shallow-copied static tool definitions for a class constructor. */
 export function getToolDefinitions(target: object): ToolDefinition[] {
   const metadata = (target as Record<PropertyKey, unknown>)[getMetadataSymbol()] as
     | Record<PropertyKey, unknown>

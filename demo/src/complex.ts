@@ -1,4 +1,10 @@
-import { Agent, OpenAIModel, Tool, type AgentContext } from '@manee/agent-framework';
+import {
+  Agent,
+  OpenAIModel,
+  Tool,
+  type AgentContext,
+  type AgentResponseOutputItem,
+} from '@manee/agent-framework';
 import { z } from 'zod';
 
 type Priority = 'low' | 'medium' | 'high';
@@ -15,8 +21,8 @@ interface Ticket {
   };
 }
 
-const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/coding/v3';
-const defaultArkModel = 'glm-5.1';
+const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/v3';
+const defaultArkModel = 'doubao-seed-2-0-pro-260215';
 
 let memoryDescriptionBuilds = 0;
 
@@ -250,18 +256,26 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   const restoredContext: AgentContext[] = [
     {
       role: 'user',
-      content: 'Previous Ark demo warm-up request.',
+      content: [{ type: 'input_text', text: 'Previous Ark demo warm-up request.' }],
     },
     {
+      type: 'message',
+      id: 'msg_previous',
       role: 'assistant',
-      content: 'Previous Ark demo warm-up response.',
+      status: 'completed',
+      content: [{ type: 'output_text', text: 'Previous Ark demo warm-up response.' }],
     },
   ];
   const restoredHistory: AgentContext[] = [
     ...restoredContext,
     {
       role: 'user',
-      content: 'Raw history can include messages outside the active context.',
+      content: [
+        {
+          type: 'input_text',
+          text: 'Raw history can include messages outside the active context.',
+        },
+      ],
     },
   ];
 
@@ -339,8 +353,8 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   });
   unsubscribeModelResponse();
 
-  agent.onModelResponse((message) => {
-    const summary = summarizeMessage(message);
+  agent.onModelResponse((output) => {
+    const summary = summarizeOutput(output);
 
     modelResponses.push(summary);
     console.log(`model response before append: ${summary}`);
@@ -509,19 +523,27 @@ async function runExpectedAgentErrorDemo(agent: Agent): Promise<void> {
   }
 }
 
-function summarizeMessage(message: AgentContext): string {
-  if (message.role !== 'assistant') {
-    return message.role;
-  }
+function summarizeOutput(output: readonly AgentResponseOutputItem[]): string {
+  return output
+    .map((item) => {
+      if (item.type === 'function_call' && 'name' in item) {
+        return `function_call:${String(item.name)}`;
+      }
 
-  const toolNames = message.toolCalls?.map((toolCall) => toolCall.name).join(', ') ?? 'none';
-  const content = message.content?.replace(/\s+/g, ' ').trim() ?? '';
+      if (item.type === 'message' && 'role' in item) {
+        return `message:${String(item.role)}`;
+      }
 
-  return `assistant content=${JSON.stringify(content)} tools=${toolNames}`;
+      return item.type;
+    })
+    .join(', ');
 }
 
-function countRole(messages: readonly AgentContext[], role: AgentContext['role']): number {
-  return messages.filter((message) => message.role === role).length;
+function countRole(
+  messages: readonly AgentContext[],
+  role: 'system' | 'developer' | 'user' | 'assistant',
+): number {
+  return messages.filter((message) => 'role' in message && message.role === role).length;
 }
 
 function toErrorMessage(error: unknown): string {
