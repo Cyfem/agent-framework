@@ -61,6 +61,7 @@ function registerToolDefinition(
   metadata: Record<PropertyKey, unknown>,
   definition: ToolDefinition,
 ): void {
+  // 子类第一次写入 metadata 时需要复制父类数组，否则会把子类工具挂到父类上。
   const hasOwnDefinitions = Object.prototype.hasOwnProperty.call(
     metadata,
     toolDefinitionsMetadataKey,
@@ -78,6 +79,7 @@ function registerToolDefinition(
 }
 
 function getMetadataSymbol(): symbol {
+  // 兼容不同运行时对 2023-11 decorator metadata symbol 的实现命名。
   return (
     (Symbol as typeof Symbol & { metadata?: symbol }).metadata ?? Symbol.for('Symbol.metadata')
   );

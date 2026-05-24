@@ -2,10 +2,10 @@
  * 金融新闻离线冒烟 demo：以固定 RSS fixture 和固定模型调用顺序验证抓取、
  * 筛选、排序、简报生成及结束工具的完整链路。
  */
-import {
-  Model,
-  type ModelResponsesRequest,
-  type ModelResponsesResponse,
+import type {
+  ModelGenerateRequest,
+  ModelGenerateResult,
+  OpenAIResponsesProtocol,
 } from '@manee/agent-framework';
 
 import {
@@ -13,6 +13,7 @@ import {
   FinanceMarketNewsAgent,
   type FinanceNewsTransport,
 } from './finance-news/agent';
+import { ResponsesMockModel } from './responses-mock-model';
 
 const fixedNow = new Date('2026-05-22T12:00:00.000Z');
 const requiredTools = [
@@ -26,10 +27,12 @@ const requiredTools = [
 ];
 
 /** 逐轮返回预期工具调用，使离线测试不依赖网络或真实 LLM。 */
-class FinanceNewsSmokeModel extends Model {
+class FinanceNewsSmokeModel extends ResponsesMockModel {
   #round = 0;
 
-  async responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse> {
+  async generate(
+    request: ModelGenerateRequest<OpenAIResponsesProtocol>,
+  ): Promise<ModelGenerateResult<OpenAIResponsesProtocol>> {
     this.#round += 1;
 
     const toolNames = request.tools.map((tool) => tool.name);
@@ -184,9 +187,13 @@ assertSmoke(
 
 console.log(`finance news smoke ready: messages=${finalContext.length}`);
 
-function toolResponse(id: string, name: string, parameters: unknown): ModelResponsesResponse {
+function toolResponse(
+  id: string,
+  name: string,
+  parameters: unknown,
+): ModelGenerateResult<OpenAIResponsesProtocol> {
   return {
-    output: [
+    messages: [
       {
         type: 'function_call',
         id: `fc_${id}`,

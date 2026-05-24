@@ -4,10 +4,10 @@
  */
 import {
   Agent,
-  OpenAIModel,
+  OpenAIResponsesModel,
   Tool,
-  type AgentContext,
-  type AgentResponseOutputItem,
+  type OpenAIResponsesContext,
+  type OpenAIResponsesProtocol,
 } from '@manee/agent-framework';
 import { z } from 'zod';
 
@@ -31,7 +31,7 @@ const defaultArkModel = 'doubao-seed-2-0-pro-260215';
 let memoryDescriptionBuilds = 0;
 
 /** 由父代理调度的质量复核子代理，用于验证 `agent-result` 汇报协议。 */
-class QualityReviewAgent extends Agent {
+class QualityReviewAgent extends Agent<OpenAIResponsesProtocol> {
   static name = 'quality-reviewer';
   static description = 'Reviews the parent agent demo state and returns a concise quality summary.';
 
@@ -45,6 +45,7 @@ class QualityReviewAgent extends Agent {
     }),
   })
   #reviewChecklist(parameters: unknown): Record<string, unknown> {
+    // 子代理工具返回结构化审查结果，父代理通过 agent-result 获取摘要。
     const { artifact, checklist } = parameters as {
       artifact: string;
       checklist: string[];
@@ -60,7 +61,7 @@ class QualityReviewAgent extends Agent {
 }
 
 /** 以内存工单为业务载体，集中暴露框架主要能力的父代理。 */
-class ArkComplexDemoAgent extends Agent {
+class ArkComplexDemoAgent extends Agent<OpenAIResponsesProtocol> {
   #nextTicketId = 1;
   #tickets = new Map<string, Ticket>();
 
@@ -75,6 +76,7 @@ class ArkComplexDemoAgent extends Agent {
     }),
   })
   #createTicket(parameters: unknown): Ticket {
+    // 创建内存工单，后续工具会围绕同一个 ticketId 累积状态。
     const { title, priority, tags } = parameters as {
       title: string;
       priority: Priority;
@@ -104,6 +106,7 @@ class ArkComplexDemoAgent extends Agent {
     }),
   })
   #appendTicketNote(parameters: unknown): Ticket | string {
+    // 找不到工单时返回可读错误，由模型决定是否修正参数。
     const { ticketId, note } = parameters as {
       ticketId: string;
       note: string;
@@ -128,6 +131,7 @@ class ArkComplexDemoAgent extends Agent {
     }),
   })
   #estimateEffort(parameters: unknown): Ticket | string {
+    // effort 工具同时验证 Zod number/enum 参数和对象工具结果序列化。
     const { ticketId, points, confidence } = parameters as {
       ticketId: string;
       points: number;
@@ -167,6 +171,7 @@ class ArkComplexDemoAgent extends Agent {
     }),
   })
   #searchMemory(parameters: unknown): string[] {
+    // 模拟只读检索工具，用于覆盖数组结果序列化。
     const { query, limit } = parameters as {
       query: string;
       limit: number;
@@ -188,6 +193,7 @@ class ArkComplexDemoAgent extends Agent {
     description: 'Return a compact summary of all in-memory tickets.',
   })
   #summarizeBoard(): Record<string, unknown> {
+    // 汇总工具无参数，验证默认空对象 schema。
     const tickets = [...this.#tickets.values()];
 
     return {
@@ -204,6 +210,7 @@ class ArkComplexDemoAgent extends Agent {
       'Return static configuration values for this demo. This tool intentionally has no parameters.',
   })
   #readProjectConfig(): Record<string, unknown> {
+    // 动态 description 工具读取当前上下文长度，但 handler 仍保持纯返回。
     return {
       runtime: 'node',
       provider: 'ark-coding-plan',
@@ -221,6 +228,7 @@ class ArkComplexDemoAgent extends Agent {
     }),
   })
   #riskyOperation(): string {
+    // before hook 会取消该工具，若真实执行则说明 errorCancel 回归失败。
     return 'This should never be returned when errorCancel is working.';
   }
 
@@ -233,6 +241,7 @@ class ArkComplexDemoAgent extends Agent {
     }),
   })
   #unstableTool(parameters: unknown): string {
+    // 按参数制造 calling 阶段异常，覆盖工具错误包装和 onToolCallError。
     const { reason } = parameters as {
       reason: string;
     };
@@ -260,7 +269,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   let runtimeInjectionDone = false;
   let unsubscribedModelResponses = 0;
   let runtimeStateReportCalls = 0;
-  const restoredContext: AgentContext[] = [
+  const restoredContext: OpenAIResponsesContext[] = [
     {
       role: 'user',
       content: [{ type: 'input_text', text: 'Previous Ark demo warm-up request.' }],
@@ -270,10 +279,12 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
       id: 'msg_previous',
       role: 'assistant',
       status: 'completed',
-      content: [{ type: 'output_text', text: 'Previous Ark demo warm-up response.' }],
+      content: [
+        { type: 'output_text', text: 'Previous Ark demo warm-up response.', annotations: [] },
+      ],
     },
   ];
-  const restoredHistory: AgentContext[] = [
+  const restoredHistory: OpenAIResponsesContext[] = [
     ...restoredContext,
     {
       role: 'user',
@@ -287,7 +298,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   ];
 
   const agent = new ArkComplexDemoAgent({
-    llm: new OpenAIModel({
+    llm: new OpenAIResponsesModel({
       apiKey,
       baseURL,
       model: modelName,
@@ -524,7 +535,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   await runExpectedAgentErrorDemo(agent);
 }
 
-async function runExpectedAgentErrorDemo(agent: Agent): Promise<void> {
+async function runExpectedAgentErrorDemo(agent: Agent<OpenAIResponsesProtocol>): Promise<void> {
   try {
     await agent.agent('This streaming call should fail and emit onAgentError.', true);
   } catch (error) {
@@ -532,7 +543,7 @@ async function runExpectedAgentErrorDemo(agent: Agent): Promise<void> {
   }
 }
 
-function summarizeOutput(output: readonly AgentResponseOutputItem[]): string {
+function summarizeOutput(output: readonly OpenAIResponsesContext[]): string {
   return output
     .map((item) => {
       if (item.type === 'function_call' && 'name' in item) {
@@ -549,7 +560,7 @@ function summarizeOutput(output: readonly AgentResponseOutputItem[]): string {
 }
 
 function countRole(
-  messages: readonly AgentContext[],
+  messages: readonly OpenAIResponsesContext[],
   role: 'system' | 'developer' | 'user' | 'assistant',
 ): number {
   return messages.filter((message) => 'role' in message && message.role === role).length;

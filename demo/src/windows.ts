@@ -1,6 +1,6 @@
 /**
  * Windows 微信多模态控制 demo：通过 Win32 消息工具驱动桌面窗口，将截图上传到
- * 方舟 Files API 后以视觉输入追加进 Responses 上下文，并由技能手册约束发送流程。
+ * Files API 后以视觉输入追加进 Responses 上下文，并由技能手册约束发送流程。
  *
  * 交互类工具仅在显式启用环境开关时可执行，默认运行只允许观察窗口状态。
  */
@@ -13,18 +13,18 @@ import { promisify } from 'node:util';
 
 import {
   Agent,
-  Model,
-  OpenAIModel,
+  OpenAIResponsesModel,
   Tool,
-  type AgentContext,
-  type AgentFunctionCallOutputItem,
-  type AgentInputContentPart,
-  type AgentInputMessage,
   type AgentOptions,
-  type AgentResponseOutputItem,
   type AgentSkill,
-  type ModelResponsesRequest,
-  type ModelResponsesResponse,
+  type AgentTextPart,
+  type ModelGenerateRequest,
+  type ModelGenerateResult,
+  type OpenAIResponsesContext,
+  type OpenAIResponsesFunctionCallOutput,
+  type OpenAIResponsesInputMessage,
+  type OpenAIResponsesProtocol,
+  type OpenAIResponsesUserExtensionPart,
 } from '@manee/agent-framework';
 import * as koffi from 'koffi';
 import { PNG } from 'pngjs';
@@ -112,7 +112,7 @@ type BitmapInfo = {
 };
 
 /** demo 需要使用的 Win32 FFI 最小函数集合，句柄在 TypeScript 侧统一表示为 bigint。 */
-type Win32Api = {
+export type Win32Api = {
   EnumWindows(callback: (hwnd: bigint, lParam: bigint) => boolean, lParam: bigint): boolean;
   IsWindow(hwnd: bigint): boolean;
   IsWindowVisible(hwnd: bigint): boolean;
@@ -171,29 +171,55 @@ interface WindowCandidate {
   enabled: boolean;
 }
 
-const imageInputParametersSchema = z.object({
-  file_id: z.string().min(1).describe('Ark Files API id for an uploaded image.'),
-  detail: z.enum(['auto', 'low', 'high']).optional().describe('Optional image detail hint.'),
-});
+const imageInputParametersSchema = z
+  .object({
+    file_id: z.string().min(1).optional().describe('Files API id for an uploaded image.'),
+    image_url: z.string().min(1).optional().describe('A supported image URL or data URL.'),
+    detail: z
+      .enum(['auto', 'low', 'high', 'original', 'xhigh'])
+      .optional()
+      .describe('Optional image detail hint.'),
+    image_pixel_limit: z
+      .object({
+        min_pixels: z.number().int().positive().optional(),
+        max_pixels: z.number().int().positive().optional(),
+      })
+      .optional()
+      .describe('Optional Ark api/v3 image pixel limit.'),
+  })
+  .refine((parameters) => Boolean(parameters.file_id) !== Boolean(parameters.image_url), {
+    message: 'Provide exactly one of file_id or image_url.',
+  });
 
-const videoInputParametersSchema = z.object({
-  file_id: z.string().min(1).describe('Ark Files API id for an uploaded video.'),
-});
+const videoInputParametersSchema = z
+  .object({
+    file_id: z.string().min(1).optional().describe('Files API id for an uploaded video.'),
+    video_url: z.string().min(1).optional().describe('A supported video URL.'),
+    fps: z.number().positive().optional().describe('Optional sampling frames per second.'),
+  })
+  .refine((parameters) => Boolean(parameters.file_id) !== Boolean(parameters.video_url), {
+    message: 'Provide exactly one of file_id or video_url.',
+  });
 
-const audioInputParametersSchema = z.object({
-  file_id: z.string().min(1).describe('Ark Files API id for uploaded audio.'),
-});
+const audioInputParametersSchema = z
+  .object({
+    file_id: z.string().min(1).optional().describe('Files API id for uploaded audio.'),
+    audio_url: z.string().min(1).optional().describe('A supported audio URL.'),
+  })
+  .refine((parameters) => Boolean(parameters.file_id) !== Boolean(parameters.audio_url), {
+    message: 'Provide exactly one of file_id or audio_url.',
+  });
 
 type MultimodalKind = 'image' | 'video' | 'audio';
 type ImageInputParameters = z.infer<typeof imageInputParametersSchema>;
 type VideoInputParameters = z.infer<typeof videoInputParametersSchema>;
 type AudioInputParameters = z.infer<typeof audioInputParametersSchema>;
-type MultimodalContentPart = AgentInputContentPart;
+type MultimodalContentPart = AgentTextPart | OpenAIResponsesUserExtensionPart;
 type MultimodalToolResult = {
   id: string;
   type: MultimodalKind;
 };
-type CaptureWindowResult = {
+export type CaptureWindowResult = {
   path: string;
   width: number;
   height: number;
@@ -208,18 +234,24 @@ type CaptureWindowResult = {
  *
  * 包装器不会修改 input/output，仅用于观察真实请求内容。
  */
-class DebugDumpModel extends Model {
-  #inner: Model;
+class DebugDumpModel extends OpenAIResponsesModel {
+  #inner: OpenAIResponsesModel;
   #debugRoot: string;
   #requestIndex = 0;
 
-  constructor(inner: Model, debugRoot: string) {
-    super();
+  constructor(inner: OpenAIResponsesModel, debugRoot: string) {
+    super({
+      apiKey: 'debug-dump-wrapper-unused',
+      model: 'debug-dump-wrapper-unused',
+    });
     this.#inner = inner;
     this.#debugRoot = debugRoot;
   }
 
-  async responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse> {
+  override async generate(
+    request: ModelGenerateRequest<OpenAIResponsesProtocol>,
+  ): Promise<ModelGenerateResult<OpenAIResponsesProtocol>> {
+    // 先落盘完整请求和结构化摘要，再转发给真实模型，便于复现协议错误。
     this.#requestIndex += 1;
     const requestId = String(this.#requestIndex).padStart(3, '0');
     const requestPath = join(this.#debugRoot, `${requestId}-request.json`);
@@ -230,7 +262,7 @@ class DebugDumpModel extends Model {
     await writeJsonFile(summaryPath, summarizeModelRequest(request));
 
     try {
-      const response = await this.#inner.responses(request);
+      const response = await this.#inner.generate(request);
 
       await writeJsonFile(join(this.#debugRoot, `${requestId}-response.json`), response);
       return response;
@@ -242,7 +274,7 @@ class DebugDumpModel extends Model {
 }
 
 /** 移植到 demo 工具命名体系下的微信搜索、验证与发送操作手册。 */
-const weixinWindowsSkill: AgentSkill = {
+export const weixinWindowsSkill: AgentSkill = {
   name: 'Windows 微信联系人搜索与消息发送',
   description:
     '在 Windows 微信桌面端中搜索联系人、打开聊天、输入消息、发送，并通过截图确认每个关键状态。',
@@ -283,12 +315,16 @@ const weixinWindowsSkill: AgentSkill = {
  * 多模态工具先暂存内容块，随后由 after hook 在函数结果之后追加 user input；
  * 截图则由 after hook 直接上传 PNG 并追加可供视觉判断的图片输入。
  */
-class WindowsControlAgent extends Agent {
+export class WindowsControlAgent extends Agent<OpenAIResponsesProtocol> {
   #api: Win32Api;
   #interactiveEnabled: boolean;
   #multimodalInputs = new Map<string, MultimodalContentPart[]>();
 
-  constructor(options: AgentOptions, api: Win32Api, interactiveEnabled: boolean) {
+  constructor(
+    options: AgentOptions<OpenAIResponsesProtocol>,
+    api: Win32Api,
+    interactiveEnabled: boolean,
+  ) {
     super(options);
     this.#api = api;
     this.#interactiveEnabled = interactiveEnabled;
@@ -327,6 +363,7 @@ class WindowsControlAgent extends Agent {
     }),
   })
   async #findWindow(parameters: unknown): Promise<Record<string, unknown>> {
+    // 枚举顶层窗口后在 TypeScript 侧做过滤，避免暴露过多 Win32 FFI 细节给模型。
     const {
       processName,
       className,
@@ -404,6 +441,7 @@ class WindowsControlAgent extends Agent {
     }),
   })
   async #captureWindow(parameters: unknown): Promise<Record<string, unknown>> {
+    // 截图结果只返回路径和元信息，视觉内容由 after hook 上传并追加进上下文。
     const {
       hwnd,
       outputName,
@@ -443,47 +481,62 @@ class WindowsControlAgent extends Agent {
 
   @Tool({
     name: 'input-image',
-    description:
-      'Insert an image uploaded through Ark Files as a multimodal user message for the next model turn.',
+    description: 'Insert an image reference as a multimodal user message for the next model turn.',
     parameters: imageInputParametersSchema,
   })
   async #inputImage(parameters: unknown): Promise<MultimodalToolResult> {
-    const { file_id, detail } = parameters as ImageInputParameters;
+    // 多模态工具只登记 content side-channel，真正追加 user message 由 after hook 完成。
+    const { file_id, image_url, detail, image_pixel_limit } = parameters as ImageInputParameters;
+    const pixelLimit = image_pixel_limit
+      ? {
+          ...(image_pixel_limit.min_pixels === undefined
+            ? {}
+            : { min_pixels: image_pixel_limit.min_pixels }),
+          ...(image_pixel_limit.max_pixels === undefined
+            ? {}
+            : { max_pixels: image_pixel_limit.max_pixels }),
+        }
+      : undefined;
 
     return this.#createMultimodalToolResult('image', {
       type: 'input_image',
-      file_id,
+      ...(file_id ? { file_id } : {}),
+      ...(image_url ? { image_url } : {}),
       ...(detail ? { detail } : {}),
+      ...(pixelLimit ? { image_pixel_limit: pixelLimit } : {}),
     });
   }
 
   @Tool({
     name: 'input-video',
-    description:
-      'Insert a video uploaded through Ark Files as a multimodal user message for the next model turn.',
+    description: 'Insert a video reference as a multimodal user message for the next model turn.',
     parameters: videoInputParametersSchema,
   })
   async #inputVideo(parameters: unknown): Promise<MultimodalToolResult> {
-    const { file_id } = parameters as VideoInputParameters;
+    // Responses 视频输入字段由 protocol 类型约束，工具结果保持轻量避免污染上下文。
+    const { file_id, video_url, fps } = parameters as VideoInputParameters;
 
     return this.#createMultimodalToolResult('video', {
       type: 'input_video',
-      file_id,
+      ...(file_id ? { file_id } : {}),
+      ...(video_url ? { video_url } : {}),
+      ...(fps ? { fps } : {}),
     });
   }
 
   @Tool({
     name: 'input-audio',
-    description:
-      'Insert audio uploaded through Ark Files as a multimodal user message for the next model turn.',
+    description: 'Insert an audio reference as a multimodal user message for the next model turn.',
     parameters: audioInputParametersSchema,
   })
   async #inputAudio(parameters: unknown): Promise<MultimodalToolResult> {
-    const { file_id } = parameters as AudioInputParameters;
+    // 音频可以通过 file_id 或 URL 引用，二进制内容不进入工具结果。
+    const { file_id, audio_url } = parameters as AudioInputParameters;
 
     return this.#createMultimodalToolResult('audio', {
       type: 'input_audio',
-      file_id,
+      ...(file_id ? { file_id } : {}),
+      ...(audio_url ? { audio_url } : {}),
     });
   }
 
@@ -511,6 +564,7 @@ class WindowsControlAgent extends Agent {
     }),
   })
   #sendKeyboardMessage(parameters: unknown): Record<string, unknown> | string {
+    // 交互工具默认禁用，必须由环境变量显式允许，防止 demo 误操作真实窗口。
     if (!this.#interactiveEnabled) {
       return interactiveDisabledMessage();
     }
@@ -562,6 +616,7 @@ class WindowsControlAgent extends Agent {
     }),
   })
   #sendText(parameters: unknown): Record<string, unknown> | string {
+    // WM_CHAR 逐 UTF-16 code unit 投递，适合微信输入中文消息。
     if (!this.#interactiveEnabled) {
       return interactiveDisabledMessage();
     }
@@ -593,6 +648,7 @@ class WindowsControlAgent extends Agent {
     }),
   })
   #clickWindow(parameters: unknown): Record<string, unknown> | string {
+    // 坐标采用目标窗口客户区坐标，由模型根据截图和 skill 中的固定坐标选择。
     if (!this.#interactiveEnabled) {
       return interactiveDisabledMessage();
     }
@@ -751,13 +807,13 @@ class WindowsControlAgent extends Agent {
 
   #createMultimodalToolResult(
     kind: MultimodalKind,
-    mediaPart: Exclude<MultimodalContentPart, { type: 'input_text' }>,
+    mediaPart: OpenAIResponsesUserExtensionPart,
   ): MultimodalToolResult {
     const id = createMultimodalInputId();
 
     this.#multimodalInputs.set(id, [
       {
-        type: 'input_text',
+        type: 'text',
         text: `这是${getMediaKindLabel(kind)}id为${id}的内容`,
       },
       mediaPart,
@@ -770,22 +826,13 @@ class WindowsControlAgent extends Agent {
   }
 }
 
-if (process.platform !== 'win32') {
-  console.error('The Windows control demo only runs on Windows.');
-  process.exitCode = 1;
-} else if (!process.env.ARK_API_KEY) {
-  console.error('Missing ARK_API_KEY. Run this demo with an Ark Coding Plan API key.');
-  process.exitCode = 1;
-} else {
-  await runWindowsDemo(process.env.ARK_API_KEY);
-}
-
 /** 为侧通道中的多模态内容生成便于日志关联的短标识。 */
 function createMultimodalInputId(): string {
   return `id${randomUUID().replaceAll('-', '').slice(0, 12)}`;
 }
 
 function getMediaKindLabel(kind: MultimodalKind): string {
+  // 注入给模型的中文说明需要区分图片、视频和音频三种内容。
   if (kind === 'image') {
     return '图片';
   }
@@ -798,7 +845,12 @@ function getMediaKindLabel(kind: MultimodalKind): string {
 }
 
 // 工具结果已由 core 写入上下文；此处再追加多模态 user input，保证请求顺序合法。
-function appendMultimodalToolResult(agent: WindowsControlAgent, result: unknown): void {
+function appendMultimodalToolResult(
+  agent: WindowsControlAgent,
+  model: OpenAIResponsesModel,
+  result: unknown,
+): void {
+  // 工具结果只包含 id；真实多模态内容从 Agent 侧通道中取出并追加。
   if (!isMultimodalToolResult(result)) {
     return;
   }
@@ -809,10 +861,7 @@ function appendMultimodalToolResult(agent: WindowsControlAgent, result: unknown)
     return;
   }
 
-  agent.appendContext({
-    role: 'user',
-    content,
-  });
+  agent.appendContext(model.buildUserMessage({ content }));
 }
 
 /**
@@ -822,7 +871,7 @@ function appendMultimodalToolResult(agent: WindowsControlAgent, result: unknown)
  */
 async function appendScreenshotToolResult(
   agent: WindowsControlAgent,
-  model: OpenAIModel,
+  model: OpenAIResponsesModel,
   result: unknown,
 ): Promise<void> {
   if (!isCaptureWindowResult(result)) {
@@ -833,47 +882,50 @@ async function appendScreenshotToolResult(
     const uploaded = await model.uploadFile(result.path, { purpose: 'user_data' });
     const id = createMultimodalInputId();
 
-    agent.appendContext({
-      role: 'user',
-      content: [
-        {
-          type: 'input_image',
-          file_id: uploaded.id,
-          detail: 'high',
-        },
-        {
-          type: 'input_text',
-          text: [
-            `This is window screenshot id=${id}.`,
-            `hwnd=${result.hwnd}`,
-            `title=${result.title || '(empty)'}`,
-            `className=${result.className}`,
-            `path=${result.path}`,
-            `size=${result.width}x${result.height}`,
-          ].join('\n'),
-        },
-      ],
-    });
+    agent.appendContext(
+      model.buildUserMessage({
+        content: [
+          {
+            type: 'input_image',
+            file_id: uploaded.id,
+            detail: 'high',
+          },
+          {
+            type: 'text',
+            text: [
+              `This is window screenshot id=${id}.`,
+              `hwnd=${result.hwnd}`,
+              `title=${result.title || '(empty)'}`,
+              `className=${result.className}`,
+              `path=${result.path}`,
+              `size=${result.width}x${result.height}`,
+            ].join('\n'),
+          },
+        ],
+      }),
+    );
   } catch (error) {
-    agent.appendContext({
-      role: 'user',
-      content: [
-        {
-          type: 'input_text',
-          text: [
-            `The screenshot at ${result.path} could not be uploaded for visual analysis.`,
-            'The current window state has not been visually confirmed.',
-            'Do not continue with any click or send action that requires visual confirmation.',
-          ].join('\n'),
-        },
-      ],
-    });
+    agent.appendContext(
+      model.buildUserMessage({
+        content: [
+          {
+            type: 'text',
+            text: [
+              `The screenshot at ${result.path} could not be uploaded for visual analysis.`,
+              'The current window state has not been visually confirmed.',
+              'Do not continue with any click or send action that requires visual confirmation.',
+            ].join('\n'),
+          },
+        ],
+      }),
+    );
 
     throw error;
   }
 }
 
 function isMultimodalToolResult(result: unknown): result is MultimodalToolResult {
+  // after hook 的 result 来自任意工具，必须先做轻量类型保护。
   if (!result || typeof result !== 'object') {
     return false;
   }
@@ -888,6 +940,7 @@ function isMultimodalToolResult(result: unknown): result is MultimodalToolResult
 }
 
 function isCaptureWindowResult(result: unknown): result is CaptureWindowResult {
+  // 截图上传只依赖路径、窗口标识和尺寸等必要字段。
   if (!result || typeof result !== 'object') {
     return false;
   }
@@ -911,11 +964,13 @@ async function writeJsonFile(path: string, value: unknown): Promise<void> {
 }
 
 // 摘要日志仅保留结构和 file_id，不会把上传的媒体二进制内容复制进日志。
-function summarizeModelRequest(request: ModelResponsesRequest): Record<string, unknown> {
+function summarizeModelRequest(
+  request: ModelGenerateRequest<OpenAIResponsesProtocol>,
+): Record<string, unknown> {
   return {
-    inputCount: request.input.length,
+    inputCount: request.context.length,
     toolCount: request.tools.length,
-    input: request.input.map((message, index) => ({
+    input: request.context.map((message, index) => ({
       index,
       ...summarizeRequestItem(message),
     })),
@@ -923,7 +978,8 @@ function summarizeModelRequest(request: ModelResponsesRequest): Record<string, u
   };
 }
 
-function summarizeRequestItem(message: AgentContext): Record<string, unknown> {
+function summarizeRequestItem(message: OpenAIResponsesContext): Record<string, unknown> {
+  // 调试摘要按 Responses item 类型分支，避免把完整二进制或长文本写进摘要。
   if (isAgentInputMessage(message)) {
     return {
       type: message.type ?? 'input_message',
@@ -953,7 +1009,7 @@ function summarizeRequestItem(message: AgentContext): Record<string, unknown> {
     return {
       type: message.type,
       callId: message.call_id,
-      outputPreview: message.output.slice(0, 240),
+      outputPreview: stringifyForPreview(message.output).slice(0, 240),
     };
   }
 
@@ -963,7 +1019,9 @@ function summarizeRequestItem(message: AgentContext): Record<string, unknown> {
   };
 }
 
-function isAgentInputMessage(message: AgentContext): message is AgentInputMessage {
+function isAgentInputMessage(
+  message: OpenAIResponsesContext,
+): message is OpenAIResponsesInputMessage {
   return (
     'role' in message &&
     (message.role === 'system' || message.role === 'developer' || message.role === 'user') &&
@@ -972,17 +1030,26 @@ function isAgentInputMessage(message: AgentContext): message is AgentInputMessag
   );
 }
 
-function isFunctionCallOutputItem(message: AgentContext): message is AgentFunctionCallOutputItem {
+function isFunctionCallOutputItem(
+  message: OpenAIResponsesContext,
+): message is OpenAIResponsesFunctionCallOutput {
   return (
     message.type === 'function_call_output' &&
     'call_id' in message &&
     typeof message.call_id === 'string' &&
-    'output' in message &&
-    typeof message.output === 'string'
+    'output' in message
   );
 }
 
-function summarizeRequestContent(content: readonly AgentInputContentPart[]): unknown {
+function summarizeRequestContent(content: OpenAIResponsesInputMessage['content']): unknown {
+  if (typeof content === 'string') {
+    return {
+      type: 'text',
+      length: content.length,
+      preview: content.slice(0, 240),
+    };
+  }
+
   return content.map((part) => {
     if (part.type === 'input_text') {
       return {
@@ -1003,6 +1070,7 @@ function summarizeRequestContent(content: readonly AgentInputContentPart[]): unk
     return {
       type: part.type,
       fileId: part.file_id,
+      url: 'video_url' in part ? part.video_url : 'audio_url' in part ? part.audio_url : undefined,
     };
   });
 }
@@ -1029,12 +1097,20 @@ function serializeError(error: unknown): Record<string, unknown> {
   };
 }
 
+function stringifyForPreview(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 /**
  * 按环境变量装配模型、技能和安全开关，并运行一次微信窗口操作任务。
  *
  * `ARK_WINDOWS_DEMO_INTERACTIVE=1` 是允许发出键盘、文字和鼠标消息的明确授权。
  */
-async function runWindowsDemo(apiKey: string): Promise<void> {
+export async function runWindowsDemo(apiKey: string): Promise<void> {
   const baseURL = process.env.ARK_BASE_URL ?? defaultArkBaseURL;
   const modelName = process.env.ARK_MODEL ?? defaultArkModel;
   const api = createWin32Api();
@@ -1042,7 +1118,7 @@ async function runWindowsDemo(apiKey: string): Promise<void> {
   const recipient = process.env.ARK_WEIXIN_RECIPIENT?.trim() || '躲在月影中';
   const messageText = process.env.ARK_WEIXIN_MESSAGE?.trim() || '你好';
   const debugRoot = join(artifactRoot, 'debug', String(Date.now()));
-  const llm = new OpenAIModel({
+  const llm = new OpenAIResponsesModel({
     apiKey,
     baseURL,
     model: modelName,
@@ -1092,7 +1168,7 @@ async function runWindowsDemo(apiKey: string): Promise<void> {
     agent.onAfterToolCall(
       toolName,
       (_parameters, _message, result) => {
-        appendMultimodalToolResult(agent, result);
+        appendMultimodalToolResult(agent, llm, result);
       },
       {
         await: true,
@@ -1167,7 +1243,7 @@ async function runWindowsDemo(apiKey: string): Promise<void> {
 /**
  * 在单一边界内绑定 user32、gdi32 与 kernel32，避免 FFI 类型细节散落在工具实现中。
  */
-function createWin32Api(): Win32Api {
+export function createWin32Api(): Win32Api {
   const rectType = koffi.struct('RECT', {
     left: 'long',
     top: 'long',
@@ -1331,6 +1407,7 @@ async function listTopLevelWindows(api: Win32Api): Promise<WindowCandidate[]> {
 }
 
 async function listProcessNameMap(): Promise<Map<number, string>> {
+  // PowerShell Get-Process 比逐个 Win32 查询进程路径更简单，且足够支撑 demo 过滤。
   const script = [
     "$ErrorActionPreference = 'Stop'",
     '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
@@ -1380,6 +1457,7 @@ async function listProcessNameMap(): Promise<Map<number, string>> {
 }
 
 function getWindowTitle(api: Win32Api, hwnd: bigint): string {
+  // Win32 标题是 UTF-16LE，读取后移除尾部 NUL。
   const length = Math.max(0, api.GetWindowTextLengthW(hwnd));
   const buffer = Buffer.alloc((length + 1) * 2);
 
@@ -1388,6 +1466,7 @@ function getWindowTitle(api: Win32Api, hwnd: bigint): string {
 }
 
 function getWindowClassName(api: Win32Api, hwnd: bigint): string {
+  // 类名用于识别微信主窗口和独立搜索下拉窗口。
   const maxCount = 512;
   const buffer = Buffer.alloc(maxCount * 2);
   const length = api.GetClassNameW(hwnd, buffer, maxCount);
@@ -1399,6 +1478,7 @@ function getWindowClassName(api: Win32Api, hwnd: bigint): string {
 }
 
 function parseHwnd(value: string): bigint {
+  // 对外统一推荐十六进制字符串，但也兼容十进制输入。
   const text = value.trim();
 
   if (!text) {
@@ -1413,10 +1493,12 @@ function parseHwnd(value: string): bigint {
 }
 
 function formatHwnd(hwnd: bigint): string {
+  // 工具结果中的 hwnd 保持固定 0x 前缀，方便模型后续原样传回。
   return `0x${hwnd.toString(16).padStart(8, '0')}`;
 }
 
 function sanitizeFileName(value: string): string {
+  // 截图文件名来自窗口标题时需要去掉 Windows 不允许的字符。
   const sanitized = value
     .split('')
     .map((char) => (char.charCodeAt(0) < 32 || '<>:"/\\|?*'.includes(char) ? '-' : char))
@@ -1464,6 +1546,7 @@ function bgraToPng(buffer: Buffer, width: number, height: number): PNG {
 }
 
 function resolveKeyCode(key: string): number {
+  // 支持常用按键名、单字母和数字，其余复杂组合由 modifiers 参数表达。
   const normalized = key.trim();
   const lower = normalized.toLowerCase();
   const mapped = keyCodes[lower];
@@ -1484,14 +1567,17 @@ function resolveKeyCode(key: string): number {
 }
 
 function makeLParam(x: number, y: number): bigint {
+  // 鼠标消息的 lParam 低 16 位为 x，高 16 位为 y。
   return BigInt(((y & 0xffff) << 16) | (x & 0xffff));
 }
 
 function interactiveDisabledMessage(): string {
+  // 交互开关关闭时把限制作为工具结果交给模型，而不是直接抛错中断流程。
   return 'Interactive Windows actions are disabled. Set ARK_WINDOWS_DEMO_INTERACTIVE=1 to allow keyboard, text, or mouse tools.';
 }
 
-function summarizeOutput(output: readonly AgentResponseOutputItem[]): string {
+function summarizeOutput(output: readonly OpenAIResponsesContext[]): string {
+  // 终端只显示本轮模型输出的高层结构，详细内容已写入 debug dump。
   return output
     .map((item) => {
       if (item.type === 'function_call' && 'name' in item) {
@@ -1508,11 +1594,13 @@ function summarizeOutput(output: readonly AgentResponseOutputItem[]): string {
 }
 
 function summarizeResult(result: unknown): string {
+  // 工具结果可能包含窗口列表，日志中截断避免刷屏。
   const text = typeof result === 'string' ? result : JSON.stringify(result);
 
   return text.length > 400 ? `${text.slice(0, 400)}...` : text;
 }
 
 function toErrorMessage(error: unknown): string {
+  // 事件错误类型不固定，统一转成可读短文本。
   return error instanceof Error ? error.message : String(error);
 }

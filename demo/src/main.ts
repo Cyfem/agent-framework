@@ -4,27 +4,35 @@
  */
 import {
   Agent,
-  Model,
+  OpenAIChatModel,
   Tool,
-  type AgentContext,
-  type AgentInputMessage,
-  type ModelResponsesRequest,
-  type ModelResponsesResponse,
+  type ModelGenerateRequest,
+  type ModelGenerateResult,
+  type OpenAIChatProtocol,
+  type OpenAIResponsesContext,
+  type OpenAIResponsesInputMessage,
+  type OpenAIResponsesProtocol,
 } from '@manee/agent-framework';
 import { z } from 'zod';
 
+import { ResponsesMockModel } from './responses-mock-model';
+
 /** 按固定轮次产生工具调用，并验证提供方 output 字段在下一轮请求中未丢失。 */
-class MockModel extends Model {
+class MockModel extends ResponsesMockModel {
   #round = 0;
 
-  async responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse> {
+  async generate(
+    request: ModelGenerateRequest<OpenAIResponsesProtocol>,
+  ): Promise<ModelGenerateResult<OpenAIResponsesProtocol>> {
     this.#round += 1;
 
-    const systemMessages = request.input.filter(isSystemInputMessage);
+    const systemMessages = request.context.filter(isSystemInputMessage);
     const skillPrompt = systemMessages.find((message) =>
       readInputText(message).includes('get-skill'),
     );
     const getSkillTool = request.tools.find((tool) => tool.name === 'get-skill');
+    const saveNoteTool = request.tools.find((tool) => tool.name === 'save-note');
+    const runtimeNoteTool = request.tools.find((tool) => tool.name === 'runtime-note');
 
     assertDemo(Boolean(skillPrompt), 'Expected skill system prompt to be present.');
     assertDemo(
@@ -38,6 +46,14 @@ class MockModel extends Model {
       getSkillTool?.description === '获取指定下标的技能手册完整内容。',
       'Expected get-skill description to stay static.',
     );
+    assertDemo(
+      saveNoteTool !== undefined && !('strict' in saveNoteTool),
+      'Expected an unspecified Responses strict option to be omitted.',
+    );
+    assertDemo(
+      runtimeNoteTool?.strict === false,
+      'Expected an explicitly disabled Responses strict option to be preserved.',
+    );
 
     console.log(
       `round ${this.#round}: ${systemMessages.length} system prompt(s), ${request.tools.length} tool(s)`,
@@ -45,14 +61,18 @@ class MockModel extends Model {
 
     if (this.#round === 2) {
       assertDemo(
-        hasPreservedFunctionCall(request.input, 'call_get_skill'),
+        hasPreservedFunctionCall(request.context, 'call_get_skill'),
         'Expected model output fields to be preserved in the next Responses input.',
+      );
+      assertDemo(
+        hasPreservedReasoning(request.context, 'call_get_skill'),
+        'Expected declared Responses reasoning fields to be preserved.',
       );
     }
 
     if (this.#round === 3) {
       assertDemo(
-        hasPreservedFunctionCall(request.input, 'call_save_note'),
+        hasPreservedFunctionCall(request.context, 'call_save_note'),
         'Expected later model output fields to be preserved in Responses input.',
       );
     }
@@ -70,7 +90,7 @@ class MockModel extends Model {
 }
 
 /** 用 private 装饰器工具验证实例注册以及 before-cancel 工具结果写入。 */
-class DemoAgent extends Agent {
+class DemoAgent extends Agent<OpenAIResponsesProtocol> {
   @Tool({
     name: 'save-note',
     description: 'Save a note for the current demo task.',
@@ -85,11 +105,13 @@ class DemoAgent extends Agent {
 }
 
 /** 分别驱动父代理与 worker 子代理的离线模型，用于覆盖 agent-result 汇报流程。 */
-class SubAgentDemoModel extends Model {
+class SubAgentDemoModel extends ResponsesMockModel {
   #parentRound = 0;
   #workerRound = 0;
 
-  async responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse> {
+  async generate(
+    request: ModelGenerateRequest<OpenAIResponsesProtocol>,
+  ): Promise<ModelGenerateResult<OpenAIResponsesProtocol>> {
     const toolNames = request.tools.map((tool) => tool.name);
 
     if (toolNames.includes('agent-result')) {
@@ -127,7 +149,7 @@ class SubAgentDemoModel extends Model {
 }
 
 /** 暂停首个请求，以稳定复现并发触发第二次 `agent()` 的场景。 */
-class ConcurrentDemoModel extends Model {
+class ConcurrentDemoModel extends ResponsesMockModel {
   #markStarted: (() => void) | undefined;
   #release: (() => void) | undefined;
   readonly started: Promise<void>;
@@ -139,7 +161,7 @@ class ConcurrentDemoModel extends Model {
     });
   }
 
-  async responses(): Promise<ModelResponsesResponse> {
+  async generate(): Promise<ModelGenerateResult<OpenAIResponsesProtocol>> {
     this.#markStarted?.();
 
     await new Promise<void>((resolve) => {
@@ -154,8 +176,132 @@ class ConcurrentDemoModel extends Model {
   }
 }
 
+/** 使用 Chat wire structure 验证多工具展开、上下文回传与 tool role 结果解析。 */
+class ChatDemoModel extends OpenAIChatModel {
+  #round = 0;
+
+  constructor() {
+    super({
+      apiKey: 'offline-chat-mock-key',
+      model: 'offline-chat-mock-model',
+    });
+  }
+
+  override async generate(
+    request: ModelGenerateRequest<OpenAIChatProtocol>,
+  ): Promise<ModelGenerateResult<OpenAIChatProtocol>> {
+    this.#round += 1;
+
+    if (this.#round === 1) {
+      assertDemo(
+        request.tools.some(
+          (tool) => tool.function.name === 'chat-record' && tool.function.strict === true,
+        ),
+        'Expected Chat model to receive an explicitly strict function tool.',
+      );
+
+      return {
+        messages: [
+          {
+            role: 'assistant',
+            content: null,
+            refusal: null,
+            annotations: [
+              {
+                type: 'url_citation',
+                url_citation: {
+                  start_index: 0,
+                  end_index: 4,
+                  title: 'Demo citation',
+                  url: 'https://example.com/chat-citation',
+                },
+              },
+            ],
+            tool_calls: [
+              {
+                id: 'chat_call_first',
+                type: 'function',
+                function: { name: 'chat-record', arguments: '{"value":"first"}' },
+              },
+              {
+                id: 'chat_call_second',
+                type: 'function',
+                function: { name: 'chat-record', arguments: '{"value":"second"}' },
+              },
+            ],
+          },
+        ],
+      };
+    }
+
+    const results = this.parseToolCallOutputMessages(request.context);
+
+    assertDemo(results.length === 2, 'Expected both Chat tool results in the next request.');
+    assertDemo(
+      results.map((result) => result.message.output).join(',') === 'recorded:first,recorded:second',
+      'Expected Chat tools to execute in source order.',
+    );
+    assertDemo(
+      request.context.some(
+        (message) =>
+          message.role === 'assistant' &&
+          message.annotations?.[0]?.url_citation.title === 'Demo citation',
+      ),
+      'Expected declared Chat assistant response fields to be passed through.',
+    );
+
+    return {
+      messages: [
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: 'chat_call_end',
+              type: 'function',
+              function: { name: 'end-agent', arguments: '{}' },
+            },
+          ],
+        },
+      ],
+    };
+  }
+}
+
+class EmptyChatDemoModel extends OpenAIChatModel {
+  calls = 0;
+
+  constructor() {
+    super({
+      apiKey: 'offline-chat-mock-key',
+      model: 'offline-chat-mock-model',
+    });
+  }
+
+  override async generate(): Promise<ModelGenerateResult<OpenAIChatProtocol>> {
+    this.calls += 1;
+    return { messages: [] };
+  }
+}
+
+class ChatDemoAgent extends Agent<OpenAIChatProtocol> {
+  @Tool({
+    name: 'chat-record',
+    description: 'Record a Chat protocol tool execution.',
+    parameters: z.object({
+      value: z.string(),
+    }),
+    strict: true,
+  })
+  #chatRecord(parameters: unknown): string {
+    const { value } = parameters as { value: string };
+
+    return `recorded:${value}`;
+  }
+}
+
 /** 供内置 `agent` 工具调度的最小子代理。 */
-class WorkerAgent extends Agent {
+class WorkerAgent extends Agent<OpenAIResponsesProtocol> {
   static name = 'worker';
   static description = 'A small worker agent used by the local sub-agent demo.';
 
@@ -173,7 +319,7 @@ class WorkerAgent extends Agent {
 }
 
 // 先恢复一段包含响应元数据的历史，后续轮次会验证其透传行为。
-const restoredHistory: AgentContext[] = [
+const restoredHistory: OpenAIResponsesContext[] = [
   {
     role: 'user',
     content: [{ type: 'input_text', text: 'Previous demo request.' }],
@@ -183,7 +329,8 @@ const restoredHistory: AgentContext[] = [
     id: 'msg_previous',
     role: 'assistant',
     status: 'completed',
-    content: [{ type: 'output_text', text: 'Previous demo response.' }],
+    phase: 'final_answer',
+    content: [{ type: 'output_text', text: 'Previous demo response.', annotations: [] }],
   },
 ];
 
@@ -209,6 +356,7 @@ const agent = new DemoAgent({
 agent.tools.push({
   name: 'runtime-note',
   description: 'Runtime-only tool pushed directly into the public tools array.',
+  strict: false,
   handler: () => 'runtime note ready',
 });
 
@@ -242,10 +390,21 @@ try {
 
 try {
   await uninitializedAgent.toolCall({
-    type: 'function_call',
-    call_id: 'call_uninitialized',
+    id: 'call_uninitialized',
     name: 'missing',
     arguments: '{}',
+    sourceMessage: {
+      type: 'function_call',
+      call_id: 'call_uninitialized',
+      name: 'missing',
+      arguments: '{}',
+    },
+    sourceCall: {
+      type: 'function_call',
+      call_id: 'call_uninitialized',
+      name: 'missing',
+      arguments: '{}',
+    },
   });
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
@@ -265,6 +424,23 @@ restoredHistory.push({
 });
 console.log(`restored context after external mutation=${agent.getContext().length}`);
 
+const outputParserModel = new MockModel();
+const contentArrayToolOutputs = outputParserModel.parseToolCallOutputMessages([
+  {
+    type: 'function_call_output',
+    call_id: 'call_content_array_output',
+    output: [{ type: 'input_text', text: 'tool output content item' }],
+  },
+]);
+
+assertDemo(
+  contentArrayToolOutputs.length === 1 &&
+    Array.isArray(contentArrayToolOutputs[0]?.message.output) &&
+    contentArrayToolOutputs[0]?.message.output[0]?.type === 'input_text',
+  'Expected Responses parser to preserve array function_call_output content.',
+);
+console.log('Responses function_call_output array parser demo ready.');
+
 agent.addSystemPrompts('Keep tool calls minimal.');
 agent.addSkill({
   name: 'runtime-skill',
@@ -277,7 +453,9 @@ agent.onModelResponse((output) => {
     output.every((item) => !agent.getContext().includes(item)),
     'Expected onModelResponse before output items are appended.',
   );
-  console.log(`model response: ${output.map((item) => item.type).join(',')}`);
+  console.log(
+    `model response: ${output.map((item) => ('type' in item ? item.type : item.role)).join(',')}`,
+  );
 });
 
 agent.onAfterToolCall(
@@ -382,15 +560,53 @@ assertDemo(concurrentEndedStatuses === 1, 'Expected first concurrent agent run t
 
 console.log(`Concurrent demo ready: final context messages=${concurrentContext.length}`);
 
-function toolResponse(id: string, name: string, parameters: unknown): ModelResponsesResponse {
+// Chat 协议使用同一个 Agent 编排器，且能把同一 assistant 消息中的多个调用顺序展开。
+const chatAgent = new ChatDemoAgent({
+  llm: new ChatDemoModel(),
+});
+
+chatAgent.init();
+
+const chatContext = await chatAgent.agent('Run the Chat protocol demo.');
+const chatToolResults = chatContext.filter((message) => message.role === 'tool');
+
+assertDemo(chatToolResults.length === 3, 'Expected two Chat tool results plus end-agent result.');
+console.log(`Chat demo ready: final context messages=${chatContext.length}`);
+
+const emptyChatModel = new EmptyChatDemoModel();
+const emptyChatAgent = new Agent<OpenAIChatProtocol>({
+  llm: emptyChatModel,
+});
+let emptyChatError = '';
+
+emptyChatAgent.init();
+
+try {
+  await emptyChatAgent.agent('Return no Chat choices.');
+} catch (error) {
+  emptyChatError = error instanceof Error ? error.message : String(error);
+}
+
+assertDemo(
+  emptyChatError === 'Model returned no messages after 4 attempt(s).',
+  'Expected empty Chat responses to fail after three retries.',
+);
+assertDemo(emptyChatModel.calls === 4, 'Expected one Chat request plus three retries.');
+console.log('Chat empty-response retry demo ready.');
+
+function toolResponse(
+  id: string,
+  name: string,
+  parameters: unknown,
+): ModelGenerateResult<OpenAIResponsesProtocol> {
   return {
-    output: [
+    messages: [
       {
         type: 'reasoning',
         id: `rs_${id}`,
         status: 'completed',
         summary: [{ type: 'summary_text', text: `considering ${name}` }],
-        providerMarker: `reasoning:${id}`,
+        encrypted_content: `encrypted:${id}`,
       },
       {
         type: 'function_call',
@@ -399,32 +615,48 @@ function toolResponse(id: string, name: string, parameters: unknown): ModelRespo
         name,
         arguments: JSON.stringify(parameters),
         status: 'completed',
-        providerMarker: `preserved:${id}`,
       },
     ],
   };
 }
 
-function hasPreservedFunctionCall(input: readonly AgentContext[], callId: string): boolean {
+function hasPreservedFunctionCall(
+  input: readonly OpenAIResponsesContext[],
+  callId: string,
+): boolean {
   return input.some(
     (item) =>
       item.type === 'function_call' &&
       'call_id' in item &&
       item.call_id === callId &&
-      'status' in item &&
       item.status === 'completed' &&
-      'providerMarker' in item &&
-      item.providerMarker === `preserved:${callId}`,
+      item.id === `fc_${callId}`,
   );
 }
 
-function isSystemInputMessage(message: AgentContext): message is AgentInputMessage {
+function hasPreservedReasoning(input: readonly OpenAIResponsesContext[], callId: string): boolean {
+  return input.some(
+    (item) =>
+      item.type === 'reasoning' &&
+      item.id === `rs_${callId}` &&
+      item.status === 'completed' &&
+      item.encrypted_content === `encrypted:${callId}`,
+  );
+}
+
+function isSystemInputMessage(
+  message: OpenAIResponsesContext,
+): message is OpenAIResponsesInputMessage {
   return 'role' in message && message.role === 'system';
 }
 
-function readInputText(message: AgentInputMessage | undefined): string {
+function readInputText(message: OpenAIResponsesInputMessage | undefined): string {
   if (!message) {
     return '';
+  }
+
+  if (typeof message.content === 'string') {
+    return message.content;
   }
 
   return message.content

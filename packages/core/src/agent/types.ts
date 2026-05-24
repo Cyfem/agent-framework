@@ -1,3 +1,5 @@
+import type { Model } from '../llm/base';
+
 /** Agent 的生命周期状态。 */
 export type AgentStatus = 'idle' | 'running' | 'ended' | 'failed';
 
@@ -7,7 +9,7 @@ export type ToolCallErrorTrigger = 'before' | 'calling' | 'after';
 /** 事件注册方法返回的取消监听函数。 */
 export type Unsubscribe = () => void;
 
-/** 工具参数 schema 转换后使用的 JSON 对象结构。 */
+/** 工具参数转换后使用的 JSON 对象结构。 */
 export type JsonObject = Record<string, unknown>;
 
 /** 框架工具所需的最小 schema 契约，Zod object schema 可直接满足该契约。 */
@@ -23,132 +25,118 @@ export interface ToolParametersSchema {
       };
 }
 
-/** Responses API 输出 item 中可能携带的状态值。 */
-export type AgentResponseStatus = 'in_progress' | 'completed' | 'incomplete';
-
-/** 框架生成的 Responses 输入消息中的文本内容块。 */
-export interface AgentInputTextContentPart {
-  type: 'input_text';
-  text: string;
-}
-
-/** 通过 Files API 上传后，在 Responses 输入消息中引用的图片内容块。 */
-export interface AgentInputImageContentPart {
-  type: 'input_image';
-  file_id: string;
-  detail?: 'auto' | 'low' | 'high' | undefined;
-}
-
-/** 通过 Files API 上传后，在 Responses 输入消息中引用的通用文件内容块。 */
-export interface AgentInputFileContentPart {
-  type: 'input_file';
-  file_id: string;
-}
-
-/** 通过 Files API 上传后，在 Responses 输入消息中引用的视频内容块。 */
-export interface AgentInputVideoContentPart {
-  type: 'input_video';
-  file_id: string;
-}
-
-/** 通过 Files API 上传后，在 Responses 输入消息中引用的音频内容块。 */
-export interface AgentInputAudioContentPart {
-  type: 'input_audio';
-  file_id: string;
-}
-
-/** 框架生成 Responses 输入消息时支持的内容块联合类型。 */
-export type AgentInputContentPart =
-  | AgentInputTextContentPart
-  | AgentInputImageContentPart
-  | AgentInputFileContentPart
-  | AgentInputVideoContentPart
-  | AgentInputAudioContentPart;
-
 /**
- * 由 Agent 生成或由应用代码主动追加的 Responses 输入消息。
+ * 一个模型协议需要关联的消息、工具和原始返回类型。
  *
- * 框架生成的输入消息不会伪造 `id`、`status` 等仅属于模型响应的字段。
+ * Agent 仅通过这些关联类型保存和拼装上下文；具体 wire structure 由 `Model`
+ * 的 builder/parser 处理。
  */
-export interface AgentInputMessage {
-  role: 'system' | 'developer' | 'user';
-  content: readonly AgentInputContentPart[];
-  type?: 'message';
+export interface AgentProtocol {
+  /** Agent 持久保存并传回 Model 的协议上下文项。 */
+  context: unknown;
+  /** Model API 接收的工具声明结构。 */
+  tool: unknown;
+  /** 应用可交给 `buildUserMessage()` 的协议用户消息结构。 */
+  userMessage: unknown;
+  /** 应用可交给 `buildSystemMessage()` 的协议系统消息结构。 */
+  systemMessage: unknown;
+  /** `parseAssistantMessages()` 返回的协议 assistant 抽象结构。 */
+  assistantMessage: unknown;
+  /** 应用可交给 `buildToolCallOutputMessage()` 的协议工具结果结构。 */
+  toolCallOutputMessage: unknown;
+  /** 单个原始工具调用项，用于保真保存 `sourceCall`。 */
+  rawToolCall: unknown;
+  /** Model SDK 返回的完整原始响应对象。 */
+  rawResponse: unknown;
 }
 
-/** 方舟 Responses `reasoning` 输出 item 中返回的推理摘要项。 */
-export interface AgentReasoningSummary {
-  type: 'summary_text';
+/** 从协议规格中取出上下文项类型。 */
+export type ContextOf<P extends AgentProtocol> = P['context'];
+/** 从协议规格中取出工具声明类型。 */
+export type ToolOf<P extends AgentProtocol> = P['tool'];
+/** 从协议规格中取出用户消息 builder 输入类型。 */
+export type UserMessageOf<P extends AgentProtocol> = P['userMessage'];
+/** 从协议规格中取出系统消息 builder 输入类型。 */
+export type SystemMessageOf<P extends AgentProtocol> = P['systemMessage'];
+/** 从协议规格中取出 assistant parser 输出类型。 */
+export type AssistantMessageOf<P extends AgentProtocol> = P['assistantMessage'];
+/** 从协议规格中取出工具结果 builder 输入类型。 */
+export type ToolCallOutputMessageOf<P extends AgentProtocol> = P['toolCallOutputMessage'];
+/** 从协议规格中取出单个原始工具调用类型。 */
+export type RawToolCallOf<P extends AgentProtocol> = P['rawToolCall'];
+
+/** Agent 生成文本输入时使用的协议无关内容块。 */
+export interface AgentTextPart {
+  /** 固定为文本内容块。 */
+  type: 'text';
+  /** 文本内容。 */
   text: string;
-  [key: string]: unknown;
 }
 
-/** 模型返回并在对话上下文中原样保留的推理 item。 */
-export interface AgentReasoningItem {
-  type: 'reasoning';
-  id?: string;
-  summary?: readonly AgentReasoningSummary[];
-  status?: AgentResponseStatus;
-  [key: string]: unknown;
+/** Agent 启动文本任务时必须能由 Model 构建的用户消息基础结构。 */
+export interface AgentBaseUserMessage {
+  /** Agent 基础用户输入只要求支持文本内容块。 */
+  content: readonly AgentTextPart[];
 }
 
-/** assistant Responses 消息中的文本输出内容块。 */
-export interface AgentOutputTextContentPart {
-  type: 'output_text';
-  text: string;
-  [key: string]: unknown;
+/** 框架内部提示词交给 Model 构建时使用的系统消息基础结构。 */
+export interface AgentBaseSystemMessage {
+  /** system prompt 文本。 */
+  content: string;
 }
 
-/** 模型返回并原样保留的 assistant 输出消息。 */
-export interface AgentAssistantOutputMessage {
-  type: 'message';
-  role: 'assistant';
-  id?: string;
-  content: readonly (AgentOutputTextContentPart | Record<string, unknown>)[];
-  status?: AgentResponseStatus;
-  [key: string]: unknown;
+/** Model 反解析普通 assistant 文本输出时使用的基础结构。 */
+export interface AgentBaseAssistantMessage {
+  /** assistant 文本内容块；provider refusal 可由具体协议额外表示。 */
+  content: readonly AgentTextPart[];
 }
 
-/**
- * 模型返回的函数调用 item。
- *
- * 写入 context 以及后续重新发送时，会保留响应中的全部字段，包括提供方扩展字段。
- */
-export interface AgentFunctionCallItem {
-  type: 'function_call';
-  call_id: string;
-  name: string;
-  arguments: string;
-  id?: string;
-  status?: AgentResponseStatus;
-  [key: string]: unknown;
-}
-
-/** 方舟 Responses 兼容提供方返回的其他输出 item。 */
-export interface AgentUnknownResponseOutputItem {
-  type: string;
-  [key: string]: unknown;
-}
-
-/** 模型 Responses 输出 item；框架会不经投影地保存并在后续请求中回传。 */
-export type AgentResponseOutputItem =
-  | AgentReasoningItem
-  | AgentAssistantOutputMessage
-  | AgentFunctionCallItem
-  | AgentUnknownResponseOutputItem;
-
-/** 执行模型请求的函数调用后，由本地生成的函数结果 item。 */
-export interface AgentFunctionCallOutputItem {
-  type: 'function_call_output';
-  call_id: string;
+/** 工具执行结果交给 Model 构建时使用的基础结构。 */
+export interface AgentBaseToolCallOutputMessage {
+  /** 模型工具调用 id；Chat 对应 `tool_call_id`，Responses 对应 `call_id`。 */
+  callId: string;
+  /** 本地工具执行结果的字符串表示。 */
   output: string;
 }
 
-/** Agent 持久保存并作为 Responses `input` 发送的上下文 item 联合类型。 */
-export type AgentContext =
-  | AgentInputMessage
-  | AgentFunctionCallOutputItem
-  | AgentResponseOutputItem;
+/** Agent 交给 Model 构建为协议工具定义的基础结构。 */
+export interface AgentToolDefinitionInput {
+  /** 工具名，必须在同一个 Agent 实例中唯一。 */
+  name: string;
+  /** 提供给模型的工具说明；动态说明会在 Agent 构建工具时先计算为字符串。 */
+  description: string;
+  /** 工具参数 schema；省略时由 Agent 使用空对象 schema。 */
+  parameters?: ToolParametersSchema;
+  /** 设置后原值传给协议 Model；省略时请求工具中也不包含 `strict`。 */
+  strict?: boolean;
+}
+
+/** 反解析后的基础消息及其原始协议消息载体。 */
+export interface AgentParsedMessage<TMessage, TContext> {
+  /** parser 反解析出的协议抽象消息。 */
+  message: TMessage;
+  /** 承载该解析结果的原始上下文项。 */
+  sourceMessage: TContext;
+}
+
+/**
+ * Model 从一个协议消息中提取出的单个工具调用。
+ *
+ * Chat 中一条 assistant message 可能展开为多个调用；`sourceCall` 精确指向
+ * 其中对应的原始项，而 `sourceMessage` 保留承载它的完整消息。
+ */
+export interface AgentToolCall<P extends AgentProtocol> {
+  /** 工具调用 id，用于把执行结果关联回模型请求。 */
+  id: string;
+  /** 本地工具名。 */
+  name: string;
+  /** 模型输出的原始 JSON 参数字符串。 */
+  arguments: string;
+  /** 承载该调用的完整协议上下文项。 */
+  sourceMessage: ContextOf<P>;
+  /** 单个原始调用项；Chat 中是一条 `tool_calls[]` 元素，Responses 中是 `function_call` item。 */
+  sourceCall: RawToolCallOf<P>;
+}
 
 /** 技能手册中的一条具体操作流程。 */
 export interface AgentSkillSop {
@@ -169,22 +157,21 @@ export interface AgentSkill {
   sops?: AgentSkillSop[];
 }
 
-/** 调用动态工具描述函数时传入的上下文。 */
+/**
+ * 调用动态工具描述函数时传入的协议无关上下文。
+ *
+ * 装饰器定义属于类级 metadata，本期不将其绑定到具体 Model 协议。
+ */
 export interface ToolDescriptionContext {
-  /** 当前 Agent 可见的技能手册。 */
   skills: readonly AgentSkill[];
-  /** 可通过内置 `agent` 工具调度的子代理构造器。 */
-  subAgents: readonly AgentConstructor[];
-  /** 当前有效的 Responses 输入上下文，不包含临时注入的 system prompt。 */
-  context: readonly AgentContext[];
-  /** 原始历史记录，可与有效上下文分别初始化。 */
-  history: readonly AgentContext[];
-  /** 用户提供的 system prompt，不包含框架内部提示词。 */
+  subAgents: readonly AgentConstructor<AgentProtocol>[];
+  context: readonly unknown[];
+  history: readonly unknown[];
   systemPrompts: readonly string[];
-  /** 当前正在转换并暴露给模型的工具。 */
   tool: {
     name: string;
     parameters?: ToolParametersSchema;
+    strict?: boolean;
   };
 }
 
@@ -196,6 +183,8 @@ export interface ToolDefinition {
   name: string;
   description: ToolDescription;
   parameters?: ToolParametersSchema;
+  /** 可选的协议严格参数标记；框架不设置默认值，也不修改 schema。 */
+  strict?: boolean;
 }
 
 /** 参数解析和校验成功后执行的运行时工具函数。 */
@@ -206,61 +195,34 @@ export interface ToolRuntimeDefinition extends ToolDefinition {
   handler: ToolHandler;
 }
 
-/** 传入 Model 实现的方舟 Responses 兼容函数工具定义。 */
-export interface ModelToolDefinition {
-  type: 'function';
-  name: string;
-  description: string;
-  parameters: JsonObject;
-  strict: true;
-}
-
-/** 基于 Responses 的 Model 实现所接收的请求结构。 */
-export interface ModelResponsesRequest {
-  input: readonly AgentContext[];
-  tools: readonly ModelToolDefinition[];
-}
-
-/**
- * 基于 Responses 的 Model 实现所返回的响应结构。
- *
- * `output` 中的 item 将由 Agent 原样写入 context/history，并在下一轮作为 `input` 回传。
- */
-export interface ModelResponsesResponse {
-  output: readonly AgentResponseOutputItem[];
-  raw?: unknown;
-}
-
 /** 子代理实例必须满足的最小契约。 */
-export interface AgentInstance {
+export interface AgentInstance<P extends AgentProtocol> {
   init(): this;
-  agent(message: string, stream?: boolean): Promise<AgentContext[]>;
+  agent(input: string | UserMessageOf<P>, stream?: boolean): Promise<ContextOf<P>[]>;
 }
 
-/** `AgentOptions.subAgents` 接收的子代理构造器契约。 */
-export interface AgentConstructor<TAgent extends AgentInstance = AgentInstance> {
-  new (options: AgentOptions): TAgent;
+/** `AgentOptions.subAgents` 接收的同协议子代理构造器契约。 */
+export interface AgentConstructor<P extends AgentProtocol> {
+  new (options: AgentOptions<P>): AgentInstance<P>;
   readonly name: string;
   readonly description?: string;
   readonly toolsDefinition: readonly ToolDefinition[];
 }
 
 /** 创建 Agent 或 Agent 子类实例时使用的选项。 */
-export interface AgentOptions {
-  /** 基于 Responses 的 LLM 适配器；`OpenAIModel` 或自定义 `Model` 子类均可提供此能力。 */
-  llm: {
-    responses(request: ModelResponsesRequest): Promise<ModelResponsesResponse>;
-  };
+export interface AgentOptions<P extends AgentProtocol> {
+  /** 提供消息构建、反解析和生成能力的协议 Model。 */
+  llm: Model<P>;
   /** 通过内部 system prompt 向模型展示索引的技能手册。 */
   skills?: readonly AgentSkill[];
-  /** 可由内置 `agent` 工具调度的子代理类。 */
-  subAgents?: readonly AgentConstructor[];
+  /** 可由内置 `agent` 工具调度的同协议子代理类。 */
+  subAgents?: readonly AgentConstructor<P>[];
   /** 用户 system prompt；框架内部提示词会排列在这些提示词之前。 */
   systemPrompts?: readonly string[];
-  /** 初始有效 Responses 输入上下文；省略时回退到 `initRawContext`。 */
-  initContext?: readonly AgentContext[];
+  /** 初始有效上下文；省略时回退到 `initRawContext`。 */
+  initContext?: readonly ContextOf<P>[];
   /** 初始原始历史记录；省略时回退到 `initContext`。 */
-  initRawContext?: readonly AgentContext[];
+  initRawContext?: readonly ContextOf<P>[];
   /** 可选的 Agent 循环硬上限；省略表示不显式限制迭代轮数。 */
   maxIterations?: number;
 }
@@ -277,37 +239,37 @@ export interface ToolEventOptions {
 }
 
 /** 模型请求的指定函数在真正执行前触发的监听器。 */
-export type BeforeToolCallCallback = (
+export type BeforeToolCallCallback<P extends AgentProtocol> = (
   parameters: unknown,
-  message: AgentFunctionCallItem,
+  call: AgentToolCall<P>,
 ) => void | Promise<void>;
 
 /** 指定工具 handler 返回后触发的监听器。 */
-export type AfterToolCallCallback = (
+export type AfterToolCallCallback<P extends AgentProtocol> = (
   parameters: unknown,
-  message: AgentFunctionCallItem,
+  call: AgentToolCall<P>,
   result: unknown,
 ) => void | Promise<void>;
 
-/** 每次模型响应触发一次；触发时整批 `output` 尚未写入上下文。 */
-export type ModelResponseCallback = (
-  output: readonly AgentResponseOutputItem[],
+/** 每次模型响应触发一次；触发时整批原始协议消息尚未写入上下文。 */
+export type ModelResponseCallback<P extends AgentProtocol> = (
+  messages: readonly ContextOf<P>[],
 ) => void | Promise<void>;
 
 /** before/calling/after 任一工具处理阶段发生错误时触发的监听器。 */
-export type ToolCallErrorCallback = (
+export type ToolCallErrorCallback<P extends AgentProtocol> = (
   name: string,
   triggerType: ToolCallErrorTrigger,
   error: unknown,
   parameters: unknown,
-  message: AgentFunctionCallItem,
+  call: AgentToolCall<P>,
   result?: unknown,
 ) => void | Promise<void>;
 
 /** Agent 进入已注册状态后触发的监听器。 */
-export type AgentStatusChangedCallback = (
-  rawContext: readonly AgentContext[],
-  context: readonly AgentContext[],
+export type AgentStatusChangedCallback<P extends AgentProtocol> = (
+  rawContext: readonly ContextOf<P>[],
+  context: readonly ContextOf<P>[],
 ) => void | Promise<void>;
 
 /** `agent()` 抛出错误时触发的监听器。 */

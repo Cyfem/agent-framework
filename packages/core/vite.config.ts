@@ -4,7 +4,12 @@ import { defineConfig, type Plugin } from 'vite';
 
 const entry = fileURLToPath(new URL('./src/index.ts', import.meta.url));
 
-/** 使用 Babel 在库构建前转换 TypeScript 源码中的 2023-11 decorators。 */
+/**
+ * 使用 Babel 在库构建前转换 TypeScript 源码中的 2023-11 decorators。
+ *
+ * Vite/rolldown 本身不会替我们处理当前装饰器提案语义，因此库包和 demo 都复用
+ * 这段插件，确保 `@Tool` initializer 行为与 TypeScript 类型检查保持一致。
+ */
 function decoratorsBabelPlugin(): Plugin {
   return {
     name: 'babel-2023-11-decorators',
@@ -41,6 +46,7 @@ export default defineConfig({
     sourcemap: true,
     rollupOptions: {
       // 核心包面向 Node.js 运行时，保留依赖和 Node 内置模块为外部引用。
+      // 发布产物只打包框架源码，避免把 openai/zod 等依赖复制进库文件。
       external: ['openai', 'zod', 'zod-to-json-schema', /^node:/],
     },
     lib: {

@@ -1,7 +1,7 @@
 /**
  * 真实金融新闻 demo：让方舟模型调度 RSS 工具链，生成带来源链接的中文市场简报。
  */
-import { OpenAIModel, type AgentResponseOutputItem } from '@manee/agent-framework';
+import { OpenAIResponsesModel, type OpenAIResponsesContext } from '@manee/agent-framework';
 
 import { FinanceMarketNewsAgent } from './finance-news/agent';
 
@@ -30,7 +30,7 @@ async function runFinanceNewsDemo(apiKey: string): Promise<void> {
     process.argv.slice(2).join(' ').trim() || process.env.FINANCE_NEWS_QUERY || defaultTask;
 
   const agent = new FinanceMarketNewsAgent({
-    llm: new OpenAIModel({
+    llm: new OpenAIResponsesModel({
       apiKey,
       baseURL,
       model: modelName,
@@ -106,7 +106,7 @@ async function runFinanceNewsDemo(apiKey: string): Promise<void> {
   console.log(`finance news demo complete: messages=${finalContext.length}`);
 }
 
-function summarizeOutput(output: readonly AgentResponseOutputItem[]): string {
+function summarizeOutput(output: readonly OpenAIResponsesContext[]): string {
   return output
     .map((item) => {
       if (item.type === 'function_call' && 'name' in item) {

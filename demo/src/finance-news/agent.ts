@@ -2,7 +2,12 @@
  * 金融新闻 Agent 实现：将 RSS 获取、XML 归一化、筛选、影响力排序和 Markdown
  * 简报渲染拆成模型可调度的工具，同时保留可注入 transport 的离线测试边界。
  */
-import { Agent, Tool, type AgentOptions } from '@manee/agent-framework';
+import {
+  Agent,
+  Tool,
+  type AgentOptions,
+  type OpenAIResponsesProtocol,
+} from '@manee/agent-framework';
 import { XMLParser } from 'fast-xml-parser';
 import { z } from 'zod';
 
@@ -109,7 +114,7 @@ export const defaultFinanceNewsSources: readonly NewsSource[] = [
  *
  * 工具运行状态仅保存在本实例中，模型需要依次抓取、筛选和排序后再构建简报。
  */
-export class FinanceMarketNewsAgent extends Agent {
+export class FinanceMarketNewsAgent extends Agent<OpenAIResponsesProtocol> {
   #sources: NewsSource[];
   #transport: FinanceNewsTransport;
   #now: () => Date;
@@ -118,7 +123,10 @@ export class FinanceMarketNewsAgent extends Agent {
   #rankedItems: RankedMarketNewsItem[] = [];
   #notes: string[] = [];
 
-  constructor(options: AgentOptions, financeOptions: FinanceMarketNewsAgentOptions = {}) {
+  constructor(
+    options: AgentOptions<OpenAIResponsesProtocol>,
+    financeOptions: FinanceMarketNewsAgentOptions = {},
+  ) {
     super(options);
     this.#sources = [...(financeOptions.sources ?? defaultFinanceNewsSources)];
     this.#transport = financeOptions.transport ?? defaultTransport;
@@ -134,6 +142,7 @@ export class FinanceMarketNewsAgent extends Agent {
     }),
   })
   #listNewsSources(parameters: unknown): Record<string, unknown> {
+    // 先让模型了解可抓取来源，便于后续选择市场或解释数据覆盖范围。
     const { market } = parameters as { market?: FinanceMarket };
     const sources = this.#sources.filter((source) => !market || source.market === market);
 
@@ -155,6 +164,7 @@ export class FinanceMarketNewsAgent extends Agent {
     }),
   })
   async #fetchMarketNews(parameters: unknown): Promise<MarketNewsFetchResult> {
+    // 抓取失败按源记录到 errors，不让单个 RSS 源影响整轮市场简报。
     const {
       markets = defaultMarkets,
       sinceHours = 72,
@@ -231,6 +241,7 @@ export class FinanceMarketNewsAgent extends Agent {
     }),
   })
   #filterNews(parameters: unknown): Record<string, unknown> {
+    // 过滤阶段只消费上一轮抓取缓存，避免模型重复请求远程 RSS。
     const {
       markets = defaultMarkets,
       keywords = [],
@@ -277,6 +288,7 @@ export class FinanceMarketNewsAgent extends Agent {
     }),
   })
   #rankMarketImpact(parameters: unknown): Record<string, unknown> {
+    // demo 使用启发式打分展示影响排序，不构成投资建议或交易信号。
     const { limit = 10 } = parameters as { limit?: number };
     const sourceItems =
       this.#filteredItems.length > 0 ? this.#filteredItems : (this.#lastFetch?.items ?? []);
@@ -301,6 +313,7 @@ export class FinanceMarketNewsAgent extends Agent {
     }),
   })
   #saveResearchNote(parameters: unknown): Record<string, unknown> {
+    // 允许模型把中间判断写成 note，最终 briefing 会合并这些观察。
     const { note } = parameters as { note: string };
 
     this.#notes.push(note);
@@ -322,6 +335,7 @@ export class FinanceMarketNewsAgent extends Agent {
     }),
   })
   #buildMarketBriefing(parameters: unknown): Record<string, unknown> {
+    // 最终工具把排序结果和 note 渲染为 Markdown，方便 demo 直接打印。
     const { title = '金融市场新闻简报', maxItems = 8 } = parameters as {
       title?: string;
       maxItems?: number;
