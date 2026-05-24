@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>微信 Chat 控制台</title>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>微信 Chat 控制台</h1>
+          <p>使用 Chat 协议、Win32 工具和截图视觉输入完成本机微信消息任务。</p>
+        </div>
+        <span id="statusBadge" class="status-badge">Idle</span>
+      </header>
+
+      <section class="workspace">
+        <aside class="sidebar">
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>全局配置</h2>
+            </div>
+            <label>
+              API key
+              <input id="apiKeyInput" type="password" autocomplete="off" placeholder="sk-..." />
+            </label>
+            <label>
+              Base URL
+              <input id="baseUrlInput" type="text" />
+            </label>
+            <label>
+              Model
+              <input id="modelInput" type="text" />
+            </label>
+            <label>
+              Max iterations
+              <input id="maxIterationsInput" type="number" min="1" max="80" step="1" />
+            </label>
+            <label class="switch-row">
+              <input id="interactiveInput" type="checkbox" />
+              <span>允许点击、键盘和文字输入</span>
+            </label>
+            <div class="config-actions">
+              <button id="saveConfigButton" type="button">保存配置</button>
+            </div>
+            <p class="security-note">
+              API key 在系统安全存储可用时加密保存在本机；不可用时不会持久化密钥。
+            </p>
+            <p class="privacy-note">
+              截图会保存到本地 .artifacts/electron-weixin，并通过 2345 端口的 serve 服务和
+              Cloudflare 隧道提供给模型读取。
+            </p>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>功能</h2>
+            </div>
+            <div class="segmented-control">
+              <button type="button" class="active">发送微信消息</button>
+            </div>
+            <label>
+              联系人名称
+              <input id="recipientInput" type="text" placeholder="输入要发送的联系人" />
+            </label>
+            <label>
+              消息内容
+              <textarea id="messageInput" rows="4" placeholder="输入要发送的消息"></textarea>
+            </label>
+            <div class="actions">
+              <button id="runButton" type="button" class="primary">开始执行</button>
+              <button id="cancelButton" type="button" disabled>请求取消</button>
+            </div>
+          </section>
+        </aside>
+
+        <section class="main-panel">
+          <section class="preview-panel">
+            <div class="panel-heading">
+              <h2>最新截图</h2>
+              <span id="screenshotMeta">暂无截图</span>
+            </div>
+            <div id="screenshotEmpty" class="screenshot-empty">
+              运行后会显示 capture-window 的最新画面。
+            </div>
+            <img id="screenshotImage" alt="最新窗口截图" hidden />
+          </section>
+
+          <section class="log-panel">
+            <div class="panel-heading">
+              <h2>运行日志</h2>
+              <button id="clearLogButton" type="button" class="icon-button">清空</button>
+            </div>
+            <ol id="logList" class="log-list"></ol>
+          </section>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="/main.ts"></script>
+  </body>
+</html>

@@ -17,6 +17,8 @@
     "ark:subagent": "vite-node src/ark-subagent.ts",
     "windows": "vite-node src/windows-responses.ts",
     "windows:chat": "vite-node src/windows-chat.ts",
+    "electron:weixin:build": "vite build --config electron-weixin/vite.main.config.ts && vite build --config electron-weixin/vite.preload.config.ts && vite build --config electron-weixin/vite.renderer.config.ts",
+    "electron:weixin": "pnpm run electron:weixin:build && electron electron-weixin/.electron/main/main.cjs",
     "finance-news": "vite-node src/finance-news.ts",
     "finance-news:smoke": "vite-node src/finance-news-smoke.ts",
     "build": "vite build",
@@ -24,11 +26,15 @@
     "start": "node dist/main.js"
   },
   "dependencies": {
-    "@manee/agent-framework": "workspace:*",
+    "@manee/agent-framework": "link:../packages/core",
     "@types/pngjs": "^6.0.5",
     "fast-xml-parser": "^5.8.0",
     "koffi": "^3.0.1",
     "pngjs": "^7.0.0",
+    "serve": "^14.2.5",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "electron": "^39.2.7"
   }
 }

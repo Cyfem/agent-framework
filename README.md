@@ -105,3 +105,13 @@ console.log(context);
 ## 更多文档
 
 完整 API 用法、事件、skills、子代理、自定义 Model 和多模态说明见 [packages/core/README.md](./packages/core/README.md)。
+
+## Electron 微信消息 Demo
+
+Windows 下可启动带界面的微信消息 agent：
+
+```bash
+pnpm demo:electron:weixin
+```
+
+该 demo 将用户目录下微信操作手册的关键流程迁移为 `get-skill` 可读取的 agent skill，并只向模型暴露项目自身的 `find-window`、`capture-window`、`click-window`、`send-text` 和 `send-keyboard-message` 工具，不依赖 `hwnd-mcp`。在界面中填写联系人、消息和模型配置，并显式勾选交互授权后，agent 会搜索联系人、截图核对聊天标题、输入消息、发送并再次截图确认结果。

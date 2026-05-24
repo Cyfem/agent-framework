@@ -3,6 +3,7 @@ dist/
 coverage/
 .vite/
 .artifacts/
+demo/electron-weixin/.electron/
 demo/.env
 *.log
 .DS_Store

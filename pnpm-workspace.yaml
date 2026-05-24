@@ -2,4 +2,5 @@ packages:
   - packages/*
   - demo
 allowBuilds:
+  electron: true
   koffi: true

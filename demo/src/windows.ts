@@ -2,7 +2,8 @@
  * Windows 微信多模态控制 demo：通过 Win32 消息工具驱动桌面窗口，将截图上传到
  * Files API 后以视觉输入追加进 Responses 上下文，并由技能手册约束发送流程。
  *
- * 交互类工具仅在显式启用环境开关时可执行，默认运行只允许观察窗口状态。
+ * 交互类工具仅在调用宿主显式授权时可执行，默认运行只允许观察窗口状态。
+ * CLI demo 通过环境开关授权，Electron 宿主通过界面中的交互开关授权。
  */
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -35,7 +36,9 @@ const execFileAsync = promisify(execFile);
 const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/v3';
 const defaultArkModel = 'doubao-seed-2-0-pro-260215';
 
-const artifactRoot = fileURLToPath(new URL('../.artifacts/windows', import.meta.url));
+const artifactRoot =
+  process.env.AGENT_FRAMEWORK_WINDOWS_ARTIFACT_ROOT ??
+  fileURLToPath(new URL('../.artifacts/windows', import.meta.url));
 
 const WM_KEYDOWN = 0x0100;
 const WM_KEYUP = 0x0101;
@@ -285,6 +288,7 @@ export const weixinWindowsSkill: AgentSkill = {
     '不要复用旧的搜索下拉窗口 hwnd；每次输入联系人名称后都重新调用 find-window 查找下拉窗口。',
     '搜索结果下拉窗是独立顶层窗口，点击联系人结果时必须使用下拉窗口 hwnd，不能把下拉坐标换算到主窗口。',
     '发送前必须 capture-window 截取主窗口，并确认聊天标题匹配目标联系人；如果不匹配，停止并报告，不要发送。',
+    '下述固定坐标以主窗口 1260x688、下拉窗口 368x194 的截图尺寸为基准；若 capture-window 返回的尺寸不同，必须按实际 width/height 分别缩放 x/y 后再调用 click-window。',
   ].join('\n'),
   sops: [
     {
@@ -318,16 +322,19 @@ export const weixinWindowsSkill: AgentSkill = {
 export class WindowsControlAgent extends Agent<OpenAIResponsesProtocol> {
   #api: Win32Api;
   #interactiveEnabled: boolean;
+  #artifactRoot: string;
   #multimodalInputs = new Map<string, MultimodalContentPart[]>();
 
   constructor(
     options: AgentOptions<OpenAIResponsesProtocol>,
     api: Win32Api,
     interactiveEnabled: boolean,
+    captureOutputRoot = artifactRoot,
   ) {
     super(options);
     this.#api = api;
     this.#interactiveEnabled = interactiveEnabled;
+    this.#artifactRoot = captureOutputRoot;
   }
 
   /** 取出一次多模态工具登记的输入内容；成功消费后立即清除暂存数据。 */
@@ -463,7 +470,7 @@ export class WindowsControlAgent extends Agent<OpenAIResponsesProtocol> {
     const className = this.#getWindowClassName(handle);
     const screenshot = this.#captureWindowPixels(handle, width, height, printFlags);
     const safeName = sanitizeFileName(outputName || title || formatHwnd(handle));
-    const filePath = join(artifactRoot, `${Date.now()}-${safeName}.png`);
+    const filePath = join(this.#artifactRoot, `${Date.now()}-${safeName}.png`);
 
     await mkdir(dirname(filePath), { recursive: true });
     await writeFile(filePath, PNG.sync.write(screenshot.png));
@@ -543,7 +550,7 @@ export class WindowsControlAgent extends Agent<OpenAIResponsesProtocol> {
   @Tool({
     name: 'send-keyboard-message',
     description:
-      'Post keyboard messages to a target window hwnd. Interactive actions are disabled unless ARK_WINDOWS_DEMO_INTERACTIVE=1.',
+      'Post keyboard messages to a target window hwnd. Interactive actions run only when the hosting agent explicitly enables them.',
     parameters: z.object({
       hwnd: z.string().describe('Window handle as a hex string.'),
       key: z
@@ -564,7 +571,7 @@ export class WindowsControlAgent extends Agent<OpenAIResponsesProtocol> {
     }),
   })
   #sendKeyboardMessage(parameters: unknown): Record<string, unknown> | string {
-    // 交互工具默认禁用，必须由环境变量显式允许，防止 demo 误操作真实窗口。
+    // 交互工具默认禁用，必须由调用宿主显式允许，防止 demo 误操作真实窗口。
     if (!this.#interactiveEnabled) {
       return interactiveDisabledMessage();
     }
@@ -609,7 +616,7 @@ export class WindowsControlAgent extends Agent<OpenAIResponsesProtocol> {
   @Tool({
     name: 'send-text',
     description:
-      'Post WM_CHAR messages for text input to a target window hwnd. Interactive actions are disabled unless ARK_WINDOWS_DEMO_INTERACTIVE=1.',
+      'Post WM_CHAR messages for text input to a target window hwnd. Interactive actions run only when the hosting agent explicitly enables them.',
     parameters: z.object({
       hwnd: z.string().describe('Window handle as a hex string.'),
       text: z.string().min(1).describe('Text to send through WM_CHAR messages.'),
@@ -638,7 +645,7 @@ export class WindowsControlAgent extends Agent<OpenAIResponsesProtocol> {
   @Tool({
     name: 'click-window',
     description:
-      'Post mouse click messages to a target window hwnd. Coordinates are client-area coordinates.',
+      'Post mouse click messages to a target window hwnd. Coordinates use the physical client-area pixels seen in capture-window output; scale any skill baseline coordinates to the current captured size.',
     parameters: z.object({
       hwnd: z.string().describe('Window handle as a hex string.'),
       x: z.number().int().nonnegative().describe('Client-area X coordinate.'),
@@ -1572,8 +1579,8 @@ function makeLParam(x: number, y: number): bigint {
 }
 
 function interactiveDisabledMessage(): string {
-  // 交互开关关闭时把限制作为工具结果交给模型，而不是直接抛错中断流程。
-  return 'Interactive Windows actions are disabled. Set ARK_WINDOWS_DEMO_INTERACTIVE=1 to allow keyboard, text, or mouse tools.';
+  // 交互开关的配置方式由宿主决定；工具层只报告本次运行尚未授权。
+  return 'Interactive Windows actions are disabled for this run. Enable interactive mode in the hosting agent before using keyboard, text, or mouse tools.';
 }
 
 function summarizeOutput(output: readonly OpenAIResponsesContext[]): string {
