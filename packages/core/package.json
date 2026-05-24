@@ -1,6 +1,6 @@
 {
-  "name": "@manee/agent-framework",
-  "version": "0.0.0",
+  "name": "@ruixutong.manee/maneeagent-framework",
+  "version": "1.0.0",
   "description": "Node.js AI agent framework.",
   "type": "module",
   "license": "MIT",
@@ -38,7 +38,8 @@
   "scripts": {
     "build": "vite build && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "prepublishOnly": "npm run typecheck && npm run lint && npm run build"
   },
   "dependencies": {
     "openai": "^6.38.0",
