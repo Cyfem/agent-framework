@@ -10,7 +10,7 @@
 - **双协议适配**：内置 `OpenAIResponsesModel` 与 `OpenAIChatModel`，覆盖 Responses API 与 Chat Completions API。
 - **工具调用**：支持 `@Tool` 装饰器工具和运行时 `agent.tools.push()` 工具，参数校验使用 Zod。
 - **事件系统**：支持模型响应、工具调用前后、工具错误、Agent 状态和 Agent 错误事件。
-- **技能手册**：通过 `skills` 暴露可索引的操作手册，模型可调用内置 `get-skill` 获取完整内容。
+- **渐进式 Skills**：首轮只暴露 `name + description`，模型通过内置 `skill` 工具按需加载 instructions、读取文本资源或运行显式启用的脚本；支持 inline 结构体和 Node file adapter。
 - **子代理调度**：通过内置 `agent` 工具调度同协议子代理，并使用 `agent-result` 汇报结果。
 - **多模态上下文**：Responses 支持 Files 上传后通过 `input_image.file_id` 等内容块注入；Chat 支持 `image_url` 等内容块。
 - **上下文压缩**：支持 active-only 工具 payload 裁剪、外部定义的摘要事务，以及 context-length 错误恢复；raw history 始终保留原文。
@@ -92,6 +92,14 @@ console.log(context);
 - 其他 parser：从混合 context 中筛选并反解析 user/system/assistant/tool-result 消息。
 
 协议类型 `P` 是封闭关联类型。需要保存或访问新的 provider 字段时，应在对应 protocol 中显式声明，而不是随意向消息对象附加字段。
+
+## Skills
+
+Skills 支持跨运行时的 inline 结构体，以及仅在 Node 文件能力可用时启用的 file source。模型首轮只能看到 `name + description`，随后通过内置 `skill({ skill, args? })` 工具按需执行 `load`、`read <resource-id>` 或 `run <script-id> [args...]`；脚本默认关闭，必须通过 `skillRuntime.scripts` 显式配置 executor 或开启自动检测。
+
+File adapter 实现的是 **Agent Skills portable text subset**，不承诺兼容所有物理目录。候选路径会拒绝空 segment、`.`/`..`、反斜杠、ASCII control/DEL、`<>:"|?*`、NUL、末尾空格或点、Windows 保留 basename，以及 NFC/大小写 alias 和 file/directory prefix collision；因此 `query?.md`、`a:b.md` 这类 POSIX 合法文件名也不属于该 subset。`references/` 与 `assets/` 只索引配置扩展名的 UTF-8 文本，unsupported resource 和无后缀 script 会在候选路径校验前忽略。
+
+已登记脚本是宿主显式信任的本地代码。框架固定使用 `shell: false` 并关闭 stdin，但不提供沙箱、timeout、输出上限、网络隔离或环境变量清理；子进程继承宿主环境。Inline script 会在独立临时目录物化完整 Skill 并 best-effort 清理，file script 则在启动前重新验证登记文件。完整配置与安全说明见 [Core Skills 文档](./packages/core/README.md#skills)。
 
 ## 生命周期
 

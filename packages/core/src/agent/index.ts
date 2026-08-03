@@ -22,6 +22,17 @@ import {
   resolveModelErrorRecoveryLimits,
 } from './model-error-recovery';
 import { getDefaultToolParametersSchema } from './schema';
+import { renderSkillDiscoveryCatalog } from './skill-command';
+import { createSkillFileSourceAdapter } from './skill-file-source';
+import { getSkillNodeCapabilities } from './skill-node-runtime';
+import { SkillRegistry } from './skill-registry';
+import {
+  DEFAULT_SKILL_TEXT_RESOURCE_EXTENSIONS,
+  detectSkillScriptExecutors,
+  resolveSkillRuntimeOptions,
+  SkillScriptRuntime,
+  type ResolvedSkillRuntimeOptions,
+} from './skill-script-runtime';
 import type {
   AfterModelErrorRecoveryCallback,
   AfterToolCallCallback,
@@ -29,7 +40,8 @@ import type {
   AgentErrorCallback,
   AgentOptions,
   AgentProtocol,
-  AgentSkill,
+  AgentSkillSource,
+  AgentSkillSourceDiagnostic,
   AgentStatus,
   AgentStatusChangedCallback,
   AgentToolCall,
@@ -41,6 +53,8 @@ import type {
   ModelResponseCallback,
   ModelErrorRecoveryOptions,
   ResolvedModelErrorRecoveryLimits,
+  SkillRuntimeOptions,
+  SkillToolInput,
   ToolOf,
   ToolCallErrorCallback,
   ToolDefinition,
@@ -96,7 +110,13 @@ export class Agent<P extends AgentProtocol> {
   }
 
   #contextStore: ContextStore<P>;
-  #skills: AgentSkill[] = [];
+  #skillSources: AgentSkillSource[] = [];
+  #skillRuntimeConfig: SkillRuntimeOptions | undefined;
+  #skillRuntime!: ResolvedSkillRuntimeOptions;
+  #skillRegistry = SkillRegistry.empty();
+  #skillSourceDiagnostics: readonly AgentSkillSourceDiagnostic[] = Object.freeze([]);
+  #skillConfigurationDirty = true;
+  #builtinSkillRuntimeDefinition: ToolRuntimeDefinition;
   #systemPrompts: string[] = [];
   #status: AgentStatus = 'idle';
   #maxIterations: number | undefined;
@@ -217,7 +237,15 @@ export class Agent<P extends AgentProtocol> {
     this.#contextStore = new ContextStore(options.initContext, options.initRawContext);
     this.#contextCompactConfig = options.contextCompact;
     this.#modelErrorRecoveryConfig = options.modelErrorRecovery;
+    this.#skillRuntimeConfig = options.skillRuntime;
     this.tools ??= [];
+    const builtinSkillRuntimeDefinition = this.tools.find((tool) => tool.name === 'skill');
+
+    if (!builtinSkillRuntimeDefinition) {
+      throw new Error('Internal skill tool was not registered.');
+    }
+
+    this.#builtinSkillRuntimeDefinition = builtinSkillRuntimeDefinition;
     this.subAgents = [...(options.subAgents ?? [])];
 
     if (
@@ -248,16 +276,44 @@ export class Agent<P extends AgentProtocol> {
    * 不会清空历史或事件监听。
    */
   init(): this {
+    if (this.#status === 'running') {
+      throw new Error('Cannot initialize an Agent while it is running.');
+    }
+
     this.#initialized = false;
     this.#assertUniqueToolNames();
     this.#assertUniqueSubAgentNames();
-    this.#contextCompact = resolveContextCompactOptions(this.#contextCompactConfig);
-    this.#modelErrorRecoveryLimits = resolveModelErrorRecoveryLimits(
+    const capabilities = getSkillNodeCapabilities();
+    const skillRuntime = resolveSkillRuntimeOptions(this.#skillRuntimeConfig, capabilities);
+    const fileSource = createSkillFileSourceAdapter({
+      capabilities,
+      resourceExtensions: skillRuntime.resourceExtensions,
+    });
+    const scriptRuntime = new SkillScriptRuntime(skillRuntime, capabilities);
+    const skills = SkillRegistry.build({
+      sources: this.#skillSources,
+      fileSource,
+      scriptRuntime,
+    });
+    const contextCompact = resolveContextCompactOptions(this.#contextCompactConfig);
+    const modelErrorRecoveryLimits = resolveModelErrorRecoveryLimits(
       this.#modelErrorRecoveryConfig,
     );
+
+    this.#skillRuntime = skillRuntime;
+    this.#skillRegistry = skills.registry;
+    this.#skillSourceDiagnostics = skills.diagnostics;
+    this.#contextCompact = contextCompact;
+    this.#modelErrorRecoveryLimits = modelErrorRecoveryLimits;
+    this.#skillConfigurationDirty = false;
     this.#initialized = true;
 
     return this;
+  }
+
+  /** 返回最近一次成功 init 的冻结、无路径 file source 诊断快照。 */
+  getSkillSourceDiagnostics(): readonly AgentSkillSourceDiagnostic[] {
+    return this.#skillSourceDiagnostics;
   }
 
   /** 追加非空系统提示词；请求模型时它们排在框架内部提示词之后。 */
@@ -271,9 +327,19 @@ export class Agent<P extends AgentProtocol> {
     return this;
   }
 
-  /** 追加技能手册；新增技能会从下一次模型请求开始对模型可见。 */
-  addSkill(...skills: AgentSkill[]): this {
-    this.#skills.push(...skills);
+  /** 追加 configured Skill source；重新 init 成功后才进入 effective registry。 */
+  addSkill(...skills: AgentSkillSource[]): this {
+    if (skills.length === 0) {
+      return this;
+    }
+
+    this.#skillSources.push(...skills);
+    this.#skillConfigurationDirty = true;
+
+    if (this.#status !== 'running') {
+      this.#initialized = false;
+    }
+
     return this;
   }
 
@@ -347,31 +413,16 @@ export class Agent<P extends AgentProtocol> {
   }
 
   @Tool({
-    name: 'get-skill',
-    description: '获取指定下标的技能手册完整内容。',
+    name: 'skill',
+    description:
+      '按名称渐进加载 Skill。省略 args 或使用 load 获取 instructions；使用 read <resource-id> 读取文本资源；使用 run <script-id> [args...] 运行已登记脚本。',
     parameters: z.object({
-      index: z.number().int().nonnegative(),
+      skill: z.string(),
+      args: z.string().optional(),
     }),
   })
-  #getSkill(parameters: unknown): string {
-    // 技能列表通过 system prompt 暴露索引，工具只负责按索引返回完整手册。
-    const { index } = parameters as { index: number };
-    const skill = this.#skills[index];
-
-    if (!skill) {
-      return `没有找到下标为 ${index} 的技能手册。`;
-    }
-
-    const parts = [
-      `手册标题：${skill.name}`,
-      `手册描述：${skill.description}`,
-      skill.systemContent ? `全局适用内容：${skill.systemContent}` : '',
-      ...(skill.sops ?? []).map((sop, sopIndex) =>
-        [`工作流${sopIndex + 1}：${sop.description}`, `执行流程：\n${sop.content}`].join('\n'),
-      ),
-    ].filter((part) => part.length > 0);
-
-    return parts.join('\n\n');
+  async #skillTool(parameters: unknown): Promise<unknown> {
+    return this.#skillRegistry.dispatch(parameters as SkillToolInput);
   }
 
   @Tool({
@@ -421,13 +472,16 @@ export class Agent<P extends AgentProtocol> {
     if (!tool) {
       const error = new Error(`Unknown tool: ${callInfo.name}`);
       await this.#emitToolCallError(callInfo.name, 'calling', error, fallbackParameters, callInfo);
-      return this.#createToolExecutionRecord(callInfo, normalizeErrorMessage(error));
+      return this.#createToolExecutionRecord(callInfo, normalizeErrorMessage(error), true);
     }
+
+    const compactResult =
+      tool === this.#builtinSkillRuntimeDefinition ? this.#skillRuntime.compactResult : true;
 
     const parsedArguments = await this.#parseToolArguments(tool, callInfo);
 
     if (!parsedArguments.ok) {
-      return this.#createToolExecutionRecord(callInfo, parsedArguments.message);
+      return this.#createToolExecutionRecord(callInfo, parsedArguments.message, compactResult);
     }
 
     const parameters = parsedArguments.parameters;
@@ -437,6 +491,7 @@ export class Agent<P extends AgentProtocol> {
       return this.#createToolExecutionRecord(
         callInfo,
         `${beforeToolErrorPrefix}${normalizeErrorMessage(beforeResult.error)}`,
+        compactResult,
       );
     }
 
@@ -446,10 +501,14 @@ export class Agent<P extends AgentProtocol> {
       result = await tool.handler(parameters);
     } catch (error) {
       await this.#emitToolCallError(tool.name, 'calling', error, parameters, callInfo);
-      return this.#createToolExecutionRecord(callInfo, normalizeErrorMessage(error));
+      return this.#createToolExecutionRecord(callInfo, normalizeErrorMessage(error), compactResult);
     }
 
-    const record = this.#createToolExecutionRecord(callInfo, serializeToolResult(result));
+    const record = this.#createToolExecutionRecord(
+      callInfo,
+      serializeToolResult(result),
+      compactResult,
+    );
 
     await this.#runAfterToolListeners(tool.name, parameters, callInfo, result);
 
@@ -612,19 +671,14 @@ export class Agent<P extends AgentProtocol> {
   }
 
   #buildSkillPrompt(): string {
-    // 技能选择指引放在 system prompt 中，让 `get-skill` 的工具描述保持精简。
+    const descriptors = this.#skillRegistry.getDescriptors();
     const skillList =
-      this.#skills.length === 0
-        ? '当前没有可查询的技能手册，不要调用 get-skill。'
-        : this.#skills
-            .map(
-              (skill, index) =>
-                `技能手册${index}：\n名称：${skill.name}\n描述：${skill.description}`,
-            )
-            .join('\n\n');
+      descriptors.length === 0
+        ? '当前没有可用 Skill，不要调用 skill 工具。'
+        : renderSkillDiscoveryCatalog(descriptors);
 
     return [
-      '框架技能约束：当正在执行的任务匹配到如下技能手册描述时，必须先调用 get-skill 工具获取对应下标的完整手册内容，然后检查手册内是否有具体工作流；如果匹配到具体工作流，必须按照该工作流执行。',
+      '框架 Skill 约束：首轮只披露 name 和 description。任务匹配时先调用 skill({ skill, args? })；省略 args 或使用 load 获取 instructions 和 manifest，再按 manifest 使用 read/run。不得猜测未登记的 resource 或 script id。',
       skillList,
     ].join('\n\n');
   }
@@ -651,7 +705,7 @@ export class Agent<P extends AgentProtocol> {
       const description =
         typeof tool.description === 'function'
           ? tool.description({
-              skills: [...this.#skills],
+              skills: this.#skillRegistry.getDescriptors(),
               subAgents: [
                 ...this.subAgents,
               ] as unknown as readonly AgentConstructor<AgentProtocol>[],
@@ -994,7 +1048,11 @@ export class Agent<P extends AgentProtocol> {
     return message;
   }
 
-  #createToolExecutionRecord(call: AgentToolCall<P>, output: string): ToolExecutionRecord<P> {
+  #createToolExecutionRecord(
+    call: AgentToolCall<P>,
+    output: string,
+    compactResult: boolean,
+  ): ToolExecutionRecord<P> {
     const resultMessage = this.#appendToolMessage(this.#createToolMessage(call.id, output));
 
     return {
@@ -1002,6 +1060,7 @@ export class Agent<P extends AgentProtocol> {
       resultMessage,
       originalInput: call.arguments,
       originalResult: output,
+      compactResult,
     };
   }
 
@@ -1017,7 +1076,12 @@ export class Agent<P extends AgentProtocol> {
       return;
     }
 
+    const previousStatus = this.#status;
     this.#status = status;
+
+    if (previousStatus === 'running' && status !== 'running' && this.#skillConfigurationDirty) {
+      this.#initialized = false;
+    }
 
     for (const listener of this.#statusListeners.filter((item) => item.status === status)) {
       void Promise.resolve(
@@ -1124,10 +1188,12 @@ function formatStaticToolDescription(tool: ToolDefinition, index: number): strin
 }
 
 export {
+  DEFAULT_SKILL_TEXT_RESOURCE_EXTENSIONS,
   DEFAULT_MODEL_ERROR_RECOVERY_LIMITS,
   DEFAULT_TOOL_PAYLOAD_COMPACT_LIMITS,
   MODEL_ERROR_RECOVERY_TRACE_LIMIT,
   ModelErrorRecoveryError,
   Tool,
+  detectSkillScriptExecutors,
 };
 export type * from './types';

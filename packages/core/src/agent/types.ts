@@ -408,23 +408,93 @@ export interface AgentToolCall<P extends AgentProtocol> {
   sourceCall: RawToolCallOf<P>;
 }
 
-/** 技能手册中的一条具体操作流程。 */
-export interface AgentSkillSop {
-  description: string;
-  content: string;
+/** 内置 `skill` 工具的参数。 */
+export interface SkillToolInput {
+  /** 需要激活的 Skill 名称。 */
+  readonly skill: string;
+  /** 可选的 load/read/run 命令字符串；省略时等价于 load。 */
+  readonly args?: string;
 }
 
-/**
- * 技能手册元数据。
- *
- * 框架通过内部 system prompt 暴露技能索引；模型应先调用内置 `get-skill`
- * 获取完整手册，再按照匹配到的流程执行。
- */
-export interface AgentSkill {
-  name: string;
-  description: string;
-  systemContent?: string;
-  sops?: AgentSkillSop[];
+/** Progressive disclosure 第一层允许暴露给模型的 Skill 信息。 */
+export interface AgentSkillDescriptor {
+  readonly name: string;
+  readonly description: string;
+}
+
+/** 直接以内存源码定义的一条 Skill script。 */
+export interface AgentSkillScript {
+  /** 带前导点的单后缀，例如 `.py` 或 `.js`。 */
+  readonly extension: string;
+  readonly content: string;
+  readonly description?: string;
+}
+
+/** 跨运行时的结构化 Skill 定义。 */
+export interface AgentSkill extends AgentSkillDescriptor {
+  readonly license?: string;
+  readonly compatibility?: string;
+  readonly metadata?: Readonly<Record<string, string>>;
+  readonly instructions: string;
+  readonly references?: Readonly<Record<string, string>>;
+  readonly assets?: Readonly<Record<string, string>>;
+  readonly scripts?: Readonly<Record<string, AgentSkillScript>>;
+}
+
+/** Node 文件能力可用时，从 Agent Skills portable text subset 目录或 SKILL.md 加载。 */
+export interface AgentSkillFileSource {
+  readonly source: 'file';
+  readonly path: string;
+}
+
+/** Agent 可配置的 Skill 来源。 */
+export type AgentSkillSource = AgentSkill | AgentSkillFileSource;
+
+/** 一个脚本后缀对应的可直接启动 executable 及其固定前置参数。 */
+export interface SkillScriptExecutor {
+  readonly command: string;
+  readonly commandArgs?: readonly string[];
+}
+
+/** 手工 executor 覆盖；`false` 删除同后缀的自动检测结果。 */
+export type SkillScriptExecutorMap = Readonly<Record<string, SkillScriptExecutor | false>>;
+
+/** Skill 脚本执行配置；所有能力默认关闭。 */
+export interface SkillScriptRuntimeOptions {
+  readonly autoDetect?: boolean;
+  readonly executors?: SkillScriptExecutorMap;
+}
+
+/** Skill 子系统运行配置。 */
+export interface SkillRuntimeOptions {
+  /** `true` 时 Skill 结果才参与全局 tool-result compact；默认 false。 */
+  readonly compactResult?: boolean;
+  /** 省略或 false 时禁止执行任何 Skill script。 */
+  readonly scripts?: false | SkillScriptRuntimeOptions;
+  /** 替换 file source 的缺省文本资源后缀。 */
+  readonly resourceExtensions?: readonly string[];
+}
+
+/** 一次已启动 Skill script 的完整退出结果。 */
+export interface SkillScriptExecutionResult {
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/** file source 在最近一次成功初始化中被忽略的稳定原因。 */
+export type AgentSkillSourceDiagnosticReason =
+  | 'node_unavailable'
+  | 'file_capability_unavailable'
+  | 'read_permission_denied'
+  | 'source_access_denied';
+
+/** 不包含本地路径的 file source 初始化诊断。 */
+export interface AgentSkillSourceDiagnostic {
+  /** configured sources 中的 0-based 下标。 */
+  readonly sourceIndex: number;
+  readonly reason: AgentSkillSourceDiagnosticReason;
 }
 
 /**
@@ -433,7 +503,7 @@ export interface AgentSkill {
  * 装饰器定义属于类级 metadata，本期不将其绑定到具体 Model 协议。
  */
 export interface ToolDescriptionContext {
-  skills: readonly AgentSkill[];
+  skills: readonly AgentSkillDescriptor[];
   subAgents: readonly AgentConstructor<AgentProtocol>[];
   context: readonly unknown[];
   history: readonly unknown[];
@@ -483,8 +553,10 @@ export interface AgentConstructor<P extends AgentProtocol> {
 export interface AgentOptions<P extends AgentProtocol> {
   /** 提供消息构建、反解析和生成能力的协议 Model。 */
   llm: Model<P>;
-  /** 通过内部 system prompt 向模型展示索引的技能手册。 */
-  skills?: readonly AgentSkill[];
+  /** 通过 progressive disclosure 暴露给模型的 Skill 来源。 */
+  skills?: readonly AgentSkillSource[];
+  /** Skill 的文本资源、脚本和 compact 行为配置。 */
+  skillRuntime?: SkillRuntimeOptions;
   /** 可由内置 `agent` 工具调度的同协议子代理类。 */
   subAgents?: readonly AgentConstructor<P>[];
   /** 用户 system prompt；框架内部提示词会排列在这些提示词之前。 */

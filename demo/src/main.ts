@@ -27,10 +27,8 @@ class MockModel extends ResponsesMockModel {
     this.#round += 1;
 
     const systemMessages = request.context.filter(isSystemInputMessage);
-    const skillPrompt = systemMessages.find((message) =>
-      readInputText(message).includes('get-skill'),
-    );
-    const getSkillTool = request.tools.find((tool) => tool.name === 'get-skill');
+    const skillPrompt = systemMessages.find((message) => readInputText(message).includes('skill'));
+    const skillTool = request.tools.find((tool) => tool.name === 'skill');
     const saveNoteTool = request.tools.find((tool) => tool.name === 'save-note');
     const runtimeNoteTool = request.tools.find((tool) => tool.name === 'runtime-note');
 
@@ -42,10 +40,7 @@ class MockModel extends ResponsesMockModel {
       ),
       'Expected skill system prompt to include current skills.',
     );
-    assertDemo(
-      getSkillTool?.description === '获取指定下标的技能手册完整内容。',
-      'Expected get-skill description to stay static.',
-    );
+    assertDemo(skillTool !== undefined, 'Expected the skill tool to remain available.');
     assertDemo(
       saveNoteTool !== undefined && !('strict' in saveNoteTool),
       'Expected an unspecified Responses strict option to be omitted.',
@@ -78,7 +73,7 @@ class MockModel extends ResponsesMockModel {
     }
 
     if (this.#round === 1) {
-      return toolResponse('call_get_skill', 'get-skill', { index: 0 });
+      return toolResponse('call_get_skill', 'skill', { skill: 'demo-skill' });
     }
 
     if (this.#round === 2) {
@@ -342,13 +337,7 @@ const agent = new DemoAgent({
     {
       name: 'demo-skill',
       description: 'A sample skill used by the demo model.',
-      systemContent: 'Prefer concise tool use.',
-      sops: [
-        {
-          description: 'Handle demo notes',
-          content: 'Read the note request, save it, then finish the task.',
-        },
-      ],
+      instructions: 'Prefer concise tool use. Read the note request, save it, then finish.',
     },
   ],
 });
@@ -445,6 +434,7 @@ agent.addSystemPrompts('Keep tool calls minimal.');
 agent.addSkill({
   name: 'runtime-skill',
   description: 'Added after construction to verify dynamic skill descriptions.',
+  instructions: 'This Skill exists to demonstrate pre-init dynamic registration.',
 });
 
 // 事件组合覆盖写入顺序、before 取消工具和工具错误观察能力。
@@ -459,9 +449,9 @@ agent.onModelResponse((output) => {
 });
 
 agent.onAfterToolCall(
-  'get-skill',
+  'skill',
   (_parameters, _message, result) => {
-    console.log(`get-skill result length: ${String(result).length}`);
+    console.log(`skill result length: ${String(result).length}`);
   },
   {
     await: true,

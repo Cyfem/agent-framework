@@ -49,6 +49,8 @@ export interface ToolExecutionRecord<P extends AgentProtocol> {
   readonly resultMessage: ContextOf<P>;
   readonly originalInput: string;
   readonly originalResult: string;
+  /** false 时仅跳过本条记录的 tool-result compactor；input compact 不受影响。 */
+  readonly compactResult: boolean;
 }
 
 /** 保留“整体未配置”与“对象字段缺省”的三态语义并做完整 runtime 校验。 */
@@ -121,15 +123,17 @@ export async function rewriteOpenLoopToolPayloads<P extends AgentProtocol>(input
       });
     }
 
-    const compactedResult = await runCompactor(
-      input.compactors.toolResult,
-      record.originalResult,
-      Object.freeze({
-        kind: 'tool_result' as const,
-        iteration: input.iteration,
-        call: callSnapshot,
-      }),
-    );
+    const compactedResult = record.compactResult
+      ? await runCompactor(
+          input.compactors.toolResult,
+          record.originalResult,
+          Object.freeze({
+            kind: 'tool_result' as const,
+            iteration: input.iteration,
+            call: callSnapshot,
+          }),
+        )
+      : undefined;
 
     if (compactedResult !== undefined && compactedResult !== record.originalResult) {
       results.push({

@@ -25,7 +25,7 @@ npm install @manee/agent-framework zod
 - Zod 参数校验：工具参数在本地执行前会先通过 schema 校验。
 - 事件系统：可观察模型响应、工具调用、工具错误、Agent 状态和 Agent 错误。
 - Context compact：active-only 工具 payload 压缩、外部摘要策略与 context-length 恢复，raw history 保留原文。
-- Skills：以索引化手册形式指导模型调用内置 `get-skill`。
+- Skills：通过内置 `skill` 工具按名称渐进加载 instructions、文本资源和显式启用的脚本。
 - Sub-agents：通过内置 `agent` 工具调度同协议子代理。
 
 ## 快速开始
@@ -395,21 +395,89 @@ const agent = new Agent<OpenAIResponsesProtocol>({
 agent.addSystemPrompts('回复要简洁，必要时调用工具。');
 ```
 
-Skills 是给模型读取的结构化手册。框架会在内部 system prompt 中列出技能索引；模型匹配到任务时，应调用内置 `get-skill` 获取完整手册。
+Skills 是给模型按需读取的结构化能力手册。框架首轮只在内部 system prompt 和动态工具描述中暴露冻结的 `name + description`；instructions、资源内容、脚本源码、本地路径和 executable 只有模型明确调用内置 `skill` 工具后才会进入相应流程。
+
+Inline 结构体是跨运行时的规范配置：
 
 ```ts
-agent.addSkill({
-  name: '账单处理手册',
-  description: '当用户询问账单、退款或抵扣时使用。',
-  systemContent: '处理账单问题时必须先查事实，再给结论。',
-  sops: [
+const agent = new Agent({
+  llm: model,
+  skills: [
     {
-      description: '处理重复计费',
-      content: '1. 查询账单。\n2. 核对重复项。\n3. 生成用户可读回复。',
+      name: 'billing-review',
+      description: 'Review invoices, refunds, credits, and duplicate charges.',
+      instructions: [
+        'Read references/policy.md before deciding.',
+        'When validation is needed, run scripts/check.js with the invoice id.',
+      ].join('\n'),
+      references: {
+        'policy.md': '# Billing policy\nVerify facts before proposing a credit.',
+      },
+      assets: {
+        'reply-template.md': '# Reply\nFacts, decision, and next action.',
+      },
+      scripts: {
+        check: {
+          extension: '.js',
+          content: 'console.log(JSON.stringify({ invoice: process.argv[2] }))',
+          description: 'Validate one invoice id.',
+        },
+      },
     },
   ],
+  skillRuntime: {
+    // Skill result 默认不进入 tool-result payload compact。
+    compactResult: false,
+    scripts: {
+      autoDetect: true,
+    },
+  },
 });
 ```
+
+内置工具输入固定为 `{ skill: string, args?: string }`，命令如下：
+
+| 命令                             | 行为                                                       |
+| -------------------------------- | ---------------------------------------------------------- |
+| 省略 `args`、空值或 `load [...]` | 返回 instructions 和当前 resource/script manifest          |
+| `read <resource-id>`             | 读取已登记的 `references/...` 或 `assets/...` 文本         |
+| `run <script-id> [argv...]`      | 用已解析 executor 运行已登记脚本；模型参数只作为 argv 传入 |
+
+`load` 支持字面量 `$ARGUMENTS` 替换。DSL 只把 TAB、LF、CR 和普通空格作为分隔符；它没有 Shell 语义，不解释变量、glob、管道、重定向、命令替换或控制运算符。
+
+### File Skill adapter
+
+Node 文件能力可用时，也可以显式配置目录或其中的 `SKILL.md`：
+
+```ts
+const agent = new Agent({
+  llm: model,
+  skills: [{ source: 'file', path: '/absolute/path/to/billing-review' }],
+  skillRuntime: {
+    resourceExtensions: ['.md', '.txt', '.json'],
+    scripts: false,
+  },
+});
+
+agent.init();
+console.log(agent.getSkillSourceDiagnostics());
+```
+
+该 adapter 明确实现 **Agent Skills portable text subset**，不承诺完整 Agent Skills 物理目录兼容：
+
+- `SKILL.md` 接受 name、description、license、compatibility、metadata 和 Markdown body；`allowed-tools` 不产生授权行为。
+- `references/`、`assets/` 只发现声明扩展名的 UTF-8 文本。缺省扩展名为 `.md/.txt/.json/.yaml/.yml/.csv/.xml`，自定义数组整体替换；非法 UTF-8 在 lazy read 时返回工具调用错误。
+- 候选路径拒绝空 segment、`.`/`..`、反斜杠、ASCII control/DEL、`<>:"|?*`、NUL、末尾空格/点、Windows 保留 basename，以及 NFC/大小写 alias 和 file/directory prefix collision。因此 POSIX 合法的 `query?.md`、`a:b.md` 也不属于本 subset。
+- unsupported resource 和无后缀 script 在候选校验前忽略；三类 well-known 根必须缺失或为真实普通目录，树内 symlink 和特殊文件忽略且不跟随。
+- 非 Node、缺少 `process.getBuiltinModule()`、文件 capability 不可用或初始化读取被权限拒绝时，file source 会被忽略；框架不读取或回显 capability 缺失 source 的 path。`getSkillSourceDiagnostics()` 只返回 0-based `sourceIndex + reason`，不写 console。
+
+Inline load/read 不依赖 Node 文件或进程能力。file run 需要 file + process capability；inline run 还需要临时文件 capability。脚本默认关闭，`scripts: {}` 也不会自动启用 executor；`autoDetect` 默认 `false`，也可以用 `executors` 手工覆盖或用 `false` 删除某一后缀。
+
+脚本固定通过 `shell: false` 启动，stdin 关闭，但它仍是宿主显式信任的本地代码：框架不提供沙箱、默认 timeout、输出上限、网络隔离或环境变量清理。子进程继承宿主环境；Deno 自动检测只配置裸 `deno run`，所需 read/env/network 权限必须由手工 executor 明确添加。Windows 自动检测不会把 `.cmd/.bat` shim 当作可由 `shell: false` 直接执行的程序。
+
+Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL.md`、references、assets 和 scripts），以 Skill root 为 cwd，并在结束后 best-effort 清理。file script 直接执行重新校验后的登记文件，不复制或修改原目录。
+
+`addSkill()` 只修改 configured sources。非运行状态下会立即使 Agent 回到未初始化；运行中添加只标记 dirty，当前 run 继续使用旧 snapshot。两种情况都必须在下一次运行前重新 `init()`，新 Skill 才会生效。父 Agent 的 Skill 和 runtime 配置不会自动传播给动态子代理。
 
 ## 子代理
 

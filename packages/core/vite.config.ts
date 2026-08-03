@@ -54,7 +54,7 @@ export default defineConfig({
     rollupOptions: {
       // 核心包面向 Node.js 运行时，保留依赖和 Node 内置模块为外部引用。
       // 发布产物只打包框架源码，避免把 openai/zod 等依赖复制进库文件。
-      external: ['openai', 'zod', 'zod-to-json-schema', /^node:/],
+      external: ['openai', 'yaml', 'zod', 'zod-to-json-schema', /^node:/],
     },
     lib: {
       entry,
