@@ -1,6 +1,7 @@
 import { transformAsync } from '@babel/core';
 import { fileURLToPath } from 'node:url';
-import { defineConfig, type Plugin } from 'vite';
+import type { Plugin } from 'vite';
+import { defineConfig } from 'vitest/config';
 
 const entry = fileURLToPath(new URL('./src/index.ts', import.meta.url));
 
@@ -41,6 +42,12 @@ function decoratorsBabelPlugin(): Plugin {
 
 export default defineConfig({
   plugins: [decoratorsBabelPlugin()],
+  test: {
+    environment: 'node',
+    globals: false,
+    clearMocks: true,
+    include: ['test/**/*.test.ts'],
+  },
   build: {
     target: 'node22',
     sourcemap: true,

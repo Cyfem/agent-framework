@@ -9,6 +9,8 @@
   "scripts": {
     "dev": "vite-node src/main.ts",
     "chat": "vite-node src/chat.ts",
+    "context-compact:chat": "vite-node src/context-compact-chat.ts",
+    "context-compact:responses": "vite-node src/context-compact-responses.ts",
     "complex": "vite-node src/complex.ts",
     "ark:full": "vite-node src/complex.ts",
     "ark:smoke": "vite-node src/ark-glm.ts",

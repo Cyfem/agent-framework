@@ -14,8 +14,11 @@ import type {
   AgentTextPart,
   AgentToolCall,
   AgentToolDefinitionInput,
+  ModelErrorDescriptor,
+  ToolPayloadReplacements,
 } from '../../agent/types';
 import { Model, type ModelGenerateRequest, type ModelGenerateResult } from '../base';
+import { classifyOpenAICompatibleError } from '../openai-error';
 import { toOpenAIToolParameters } from '../openai-schema';
 import type {
   OpenAIChatAssistantContextMessage,
@@ -76,7 +79,9 @@ export class OpenAIChatModel extends Model<OpenAIChatProtocol> {
       messages: request.context as unknown as ChatCompletionMessageParam[],
     };
 
-    if (request.tools.length > 0) {
+    if (request.purpose === 'context-summary') {
+      deleteToolOnlyChatParams(params);
+    } else if (request.tools.length > 0) {
       params.tools = request.tools as unknown as ChatCompletionTool[];
     }
 
@@ -259,6 +264,141 @@ export class OpenAIChatModel extends Model<OpenAIChatProtocol> {
         : [],
     );
   }
+
+  /** Copy-on-write 改写 Chat function arguments 与对应 tool role content。 */
+  rewriteToolPayloads(
+    context: readonly OpenAIChatContext[],
+    replacements: ToolPayloadReplacements<OpenAIChatProtocol>,
+  ): readonly OpenAIChatContext[] {
+    const rewritten = [...context];
+    const inputTargets = new Map<number, Map<number, string>>();
+    const resultTargets = new Map<number, string>();
+
+    for (const replacement of replacements.inputs) {
+      const messageIndex = findUniqueMessageIndex(
+        context,
+        replacement.sourceMessage,
+        'Chat tool input replacement',
+      );
+      const message = context[messageIndex];
+
+      if (message?.role !== 'assistant') {
+        throw new Error('Chat tool input replacement sourceMessage is not an assistant message.');
+      }
+
+      const callIndexes = (message.tool_calls ?? []).flatMap((call, index) =>
+        call === replacement.sourceCall ? [index] : [],
+      );
+      if (callIndexes.length !== 1) {
+        throw new Error(
+          `Chat tool input replacement sourceCall must match exactly once; matched ${callIndexes.length}.`,
+        );
+      }
+
+      const callIndex = callIndexes[0]!;
+      const call = message.tool_calls?.[callIndex];
+      if (call?.type !== 'function') {
+        throw new Error('Chat tool input replacement sourceCall is not a function tool call.');
+      }
+
+      const messageTargets = inputTargets.get(messageIndex) ?? new Map<number, string>();
+      if (messageTargets.has(callIndex)) {
+        throw new Error('Chat tool input replacement targets the same call more than once.');
+      }
+      messageTargets.set(callIndex, replacement.replacement);
+      inputTargets.set(messageIndex, messageTargets);
+    }
+
+    for (const replacement of replacements.results) {
+      const messageIndex = findUniqueMessageIndex(
+        context,
+        replacement.sourceMessage,
+        'Chat tool result replacement',
+      );
+      const message = context[messageIndex];
+
+      if (message?.role !== 'tool' || message.tool_call_id !== replacement.callId) {
+        throw new Error(
+          'Chat tool result replacement sourceMessage must be a tool message with the same call id.',
+        );
+      }
+      if (resultTargets.has(messageIndex)) {
+        throw new Error('Chat tool result replacement targets the same message more than once.');
+      }
+      resultTargets.set(messageIndex, replacement.replacement);
+    }
+
+    for (const [messageIndex, targets] of inputTargets) {
+      const message = context[messageIndex];
+      if (message?.role !== 'assistant') {
+        throw new Error('Chat tool input replacement target changed during rewrite.');
+      }
+
+      rewritten[messageIndex] = {
+        ...message,
+        tool_calls: (message.tool_calls ?? []).map((call, callIndex) => {
+          const replacement = targets.get(callIndex);
+          if (replacement === undefined) {
+            return call;
+          }
+          if (call.type !== 'function') {
+            throw new Error('Chat tool input replacement target is not a function tool call.');
+          }
+
+          return {
+            ...call,
+            function: {
+              ...call.function,
+              arguments: replacement,
+            },
+          };
+        }),
+      };
+    }
+
+    for (const [messageIndex, replacement] of resultTargets) {
+      const message = context[messageIndex];
+      if (message?.role !== 'tool') {
+        throw new Error('Chat tool result replacement target changed during rewrite.');
+      }
+
+      rewritten[messageIndex] = {
+        ...message,
+        content: replacement,
+      };
+    }
+
+    return rewritten;
+  }
+
+  /** 使用共享 OpenAI-compatible 规则识别 context-length 等 provider 错误。 */
+  classifyError(error: unknown): ModelErrorDescriptor {
+    return classifyOpenAICompatibleError(error);
+  }
+}
+
+function deleteToolOnlyChatParams(params: ChatCompletionCreateParamsNonStreaming): void {
+  const mutable = params as ChatCompletionCreateParamsNonStreaming & Record<string, unknown>;
+
+  delete mutable.tools;
+  delete mutable.tool_choice;
+  delete mutable.parallel_tool_calls;
+  delete mutable.max_tool_calls;
+  delete mutable.functions;
+  delete mutable.function_call;
+}
+
+function findUniqueMessageIndex(
+  context: readonly OpenAIChatContext[],
+  sourceMessage: OpenAIChatContext,
+  label: string,
+): number {
+  const indexes = context.flatMap((message, index) => (message === sourceMessage ? [index] : []));
+  if (indexes.length !== 1) {
+    throw new Error(`${label} sourceMessage must match exactly once; matched ${indexes.length}.`);
+  }
+
+  return indexes[0]!;
 }
 
 function parseUserContent(

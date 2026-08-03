@@ -8,14 +8,17 @@ import type {
   AgentToolDefinitionInput,
   AssistantMessageOf,
   ContextOf,
+  ModelErrorClassificationContext,
+  ModelErrorDescriptor,
   SystemMessageOf,
+  ToolPayloadReplacements,
   ToolCallOutputMessageOf,
   ToolOf,
   UserMessageOf,
 } from '../../agent/types';
 import type { ModelGenerateRequest, ModelGenerateResult } from './types';
 
-export type { ModelGenerateRequest, ModelGenerateResult } from './types';
+export type { ModelGeneratePurpose, ModelGenerateRequest, ModelGenerateResult } from './types';
 
 /**
  * Agent 使用的协议适配器抽象基类。
@@ -105,4 +108,70 @@ export abstract class Model<P extends AgentProtocol> {
   abstract parseToolCallOutputMessages(
     context: readonly ContextOf<P>[],
   ): readonly AgentParsedMessage<ToolCallOutputMessageOf<P>, ContextOf<P>>[];
+
+  /**
+   * Copy-on-write 改写工具 input/result payload。
+   *
+   * 旧自定义 Model 不必实现此能力；只有真正产生 replacement 时才会抛出明确的
+   * capability 错误。空 replacement 始终返回新的数组浅拷贝。
+   */
+  rewriteToolPayloads(
+    context: readonly ContextOf<P>[],
+    replacements: ToolPayloadReplacements<P>,
+  ): readonly ContextOf<P>[] {
+    if (replacements.inputs.length === 0 && replacements.results.length === 0) {
+      return [...context];
+    }
+
+    throw new Error(
+      `${this.constructor.name} does not support tool payload rewriting. Override rewriteToolPayloads().`,
+    );
+  }
+
+  /**
+   * 从摘要响应中按协议顺序提取 assistant 文本。
+   *
+   * 默认实现只接受 runtime 形状为 `{ content: [{ type: 'text', text }] }` 的
+   * parser 结果；协议具有不同结构时可覆盖。
+   */
+  extractAssistantText(context: readonly ContextOf<P>[]): readonly string[] {
+    const texts: string[] = [];
+
+    for (const parsed of this.parseAssistantMessages(context)) {
+      const message = parsed.message as { content?: unknown };
+      const messageParts: string[] = [];
+
+      if (!Array.isArray(message.content)) {
+        continue;
+      }
+
+      for (const part of message.content) {
+        if (
+          typeof part === 'object' &&
+          part !== null &&
+          'type' in part &&
+          part.type === 'text' &&
+          'text' in part &&
+          typeof part.text === 'string'
+        ) {
+          messageParts.push(part.text);
+        }
+      }
+
+      if (messageParts.length > 0) {
+        texts.push(messageParts.join(''));
+      }
+    }
+
+    return texts;
+  }
+
+  /** 将 provider 异常归一化为框架可恢复的描述。 */
+  classifyError(error: unknown, context: ModelErrorClassificationContext<P>): ModelErrorDescriptor {
+    void context;
+    return {
+      kind: 'unknown',
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
 }

@@ -13,6 +13,7 @@
 - **技能手册**：通过 `skills` 暴露可索引的操作手册，模型可调用内置 `get-skill` 获取完整内容。
 - **子代理调度**：通过内置 `agent` 工具调度同协议子代理，并使用 `agent-result` 汇报结果。
 - **多模态上下文**：Responses 支持 Files 上传后通过 `input_image.file_id` 等内容块注入；Chat 支持 `image_url` 等内容块。
+- **上下文压缩**：支持 active-only 工具 payload 裁剪、外部定义的摘要事务，以及 context-length 错误恢复；raw history 始终保留原文。
 - **发布友好**：公开 API 带中文 TSDoc，构建后的 `.d.ts` 会保留说明。
 
 ## 安装
@@ -101,6 +102,38 @@ console.log(context);
 - 默认没有迭代次数上限，可通过 `maxIterations` 设置硬上限。
 - 当前版本只支持非流式 `generate()`；`stream=true` 会抛错。
 - 并发调用第二个 `agent()` 会抛出 `Agent is already running.`，但不会影响正在运行的任务状态。
+
+## Context compact
+
+`contextCompact` 整体未配置时不压缩。只要传入对象，缺省的 `toolInput` 与 `toolResult` 都会启用框架内置字符裁剪：input 为 `8192 → 4096`，result 为 `16384 → 8192`（UTF-16 code unit）。
+
+```ts
+const agent = new Agent({
+  llm: model,
+  contextCompact: {},
+});
+```
+
+工具始终使用原始 arguments 执行，`getHistory()` 返回 append-only raw history，`getContext()` 返回下一次模型请求使用的 active context。压缩只 copy-on-write 改写 active payload；框架不会裁剪 raw history，也不解决内存、持久化或敏感数据留存。
+
+可以逐类覆盖长度、完全接管或关闭策略：
+
+```ts
+const agent = new Agent({
+  llm: model,
+  contextCompact: {
+    toolInput: { strategy: 'default', thresholdChars: 12_000, targetChars: 6_000 },
+    toolResult: async (original, info) =>
+      info.call.name === 'search' ? compactSearchResult(original) : undefined,
+  },
+});
+```
+
+自定义 callback 完全覆盖缺省策略；返回 `undefined` 或原文表示不替换，不会回退到内置策略。值为 `false` 时关闭该类。仅启用摘要时必须同时配置 `toolInput: false` 与 `toolResult: false`，因为 `{ summary }` 也会缺省启用两类工具压缩。
+
+摘要的业务语义由调用方通过 `trigger/select/prompt/validate` 定义；框架只负责选择默认 boundary、用当前 Model 发起无工具的 `context-summary` 请求、验证响应并通过 revision CAS 原子提交。context-length 错误可复用同一摘要策略恢复。普通未知模型错误默认额外重试 3 次，context handler 默认执行 2 次；可用 `modelErrorRecovery` 覆盖，并通过 `onBeforeModelErrorRecovery()` / `onAfterModelErrorRecovery()` 控制动作。
+
+内置 payload 压缩只保证格式规则和目标字符上限，不保证工具 schema、业务语义或脱敏。自定义 Model 在实际产生工具 replacement 时还需要实现 `rewriteToolPayloads()`，并可覆盖 `classifyError()` 识别 context-length 错误。完整配置、恢复决策和风险说明见 [packages/core/README.md](./packages/core/README.md)。离线示例位于 [Chat](./demo/src/context-compact-chat.ts) 与 [Responses](./demo/src/context-compact-responses.ts)。
 
 ## 更多文档
 
