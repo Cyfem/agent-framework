@@ -143,6 +143,20 @@ const agent = new Agent({
 
 内置 payload 压缩只保证格式规则和目标字符上限，不保证工具 schema、业务语义或脱敏。自定义 Model 在实际产生工具 replacement 时还需要实现 `rewriteToolPayloads()`，并可覆盖 `classifyError()` 识别 context-length 错误。完整配置、恢复决策和风险说明见 [packages/core/README.md](./packages/core/README.md)。离线示例位于 [Chat](./demo/src/context-compact-chat.ts) 与 [Responses](./demo/src/context-compact-responses.ts)。
 
+## Skills 与 Context Compact feature suite
+
+仓库提供两层可执行验收：确定性的离线 suite 覆盖 Skills、payload compact、summary 和错误恢复；Ark Agent Plan suite 则使用同一个模型分别验证 Chat Completions 与 Responses 的真实工具闭环。
+
+```bash
+# 不需要网络或密钥
+pnpm --filter @manee/agent-framework-demo features:offline
+
+# 先将 demo/.env.example 复制为已被 Git 忽略的 demo/.env，并填写 ARK_API_KEY
+pnpm --filter @manee/agent-framework-demo features:ark
+```
+
+Agent Plan demo 的缺省地址为 `https://ark.cn-beijing.volces.com/api/plan/v3`，缺省模型为 `kimi-k3`；它不会回退到普通 Ark `/api/v3` 或 Coding Plan `/api/coding/v3`。根目录 `pnpm test` 会依次运行 core、离线 suite 和真实 Ark suite，因此缺少 `ARK_API_KEY`、网络不可用或任一协议不兼容都会使门禁失败。详细能力矩阵、安全边界和配置方式见 [demo/README.md](./demo/README.md)。
+
 ## 更多文档
 
 完整 API 用法、事件、skills、子代理、自定义 Model 和多模态说明见 [packages/core/README.md](./packages/core/README.md)。
