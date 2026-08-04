@@ -1,19 +1,23 @@
-# @manee/agent-framework
+# @ruixutong.manee/maneeagent-framework
 
-面向 Node.js 的 TypeScript AI Agent 编排框架。它的核心目标是把 Agent 编排逻辑与模型协议解耦：`Agent<P>` 管任务循环、上下文、工具、事件和子代理；`Model<P>` 管协议消息、工具 wire structure、工具调用解析和实际模型请求。
+[![npm version](https://img.shields.io/npm/v/%40ruixutong.manee%2Fmaneeagent-framework?logo=npm)](https://www.npmjs.com/package/@ruixutong.manee/maneeagent-framework)
+![Node.js >= 22](https://img.shields.io/badge/Node.js-%3E%3D22-339933?logo=node.js&logoColor=white)
+
+面向 Node.js、以 TypeScript 为主要开发体验的 AI Agent 编排框架。它的核心目标是把 Agent 编排逻辑与模型协议解耦：`Agent<P>` 管任务循环、上下文、工具、事件和子代理；`Model<P>` 管协议消息、工具 wire structure、工具调用解析和实际模型请求。
 
 ## 安装
 
 ```bash
-npm install @manee/agent-framework zod
+npm install @ruixutong.manee/maneeagent-framework zod
 ```
 
-要求：
+运行与兼容性：
 
 - Node.js >= 22
-- TypeScript 项目
+- 同时提供 ESM、CommonJS 和 TypeScript 声明；TypeScript 是推荐体验，但不是运行时工具 API 的硬要求
 - 使用 `@Tool(...)` 时，构建链需要支持 2023-11 decorators
-- API key 使用环境变量注入，不要硬编码到源码或提交历史中
+- 核心库不读取固定环境变量；API key、`baseURL`、模型名或已配置的 OpenAI client 均通过 Model options 注入
+- API key 应从环境变量或密钥服务读取，不要硬编码到源码或提交历史中
 
 ## 能力概览
 
@@ -27,6 +31,18 @@ npm install @manee/agent-framework zod
 - Skills：以索引化手册形式指导模型调用内置 `get-skill`。
 - Sub-agents：通过内置 `agent` 工具调度同协议子代理。
 
+## 公开入口
+
+| 运行时导出             | 用途                                                        |
+| ---------------------- | ----------------------------------------------------------- |
+| `Agent`                | 协议无关的任务循环、上下文、工具和生命周期编排。            |
+| `Tool`                 | 将类方法注册为 Agent 工具的标准装饰器。                     |
+| `Model`                | 接入自定义消息协议时实现的抽象基类。                        |
+| `OpenAIResponsesModel` | Responses API 与 OpenAI-compatible endpoint 适配器。        |
+| `OpenAIChatModel`      | Chat Completions API 与 OpenAI-compatible endpoint 适配器。 |
+
+包根入口还导出 Agent、Model、Responses 和 Chat 的配套 TypeScript 类型，不提供子路径入口或 CLI `bin`。
+
 ## 快速开始
 
 ```ts
@@ -35,8 +51,15 @@ import {
   OpenAIResponsesModel,
   Tool,
   type OpenAIResponsesProtocol,
-} from '@manee/agent-framework';
+} from '@ruixutong.manee/maneeagent-framework';
 import { z } from 'zod';
+
+const apiKey = process.env.OPENAI_API_KEY;
+const modelName = process.env.OPENAI_MODEL;
+
+if (!apiKey || !modelName) {
+  throw new Error('Missing OPENAI_API_KEY or OPENAI_MODEL.');
+}
 
 class NotesAgent extends Agent<OpenAIResponsesProtocol> {
   @Tool({
@@ -53,13 +76,15 @@ class NotesAgent extends Agent<OpenAIResponsesProtocol> {
 }
 
 const model = new OpenAIResponsesModel({
-  apiKey: process.env.OPENAI_API_KEY,
-  model: 'gpt-4.1',
+  apiKey,
+  model: modelName,
+  // OpenAI-compatible 服务可在这里额外传入 baseURL。
 });
 
 const agent = new NotesAgent({
   llm: model,
-  systemPrompts: ['你是一个会按需调用工具的助手。'],
+  maxIterations: 8,
+  systemPrompts: ['按需调用工具；完成任务后单独调用 end-agent。'],
 });
 
 agent.init();
@@ -68,7 +93,7 @@ const context = await agent.agent('请保存一条笔记：今天完成 README�
 console.log(context);
 ```
 
-`init()` 是显式配置校验入口。调用 `agent()` 或 `toolCall()` 前必须先调用它；如果之后修改了 `agent.tools` 或 `agent.subAgents`，需要再次调用 `init()`。
+`OPENAI_API_KEY` 和 `OPENAI_MODEL` 只是这个示例使用的环境变量名称，不是框架约定。`init()` 是显式配置校验入口：调用 `agent()` 或 `toolCall()` 前必须先调用它；如果之后修改了 `agent.tools` 或 `agent.subAgents`，需要再次调用。示例显式设置 `maxIterations`，避免模型没有按要求调用 `end-agent` 时持续请求。
 
 ## Agent 与 Model
 
@@ -98,6 +123,8 @@ abstract class Model<P extends AgentProtocol> {
 完整抽象还包括 `parseUserMessages()`、`parseSystemMessages()`、`parseAssistantMessages()` 和 `parseToolCallOutputMessages()`。parser 接收混合 context，只返回匹配类型，并保留 `sourceMessage`；工具调用额外保留 `sourceCall`。
 
 ## 工具系统
+
+每个 Agent 实例都会自动注册三个框架工具：`agent` 用于调度子代理，`get-skill` 用于读取技能手册，`end-agent` 用于正常结束任务。即使当前没有子代理或 Skills，这些工具仍属于 Agent 的运行时工具集合；自定义工具不得与它们重名，`init()` 会统一校验工具名和子代理类名是否唯一。
 
 ### 装饰器工具
 
@@ -299,12 +326,12 @@ parent.init();
 
 ## Responses API
 
-`OpenAIResponsesModel` 使用 Responses API 的 `input` / `tools` / `output` 语义。模型返回的 output item 会作为协议 context 原样保存和回传；Agent 只识别 `function_call` 来执行本地工具。
+`OpenAIResponsesModel` 使用 Responses API 的 `input` / `tools` / `output` 语义。模型返回的 output item 会作为协议 context 原样保存和回传；Agent 只识别 `function_call` 来执行本地工具。下面沿用快速开始中已经校验的 `apiKey` 和 `modelName`。
 
 ```ts
 const model = new OpenAIResponsesModel({
-  apiKey: process.env.OPENAI_API_KEY,
-  model: 'gpt-4.1',
+  apiKey,
+  model: modelName,
   defaultParams: {
     temperature: 0.2,
   },
@@ -333,15 +360,23 @@ agent.appendContext(
 `OpenAIChatModel` 使用 Chat Completions 的 `messages` 和 function tools。Chat parser 会从 assistant message 的 `tool_calls[]` 中按原始顺序展开本地 function tool call。
 
 ```ts
-import { Agent, OpenAIChatModel, type OpenAIChatProtocol } from '@manee/agent-framework';
+import {
+  Agent,
+  OpenAIChatModel,
+  type OpenAIChatProtocol,
+} from '@ruixutong.manee/maneeagent-framework';
+
+// 由应用提供，例如 data:image/png;base64,...
+declare const imageDataUrl: string;
 
 const chatModel = new OpenAIChatModel({
-  apiKey: process.env.OPENAI_API_KEY,
-  model: 'gpt-4.1',
+  apiKey,
+  model: modelName,
 });
 
 const chatAgent = new Agent<OpenAIChatProtocol>({
   llm: chatModel,
+  maxIterations: 8,
 });
 
 chatAgent.appendContext(
@@ -388,20 +423,21 @@ class MyModel extends Model<MyProtocol> {
 
 ## 生命周期与错误处理
 
+- 调用 `agent()` 或 `toolCall()` 前必须先执行 `init()`；修改 `tools` 或 `subAgents` 后需要重新执行。
 - `agent(input)` 会先把输入构建为 user message，再进入循环。
-- Agent 默认不设置迭代次数上限；可通过 `maxIterations` 设置保护。
-- 内置 `end-agent` 是唯一正常结束条件。
+- Agent 默认不设置迭代次数上限；真实模型场景建议通过 `maxIterations` 设置保护，达到上限时会抛错并进入 `failed`。
+- 内置 `end-agent` 是唯一正常结束条件，而且必须在单独一轮工具调用中执行。
 - 成功响应但没有消息时会重试 3 次；网络/API 异常不重试。
 - 并发调用第二个 `agent()` 会抛出 `Agent is already running.`，但不会把正在运行的任务标记为失败。
 - `stream=true` 当前不支持，会抛出错误。
+- 父代理和子代理必须使用同一个 `AgentProtocol`；每次调度都会创建新的子代理实例和独立上下文。
 
-## 发布内容
+## 包入口与发布内容
 
-npm 包包含：
+包根目录只公开 `.` 入口：
 
-- `dist/index.js`
-- `dist/index.cjs`
-- `dist/index.d.ts`
-- `README.md`
+- ESM `import` 使用 `dist/index.js`。
+- CommonJS `require` 使用 `dist/index.cjs`。
+- TypeScript 使用 `dist/index.d.ts`，并按需引用 `dist` 下的配套声明文件。
 
-声明文件会保留中文 TSDoc，便于在 IDE 中查看 API 用法。
+发布包包含完整 `dist` 目录和本 README，因此也会包含构建生成的 source map 与嵌套声明文件。声明文件保留中文 TSDoc，便于在 IDE 中查看 API 用法。
