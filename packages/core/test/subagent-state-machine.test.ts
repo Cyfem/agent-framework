@@ -75,7 +75,7 @@ describe('Subagent v2 pure state machine', () => {
 
     const queued = task({
       state: 'queued',
-      attempt: 0,
+      attempt: 1,
     });
     const running = transitionSubAgentTask(queued, 'running', { now: 101 });
     const submitted = submitSubAgentResult(running, {
@@ -99,7 +99,8 @@ describe('Subagent v2 pure state machine', () => {
       output: { answer: 42 },
       result: { status: 'succeeded', output: { answer: 42 } },
     });
-    expect(queued).toMatchObject({ state: 'queued', revision: 3, attempt: 0 });
+    expect(queued).toMatchObject({ state: 'queued', revision: 3, attempt: 1 });
+    expect(running.attempt).toBe(1);
     expectCode(
       () => assertSubAgentTaskTransition(completed.task.state, 'cancelled'),
       'INVALID_STATE_TRANSITION',

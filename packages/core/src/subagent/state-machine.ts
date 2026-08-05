@@ -220,7 +220,9 @@ export function transitionSubAgentTask(
   draft.updatedAt = options.now;
 
   if (next === 'running') {
-    draft.attempt = task.attempt + 1;
+    // A queued task already represents create operation attempt 1. Resuming a
+    // paused task starts a new Executor operation and therefore increments it.
+    draft.attempt = task.state === 'queued' ? task.attempt : task.attempt + 1;
     draft.activeStartedAt = options.now;
     draft.recoveryRequired = false;
     draft.approvals = Object.freeze([...(options.approvals ?? [])]);
