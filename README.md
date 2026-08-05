@@ -14,7 +14,9 @@
 - **工具调用**：支持 `@Tool` 装饰器和运行时工具，调用前通过 Zod-compatible schema 校验参数。
 - **上下文与历史**：分别维护模型使用的 active context 和完整 raw history，并保留 provider 原始字段。
 - **事件系统**：可观察模型响应、工具调用前后、工具异常、Agent 状态和 Agent 错误。
-- **Skills 与子代理**：通过内置 `get-skill` 按需读取技能手册，通过内置 `agent` 工具调度同协议子代理。
+- **渐进式 Skills**：首轮只暴露 `name + description`，模型通过内置 `skill` 工具按需加载 instructions、读取文本资源或运行显式启用的脚本。
+- **子代理调度**：通过内置 `agent` 工具调度同协议子代理，并使用 `agent-result` 汇报结果。
+- **上下文压缩与恢复**：支持 active-only 工具 payload 裁剪、外部摘要事务和 context-length 错误恢复；raw history 始终保留原文。
 - **多模态上下文**：Responses 支持文件上传和图片、文件、视频、音频内容块；Chat 支持图片、音频和文件内容块。
 - **扩展 Model**：可继承 `Model<P>` 接入其他消息协议或 OpenAI-compatible 服务。
 
@@ -104,6 +106,12 @@ pnpm demo
 
 `pnpm demo` 是无需 API key 的离线综合回归，可用于确认本地环境和核心构建链正常。
 
+## Skills
+
+Skills 支持跨运行时的 inline 结构体，以及仅在 Node 文件能力可用时启用的 file source。模型首轮只看到 `name + description`，随后通过内置 `skill({ skill, args? })` 工具按需执行 `load`、`read <resource-id>` 或 `run <script-id> [args...]`；脚本默认关闭，必须通过 `skillRuntime.scripts` 显式配置 executor 或开启自动检测。
+
+Skill script 是宿主显式信任的本地代码。框架使用 `shell: false` 并关闭 stdin，但不提供沙箱、默认 timeout、输出上限、网络隔离或环境变量清理，子进程也会继承宿主环境。完整配置、portable text subset 和安全边界见 [核心包 Skills 文档](./packages/core/README.md#系统提示词与-skills)。
+
 ## Demo
 
 ### 离线回归
@@ -120,15 +128,18 @@ pnpm demo
 
 以下 CLI demo 会请求真实方舟 endpoint，可能产生模型调用费用；金融新闻示例还会访问公共 RSS。运行前请从 shell 注入 `ARK_API_KEY`，不要把 key 写入源码或提交历史。
 
-| 命令                     | 协议与用途                                                    |
-| ------------------------ | ------------------------------------------------------------- |
-| `pnpm demo:ark:smoke`    | Responses 最小真实工具调用冒烟。                              |
-| `pnpm demo:ark`          | Responses 完整能力场景；与 `pnpm demo:complex` 使用同一入口。 |
-| `pnpm demo:ark:coding`   | Coding Plan Chat Completions 工具闭环。                       |
-| `pnpm demo:ark:subagent` | 分别验证 Responses 与 Chat 子代理调度。                       |
-| `pnpm demo:finance-news` | 通过公共 RSS 生成带来源链接的中文市场简报。                   |
+| 命令                     | 协议与用途                                                             |
+| ------------------------ | ---------------------------------------------------------------------- |
+| `pnpm demo:ark:smoke`    | Responses 最小真实工具调用冒烟。                                       |
+| `pnpm demo:ark`          | Responses 完整能力场景；与 `pnpm demo:complex` 使用同一入口。          |
+| `pnpm demo:ark:coding`   | Coding Plan Chat Completions 工具闭环。                                |
+| `pnpm demo:ark:subagent` | 分别验证 Responses 与 Chat 子代理调度。                                |
+| `pnpm demo:features:ark` | Agent Plan Chat/Responses 综合验收：Skills、Tool、子代理与上下文压缩。 |
+| `pnpm demo:finance-news` | 通过公共 RSS 生成带来源链接的中文市场简报。                            |
 
-只有 `demo:ark:coding` 和 `demo:ark:subagent` 会自动读取已忽略的 `demo/.env`；其他真实 CLI demo 只读取当前进程环境。
+`demo:ark:coding`、`demo:ark:subagent` 和 `demo:features:ark` 会自动读取已忽略的 `demo/.env`；其他真实 CLI demo 只读取当前进程环境。综合验收默认使用方舟 Agent Plan `/api/plan/v3` 和 `kimi-k3`，依次运行 Chat 与 Responses；每种协议最多 12 次 provider generate、单次请求超时 120 秒，SDK 与框架错误重试均关闭，因此一次完整通过最多产生 24 次真实、可计费请求。一个协议失败后另一个仍会运行，任一失败都会使命令以非零状态退出。
+
+综合验收的日志只输出协议、阶段、工具名、长度和稳定错误元数据，不输出 API key、prompt、完整工具 payload 或响应体。Skill script 作为受信任宿主 Node.js 子进程运行，不受框架沙箱保护；context compact 只缩短 active context，raw history 仍保留原始内容。详细运行和安全说明见 [`demo/README.md`](./demo/README.md)。
 
 ### Windows 与微信
 
@@ -140,7 +151,7 @@ pnpm demo
 
 两个 CLI Windows demo 默认只允许查找窗口和截图观察。只有显式设置 `ARK_WINDOWS_DEMO_INTERACTIVE=1` 才会解锁点击、键盘输入和消息发送；请同时设置明确的联系人和消息，不要依赖源码中的演示默认值。
 
-Electron demo 同样要求在界面中显式勾选交互授权。它内置仓库中的微信技能手册，并向模型提供筛选后的 Win32 工具以及框架内置的 `agent`、`get-skill`、`end-agent` 工具。
+Electron demo 同样要求在界面中显式勾选交互授权。它内置仓库中的微信技能手册，并向模型提供筛选后的 Win32 工具以及框架内置的 `agent`、`skill`、`end-agent` 工具。
 
 Electron 截图会写入 `.artifacts/electron-weixin`，本地通过 `serve` 监听 2345 端口，再使用当前硬编码的 `https://weixin-agent.maneerui.com/<file>` 地址交给模型。仓库不会创建或配置 Cloudflare Tunnel；运行者必须预先把该公网域名路由到本地 2345 端口。截图可能经公网 URL 暴露给模型服务，运行前请确认网络配置并避免采集敏感内容。因此该 demo 是部署绑定型示例，不是克隆后即可一键运行的通用应用。
 
@@ -152,6 +163,7 @@ Electron 截图会写入 `.artifacts/electron-weixin`，本地通过 `serve` 监
 | `ARK_BASE_URL` / `ARK_MODEL`                  | Responses、Windows、金融新闻 demo | 覆盖示例默认 endpoint 和模型。            |
 | `ARK_CODING_BASE_URL` / `ARK_CODING_MODEL`    | `demo:ark:coding`                 | 覆盖 Coding Plan Chat endpoint 和模型。   |
 | `ARK_SUBAGENT_MODEL`                          | `demo:ark:subagent`               | 覆盖子代理 smoke 使用的模型。             |
+| `ARK_PLAN_BASE_URL` / `ARK_PLAN_MODEL`        | `demo:features:ark`               | 覆盖 Agent Plan endpoint 和模型。         |
 | `FINANCE_NEWS_QUERY`                          | `demo:finance-news`               | 自定义研究任务；命令行参数优先级更高。    |
 | `ARK_WINDOWS_DEMO_INTERACTIVE`                | Windows CLI demo                  | 设为 `1` 才允许点击、输入和发送。         |
 | `ARK_WEIXIN_RECIPIENT` / `ARK_WEIXIN_MESSAGE` | Windows CLI demo                  | 指定微信联系人和发送内容。                |
@@ -163,12 +175,13 @@ Electron 截图会写入 `.artifacts/electron-weixin`，本地通过 `serve` 监
 
 ```bash
 pnpm build
+pnpm test
 pnpm typecheck
 pnpm lint
 pnpm format:check
 ```
 
-仓库当前没有独立的 `test` script 或单元测试框架；`pnpm demo`、`pnpm demo:chat` 和 `pnpm demo:finance-news:smoke` 是现有的离线回归入口。
+`pnpm test` 通过 Vitest 运行核心包单元测试，不需要模型凭据或网络访问；`pnpm demo`、`pnpm demo:chat` 和 `pnpm demo:finance-news:smoke` 是额外的离线回归入口。
 
 ## 当前限制
 
@@ -178,6 +191,38 @@ pnpm format:check
 - 同一个 Agent 实例不能并发执行多个 `agent()` 调用。
 - 父子代理必须使用同一个协议规格。
 - `@Tool` 需要应用构建链支持 2023-11 decorators。
+
+## Context compact
+
+`contextCompact` 整体未配置时不压缩。只要传入对象，缺省的 `toolInput` 与 `toolResult` 都会启用框架内置字符裁剪：input 为 `8192 → 4096`，result 为 `16384 → 8192`（UTF-16 code unit）。
+
+```ts
+const agent = new Agent({
+  llm: model,
+  contextCompact: {},
+});
+```
+
+工具始终使用原始 arguments 执行，`getHistory()` 返回 append-only raw history，`getContext()` 返回下一次模型请求使用的 active context。压缩只 copy-on-write 改写 active payload；框架不会裁剪 raw history，也不解决内存、持久化或敏感数据留存。
+
+可以逐类覆盖长度、完全接管或关闭策略：
+
+```ts
+const agent = new Agent({
+  llm: model,
+  contextCompact: {
+    toolInput: { strategy: 'default', thresholdChars: 12_000, targetChars: 6_000 },
+    toolResult: async (original, info) =>
+      info.call.name === 'search' ? compactSearchResult(original) : undefined,
+  },
+});
+```
+
+自定义 callback 完全覆盖缺省策略；返回 `undefined` 或原文表示不替换，不会回退到内置策略。值为 `false` 时关闭该类。仅启用摘要时必须同时配置 `toolInput: false` 与 `toolResult: false`，因为 `{ summary }` 也会缺省启用两类工具压缩。
+
+摘要的业务语义由调用方通过 `trigger/select/prompt/validate` 定义；框架只负责选择默认 boundary、用当前 Model 发起无工具的 `context-summary` 请求、验证响应并通过 revision CAS 原子提交。context-length 错误可复用同一摘要策略恢复。普通未知模型错误默认额外重试 3 次，context handler 默认执行 2 次；可用 `modelErrorRecovery` 覆盖，并通过 `onBeforeModelErrorRecovery()` / `onAfterModelErrorRecovery()` 控制动作。
+
+内置 payload 压缩只保证格式规则和目标字符上限，不保证工具 schema、业务语义或脱敏。自定义 Model 在实际产生工具 replacement 时还需要实现 `rewriteToolPayloads()`，并可覆盖 `classifyError()` 识别 context-length 错误。完整配置、恢复决策和风险说明见 [packages/core/README.md](./packages/core/README.md)。离线示例位于 [Chat](./demo/src/context-compact-chat.ts) 与 [Responses](./demo/src/context-compact-responses.ts)。
 
 ## 更多文档
 

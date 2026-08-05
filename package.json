@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "pnpm -r run build",
+    "test": "pnpm --filter ./packages/core test",
     "typecheck": "pnpm -r run typecheck",
     "lint": "eslint .",
     "format": "prettier . --write",
@@ -20,6 +21,7 @@
     "demo:ark:smoke": "pnpm --filter ./packages/core build && pnpm --filter @manee/agent-framework-demo ark:smoke",
     "demo:ark:coding": "pnpm --filter ./packages/core build && pnpm --filter @manee/agent-framework-demo ark:coding",
     "demo:ark:subagent": "pnpm --filter ./packages/core build && pnpm --filter @manee/agent-framework-demo ark:subagent",
+    "demo:features:ark": "pnpm --filter ./packages/core build && pnpm --filter @manee/agent-framework-demo features:ark",
     "demo:windows": "pnpm --filter ./packages/core build && pnpm --filter @manee/agent-framework-demo windows",
     "demo:windows:chat": "pnpm --filter ./packages/core build && pnpm --filter @manee/agent-framework-demo windows:chat",
     "demo:electron:weixin": "pnpm --filter ./packages/core build && pnpm --filter @manee/agent-framework-demo electron:weixin",
@@ -40,6 +42,7 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.4",
     "vite": "^8.0.13",
-    "vite-node": "^6.0.0"
+    "vite-node": "^6.0.0",
+    "vitest": "^4.0.18"
   }
 }

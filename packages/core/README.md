@@ -28,7 +28,8 @@ npm install @ruixutong.manee/maneeagent-framework zod
 - `Tool`：基于 2023-11 decorators 的工具声明。
 - Zod 参数校验：工具参数在本地执行前会先通过 schema 校验。
 - 事件系统：可观察模型响应、工具调用、工具错误、Agent 状态和 Agent 错误。
-- Skills：以索引化手册形式指导模型调用内置 `get-skill`。
+- Context compact：active-only 工具 payload 压缩、外部摘要策略与 context-length 恢复，raw history 保留原文。
+- Skills：通过内置 `skill` 工具按名称渐进加载 instructions、文本资源和显式启用的脚本。
 - Sub-agents：通过内置 `agent` 工具调度同协议子代理。
 
 ## 公开入口
@@ -124,7 +125,7 @@ abstract class Model<P extends AgentProtocol> {
 
 ## 工具系统
 
-每个 Agent 实例都会自动注册三个框架工具：`agent` 用于调度子代理，`get-skill` 用于读取技能手册，`end-agent` 用于正常结束任务。即使当前没有子代理或 Skills，这些工具仍属于 Agent 的运行时工具集合；自定义工具不得与它们重名，`init()` 会统一校验工具名和子代理类名是否唯一。
+每个 Agent 实例都会自动注册三个框架工具：`agent` 用于调度子代理，`skill` 用于渐进加载技能，`end-agent` 用于正常结束任务。即使当前没有子代理或 Skills，这些工具仍属于 Agent 的运行时工具集合；自定义工具不得与它们重名，`init()` 会统一校验工具名和子代理类名是否唯一。
 
 ### 装饰器工具
 
@@ -268,6 +269,151 @@ agent.appendContext(
 );
 ```
 
+## Context compact
+
+Context compact 只改变下一次模型请求使用的 active context，不裁剪 append-only raw history：
+
+- `getContext()` 返回 active context，可能含压缩后的工具 payload 或框架生成的摘要 memory。
+- `getHistory()` 返回 raw history，始终保留模型原始 tool arguments、完整工具结果和正常对话消息。
+- 摘要 prompt、摘要响应和 synthetic summary message 都不写入 raw history。
+
+因此该能力用于控制 provider 请求上下文，并不解决进程内存、历史持久化或敏感信息留存；两种 getter 仍只返回数组浅拷贝，消息对象本身不会深拷贝。
+
+### 缺省工具 payload 压缩
+
+完全不传 `contextCompact` 时，工具压缩关闭，原有成功路径和 fire-and-forget listener 时序不变。只要传入 `contextCompact` 对象，未配置的 `toolInput` / `toolResult` 就启用内置策略：
+
+```ts
+const agent = new Agent<OpenAIResponsesProtocol>({
+  llm: model,
+  contextCompact: {},
+});
+```
+
+缺省字符限制如下，单位都是 JavaScript `string.length` 的 UTF-16 code unit，不是 token：
+
+| payload       | 仅当长度大于 | replacement 最长 |
+| ------------- | ------------ | ---------------- |
+| `tool_input`  | 8,192        | 4,096            |
+| `tool_result` | 16,384       | 8,192            |
+
+阈值相等时不压缩。可以通过运行时冻结的 `DEFAULT_TOOL_PAYLOAD_COMPACT_LIMITS` 读取缺省值，也可以逐类覆盖：
+
+```ts
+const agent = new Agent<OpenAIResponsesProtocol>({
+  llm: model,
+  contextCompact: {
+    toolInput: {
+      strategy: 'default',
+      thresholdChars: 12_000,
+      targetChars: 6_000,
+    },
+    toolResult: {
+      strategy: 'default',
+      thresholdChars: 24_000,
+      targetChars: 10_000,
+    },
+  },
+});
+```
+
+长度必须是安全整数，`targetChars >= 512` 且 `thresholdChars > targetChars`；非法配置在 `init()` 阶段失败。工具 handler、参数 JSON 解析和 schema 校验始终读取原始 arguments；只有本轮全部工具与 listener 完成后，框架才一次性 copy-on-write 改写 active entries。任一 callback、adapter、校验或 revision CAS 失败都会放弃整批 replacement，raw/active 保留本轮原值。
+
+内置策略只对不超过 1,048,576 个 UTF-16 code units 的字符串尝试解析 JSON，并对过深容器、超大数组/对象和长字符串做有界结构裁剪。仍需进一步缩小时：
+
+- tool input 使用合法 JSON envelope，`format` 为 `json`、`invalid-json` 或 `not-inspected`；
+- 已确认合法 JSON 的 tool result 使用同类 JSON envelope；非法 JSON 或因过大而未探测的 result 使用带 `[context compacted: ...]` marker 的纯文本头尾预览；
+- 所有结果严格不超过配置的 `targetChars`，头尾切分不会留下孤立 surrogate。
+
+envelope 的稳定外形如下：
+
+```json
+{
+  "__context_compact__": {
+    "version": 1,
+    "kind": "tool_input",
+    "format": "json",
+    "originalChars": 18000,
+    "omittedChars": 14000,
+    "head": "...",
+    "tail": "..."
+  }
+}
+```
+
+这只是通用、有界的字符压缩：合法 JSON 只保证语法，不保证仍满足原工具 schema；它不理解业务语义，也不提供敏感信息脱敏。需要这些保证时应使用自定义 callback。
+
+### 自定义或关闭工具压缩
+
+```ts
+const agent = new Agent<OpenAIResponsesProtocol>({
+  llm: model,
+  contextCompact: {
+    toolInput: false,
+    toolResult: async (original, info) => {
+      if (info.call.name !== 'search-documents' || original.length < 2_000) {
+        return undefined;
+      }
+
+      return JSON.stringify({
+        compacted: true,
+        callId: info.call.id,
+        preview: original.slice(0, 1_500),
+      });
+    },
+  },
+});
+```
+
+callback 完全覆盖该类缺省策略，并按模型调用顺序对每条记录先 input 后 result 串行 `await`。它只得到冻结的 `id/name/arguments` 值快照和从 0 开始的 `iteration`，不会得到 provider message 或 ContextStore 引用。返回 `undefined` 或原文表示“不替换”，不会回退到内置策略；抛错、rejection 或返回非字符串会使本轮 compact 失败。`false` 则彻底关闭该类。
+
+工具压缩启用时，`{ await: false }` 的 before/after listener 仍不会阻塞当前工具及后续工具，但框架会在 loop finalization、改写与关闭 span 前等待它 settle。永不 settle 的 listener 会永久挂起这一轮；应用必须自行设置超时或保证 promise 能结束。两类工具压缩都关闭时不会增加这次 finalization 等待。
+
+公开的 standalone `agent.toolCall()` 不属于 Agent loop，因此不会自动 compact。父 Agent 创建动态子代理时也不会传播自己的 `contextCompact`、`modelErrorRecovery` 或恢复 hooks；需要时由子代理显式配置。
+
+### 摘要策略
+
+框架不内置业务摘要提示词、tokenizer、模型窗口表或触发规则。调用方通过 `trigger/select/prompt/validate` 定义语义，框架负责快照、模型调用、校验与 revision CAS：
+
+```ts
+const agent = new Agent<OpenAIResponsesProtocol>({
+  llm: model,
+  contextCompact: {
+    // summary-only 必须显式关闭，否则对象字段缺省会启用两类工具压缩。
+    toolInput: false,
+    toolResult: false,
+    summary: {
+      trigger: ({ activeContext, previousSummary }) =>
+        activeContext.length > 80 || (previousSummary?.text.length ?? 0) > 8_000,
+
+      // select 可省略：主动摘要默认保留最近一个完整 span，压缩更早 boundary。
+      select: ({ boundaryOriginalContext, boundaryActiveContext }) => ({
+        contextToSummarize: boundaryOriginalContext.slice(0, -10),
+        preservedContext: boundaryActiveContext.slice(-10),
+      }),
+
+      prompt: ({ selection, previousSummary }) =>
+        [
+          '把所选历史压缩成事实、决策、未完成事项和工具结论。',
+          `本次消息数：${selection.contextToSummarize.length}`,
+          previousSummary ? '请合并已有摘要，避免丢失仍有效的事实。' : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+
+      validate: ({ summary }) =>
+        summary.trim().length >= 40
+          ? { ok: true }
+          : { ok: false, reason: '摘要过短，不能原子提交。' },
+    },
+  },
+});
+```
+
+每个 Agent iteration 只运行一次 proactive `trigger`；同一 iteration 内的模型异常重试和空响应重试不会重复触发。省略 `select` 时，主动模式压缩更早的 boundary original projection 并保留最近完整 span；context-length emergency 模式压缩整个 boundary 并默认不保留消息。滚动摘要时，`previousSummary` 会进入策略快照和下一次摘要请求。
+
+摘要固定复用当前 Model，设置 `purpose: "context-summary"`、`tools: []`，并只发送框架 guard、已有摘要、所选原文和外部 `prompt`。它不会触发 `onModelResponse`。含工具调用、没有 assistant 文本、validator 拒绝或 revision 冲突时不提交半成品；成功后 active context 变为 synthetic user-role memory 加 preserved context，raw history 不变。摘要调用自身的 context-length 错误不会递归触发摘要 handler。
+
 ## 系统提示词与 Skills
 
 用户 system prompt 可通过构造函数或 `addSystemPrompts()` 添加：
@@ -276,21 +422,89 @@ agent.appendContext(
 agent.addSystemPrompts('回复要简洁，必要时调用工具。');
 ```
 
-Skills 是给模型读取的结构化手册。框架会在内部 system prompt 中列出技能索引；模型匹配到任务时，应调用内置 `get-skill` 获取完整手册。
+Skills 是给模型按需读取的结构化能力手册。框架首轮只在内部 system prompt 和动态工具描述中暴露冻结的 `name + description`；instructions、资源内容、脚本源码、本地路径和 executable 只有模型明确调用内置 `skill` 工具后才会进入相应流程。
+
+Inline 结构体是跨运行时的规范配置：
 
 ```ts
-agent.addSkill({
-  name: '账单处理手册',
-  description: '当用户询问账单、退款或抵扣时使用。',
-  systemContent: '处理账单问题时必须先查事实，再给结论。',
-  sops: [
+const agent = new Agent({
+  llm: model,
+  skills: [
     {
-      description: '处理重复计费',
-      content: '1. 查询账单。\n2. 核对重复项。\n3. 生成用户可读回复。',
+      name: 'billing-review',
+      description: 'Review invoices, refunds, credits, and duplicate charges.',
+      instructions: [
+        'Read references/policy.md before deciding.',
+        'When validation is needed, run scripts/check.js with the invoice id.',
+      ].join('\n'),
+      references: {
+        'policy.md': '# Billing policy\nVerify facts before proposing a credit.',
+      },
+      assets: {
+        'reply-template.md': '# Reply\nFacts, decision, and next action.',
+      },
+      scripts: {
+        check: {
+          extension: '.js',
+          content: 'console.log(JSON.stringify({ invoice: process.argv[2] }))',
+          description: 'Validate one invoice id.',
+        },
+      },
     },
   ],
+  skillRuntime: {
+    // Skill result 默认不进入 tool-result payload compact。
+    compactResult: false,
+    scripts: {
+      autoDetect: true,
+    },
+  },
 });
 ```
+
+内置工具输入固定为 `{ skill: string, args?: string }`，命令如下：
+
+| 命令                             | 行为                                                       |
+| -------------------------------- | ---------------------------------------------------------- |
+| 省略 `args`、空值或 `load [...]` | 返回 instructions 和当前 resource/script manifest          |
+| `read <resource-id>`             | 读取已登记的 `references/...` 或 `assets/...` 文本         |
+| `run <script-id> [argv...]`      | 用已解析 executor 运行已登记脚本；模型参数只作为 argv 传入 |
+
+`load` 支持字面量 `$ARGUMENTS` 替换。DSL 只把 TAB、LF、CR 和普通空格作为分隔符；它没有 Shell 语义，不解释变量、glob、管道、重定向、命令替换或控制运算符。
+
+### File Skill adapter
+
+Node 文件能力可用时，也可以显式配置目录或其中的 `SKILL.md`：
+
+```ts
+const agent = new Agent({
+  llm: model,
+  skills: [{ source: 'file', path: '/absolute/path/to/billing-review' }],
+  skillRuntime: {
+    resourceExtensions: ['.md', '.txt', '.json'],
+    scripts: false,
+  },
+});
+
+agent.init();
+console.log(agent.getSkillSourceDiagnostics());
+```
+
+该 adapter 明确实现 **Agent Skills portable text subset**，不承诺完整 Agent Skills 物理目录兼容：
+
+- `SKILL.md` 接受 name、description、license、compatibility、metadata 和 Markdown body；`allowed-tools` 不产生授权行为。
+- `references/`、`assets/` 只发现声明扩展名的 UTF-8 文本。缺省扩展名为 `.md/.txt/.json/.yaml/.yml/.csv/.xml`，自定义数组整体替换；非法 UTF-8 在 lazy read 时返回工具调用错误。
+- 候选路径拒绝空 segment、`.`/`..`、反斜杠、ASCII control/DEL、`<>:"|?*`、NUL、末尾空格/点、Windows 保留 basename，以及 NFC/大小写 alias 和 file/directory prefix collision。因此 POSIX 合法的 `query?.md`、`a:b.md` 也不属于本 subset。
+- unsupported resource 和无后缀 script 在候选校验前忽略；三类 well-known 根必须缺失或为真实普通目录，树内 symlink 和特殊文件忽略且不跟随。
+- 非 Node、缺少 `process.getBuiltinModule()`、文件 capability 不可用或初始化读取被权限拒绝时，file source 会被忽略；框架不读取或回显 capability 缺失 source 的 path。`getSkillSourceDiagnostics()` 只返回 0-based `sourceIndex + reason`，不写 console。
+
+Inline load/read 不依赖 Node 文件或进程能力。file run 需要 file + process capability；inline run 还需要临时文件 capability。脚本默认关闭，`scripts: {}` 也不会自动启用 executor；`autoDetect` 默认 `false`，也可以用 `executors` 手工覆盖或用 `false` 删除某一后缀。
+
+脚本固定通过 `shell: false` 启动，stdin 关闭，但它仍是宿主显式信任的本地代码：框架不提供沙箱、默认 timeout、输出上限、网络隔离或环境变量清理。子进程继承宿主环境；Deno 自动检测只配置裸 `deno run`，所需 read/env/network 权限必须由手工 executor 明确添加。Windows 自动检测不会把 `.cmd/.bat` shim 当作可由 `shell: false` 直接执行的程序。
+
+Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL.md`、references、assets 和 scripts），以 Skill root 为 cwd，并在结束后 best-effort 清理。file script 直接执行重新校验后的登记文件，不复制或修改原目录。
+
+`addSkill()` 只修改 configured sources。非运行状态下会立即使 Agent 回到未初始化；运行中添加只标记 dirty，当前 run 继续使用旧 snapshot。两种情况都必须在下一次运行前重新 `init()`，新 Skill 才会生效。父 Agent 的 Skill 和 runtime 配置不会自动传播给动态子代理。
 
 ## 子代理
 
@@ -407,6 +621,8 @@ chatAgent.init();
 - 实现 builder，把 Agent 基础结构转成协议结构。
 - 实现 parser，从混合 context 中筛选目标消息，其他类型直接跳过。
 - 实现 `generate()`，返回需要写入 context/history 的协议消息。
+- 若要启用工具 payload compact，实现 `rewriteToolPayloads()` 的精确 copy-on-write 定位与批量改写。
+- 若要识别 provider 的 context-length 错误，覆盖 `classifyError()`；需要不同摘要输出结构时覆盖 `extractAssistantText()`。
 
 ```ts
 class MyModel extends Model<MyProtocol> {
@@ -417,22 +633,109 @@ class MyModel extends Model<MyProtocol> {
     return { messages: [] };
   }
 
+  override rewriteToolPayloads(context, replacements) {
+    // inputs 由 sourceMessage + sourceCall identity 唯一定位，results 由
+    // sourceMessage + callId 唯一定位；每个 replacement 必须恰好命中一次。
+    // 保持数组长度、顺序和全部未知 provider metadata，只 clone 被改写的项。
+    return rewriteMyProtocolPayloads(context, replacements);
+  }
+
+  override classifyError(error, { purpose, request }) {
+    const providerError = readMyProviderError(error);
+
+    return {
+      kind:
+        providerError.code === 'context_window_exceeded' ? 'context_length_exceeded' : 'unknown',
+      message: providerError.message,
+      provider: 'my-provider',
+      providerCode: providerError.code,
+      status: providerError.status,
+      requestId: providerError.requestId,
+    };
+  }
+
   // 继续实现 buildUserMessage、buildSystemMessage、buildToolMessage、parser 等方法。
 }
 ```
+
+这些新增方法都有非 abstract 缺省实现，旧自定义 Model 源码仍可编译。默认 `rewriteToolPayloads()` 对空 replacements 返回新的数组浅拷贝，实际需要非空改写时抛出明确 capability error；默认 `classifyError()` 归类为 `unknown`。内置 Chat/Responses adapter 已实现 identity 精确匹配、provider metadata 保真和 OpenAI-compatible 错误分类。
 
 ## 生命周期与错误处理
 
 - 调用 `agent()` 或 `toolCall()` 前必须先执行 `init()`；修改 `tools` 或 `subAgents` 后需要重新执行。
 - `agent(input)` 会先把输入构建为 user message，再进入循环。
 - Agent 默认不设置迭代次数上限；真实模型场景建议通过 `maxIterations` 设置保护，达到上限时会抛错并进入 `failed`。
-- 内置 `end-agent` 是唯一正常结束条件，而且必须在单独一轮工具调用中执行。
-- 成功响应但没有消息时会重试 3 次；网络/API 异常不重试。
+- 内置 `end-agent` 是唯一正常结束条件，模型应在单独一轮中调用；loop 会等它的结果、listener 和 compact 全部成功后再提交 `ended`。
+- 成功响应但没有消息时会额外重试 3 次，即总计最多 4 次响应尝试。
+- 未识别或没有匹配 handler 的模型异常默认额外重试 3 次；设置 `modelErrorRecovery: { unhandledRetryLimit: 0 }` 可恢复旧的立即抛错行为。
+- 配置 summary 后，`context_length_exceeded` 默认由 `core.context_compaction` handler 最多实际执行 2 次；没有 summary 时按普通未知异常处理。
 - 并发调用第二个 `agent()` 会抛出 `Agent is already running.`，但不会把正在运行的任务标记为失败。
 - `stream=true` 当前不支持，会抛出错误。
 - 父代理和子代理必须使用同一个 `AgentProtocol`；每次调度都会创建新的子代理实例和独立上下文。
 
-## 包入口与发布内容
+### 模型错误恢复
+
+恢复额度可在构造时覆盖：
+
+```ts
+const agent = new Agent<OpenAIResponsesProtocol>({
+  llm: model,
+  modelErrorRecovery: {
+    unhandledRetryLimit: 1,
+    contextLengthRecoveryLimit: 3,
+  },
+  contextCompact: {
+    toolInput: false,
+    toolResult: false,
+    summary,
+  },
+});
+```
+
+`onBeforeModelErrorRecovery()` 与 `onAfterModelErrorRecovery()` 是按注册顺序串行 `await` 的控制 hooks；`undefined` 等价于 `default`，多个 listener 取最后一个非 `default` 决策。事件包含原始 `cause`、错误 `descriptor`、请求 `purpose`、失败 `request`、1-based `requestAttempt`、retry `ledger`、已解析 `limits`、匹配的 handler 和 context revision。
+
+```ts
+agent.onBeforeModelErrorRecovery((event) => {
+  auditRecovery('before', event);
+
+  if (event.descriptor.providerCode === 'account_disabled') {
+    return 'stop';
+  }
+
+  return 'default';
+});
+
+agent.onAfterModelErrorRecovery((event) => {
+  auditRecovery('after', event);
+
+  if (event.handlerOutcome === 'failed' && canUseFallbackRegion()) {
+    switchToFallbackRegion();
+    return 'retry';
+  }
+
+  return 'default';
+});
+```
+
+决策语义如下：
+
+| 阶段   | 决策       | 行为                                                  |
+| ------ | ---------- | ----------------------------------------------------- |
+| before | `default`  | 按额度和匹配 handler 执行默认路径                     |
+| before | `retry`    | 跳过 handler，进入 after，然后强制重试                |
+| before | `continue` | 即使超过默认 handler 额度也执行 handler，再进入 after |
+| before | `stop`     | 立即停止，不执行 handler 或 after                     |
+| after  | `default`  | 接受 `proposedAction`                                 |
+| after  | `retry`    | 无视默认额度，强制重试                                |
+| after  | `stop`     | 立即停止                                              |
+
+before/after hook 或 classifier 抛错会立即终止并包装；handler 失败仍进入 after，允许 after 选择重试。发生过恢复活动后仍无法继续时会抛出 `ModelErrorRecoveryError`，其中保留 initial/terminal cause、最终 descriptor/reason、ledger、stage failures，以及最近 64 条 decision trace 和丢弃数量。若第一次失败没有发生重试、handler 或 hook 控制，则继续原样抛出 provider error。
+
+`retry` / `continue` 属于 forced retry，没有框架硬上限。hook 如果持续返回它们，可能造成无限模型请求和费用；生产环境应结合 event ledger、外部取消信号、超时或自有预算明确终止。
+
+离线参考实现见仓库中的 [Chat 工具 payload compact](../../demo/src/context-compact-chat.ts) 和 [Responses 摘要 compact](../../demo/src/context-compact-responses.ts)。
+
+## 发布内容
 
 包根目录只公开 `.` 入口：
 

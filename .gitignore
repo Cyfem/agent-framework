@@ -4,6 +4,7 @@ coverage/
 .vite/
 .artifacts/
 demo/electron-weixin/.electron/
+plans/
 demo/.env
 *.log
 .DS_Store

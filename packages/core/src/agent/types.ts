@@ -1,4 +1,12 @@
 import type { Model } from '../llm/base';
+import type {
+  ModelGeneratePurpose,
+  ModelGenerateRequest,
+  ModelGenerateResult,
+} from '../llm/base/types';
+
+/** 同步或异步扩展点的统一返回类型。 */
+export type MaybePromise<T> = T | Promise<T>;
 
 /** Agent 的生命周期状态。 */
 export type AgentStatus = 'idle' | 'running' | 'ended' | 'failed';
@@ -64,6 +72,268 @@ export type AssistantMessageOf<P extends AgentProtocol> = P['assistantMessage'];
 export type ToolCallOutputMessageOf<P extends AgentProtocol> = P['toolCallOutputMessage'];
 /** 从协议规格中取出单个原始工具调用类型。 */
 export type RawToolCallOf<P extends AgentProtocol> = P['rawToolCall'];
+
+/** 工具 payload 的压缩位置。 */
+export type ToolPayloadKind = 'tool_input' | 'tool_result';
+
+/** 传给工具 payload 压缩器的脱敏值快照。 */
+export interface ToolPayloadCompactCallSnapshot {
+  readonly id: string;
+  readonly name: string;
+  readonly arguments: string;
+}
+
+/** 工具 payload 压缩器的调用信息。 */
+export interface ToolPayloadCompactInfo {
+  readonly kind: ToolPayloadKind;
+  /** 从 0 开始的 Agent loop 序号；模型请求重试不增加该值。 */
+  readonly iteration: number;
+  readonly call: ToolPayloadCompactCallSnapshot;
+}
+
+/** 完全接管某一类工具 payload 的自定义压缩器。 */
+export type ToolPayloadCompactor = (
+  original: string,
+  info: ToolPayloadCompactInfo,
+) => MaybePromise<string | undefined>;
+
+/** 框架缺省字符裁剪策略的可覆盖长度。 */
+export interface DefaultToolPayloadCompactOptions {
+  readonly strategy: 'default';
+  readonly thresholdChars?: number;
+  readonly targetChars?: number;
+}
+
+/** 单类工具 payload 可使用缺省策略、自定义策略，或显式关闭。 */
+export type ToolPayloadCompactConfig =
+  | false
+  | DefaultToolPayloadCompactOptions
+  | ToolPayloadCompactor;
+
+/** 精确定位一个工具输入并替换其 arguments 的协议无关描述。 */
+export interface ToolInputReplacement<P extends AgentProtocol> {
+  readonly sourceMessage: ContextOf<P>;
+  readonly sourceCall: RawToolCallOf<P>;
+  readonly replacement: string;
+}
+
+/** 精确定位一个工具结果并替换其 output/content 的协议无关描述。 */
+export interface ToolResultReplacement<P extends AgentProtocol> {
+  readonly sourceMessage: ContextOf<P>;
+  readonly callId: string;
+  readonly replacement: string;
+}
+
+/** 一轮工具调用一次性交给 Model adapter 的批量替换。 */
+export interface ToolPayloadReplacements<P extends AgentProtocol> {
+  readonly inputs: readonly ToolInputReplacement<P>[];
+  readonly results: readonly ToolResultReplacement<P>[];
+}
+
+/** Model 错误的框架级分类；允许 Model 扩展自定义种类。 */
+export type ModelErrorKind = 'context_length_exceeded' | 'unknown' | (string & {});
+
+/** Model adapter 对 provider 异常提取出的稳定描述。 */
+export interface ModelErrorDescriptor {
+  readonly kind: ModelErrorKind;
+  readonly message: string;
+  readonly provider?: string;
+  readonly providerCode?: string;
+  readonly status?: number;
+  readonly requestId?: string;
+  readonly retryableHint?: boolean;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+/** Model 错误分类时可读取的逻辑请求信息。 */
+export interface ModelErrorClassificationContext<P extends AgentProtocol> {
+  readonly purpose: ModelGeneratePurpose;
+  readonly request: Readonly<ModelGenerateRequest<P>>;
+}
+
+/** 本次摘要由主动 trigger 或 context-length 恢复触发。 */
+export type ContextCompactCause =
+  | { readonly type: 'trigger' }
+  | {
+      readonly type: 'context_length_exceeded';
+      readonly error: ModelErrorDescriptor;
+      readonly cause: unknown;
+    };
+
+/** 上一次成功摘要的正文及 synthetic memory 消息。 */
+export interface SummaryValue<P extends AgentProtocol> {
+  readonly text: string;
+  readonly message: ContextOf<P>;
+}
+
+/** 摘要策略每个阶段都能读取的不可变上下文视图。 */
+export interface SummaryCompactSnapshot<P extends AgentProtocol> {
+  readonly cause: ContextCompactCause;
+  readonly iteration: number;
+  readonly activeContext: readonly ContextOf<P>[];
+  readonly boundaryOriginalContext: readonly ContextOf<P>[];
+  readonly boundaryActiveContext: readonly ContextOf<P>[];
+  readonly rawHistory: readonly ContextOf<P>[];
+  readonly pendingRequest: Readonly<ModelGenerateRequest<P>>;
+  readonly previousSummary?: SummaryValue<P>;
+}
+
+/** 交给摘要模型的内容与摘要成功后需要保留的 active 内容。 */
+export interface SummaryContextSelection<P extends AgentProtocol> {
+  readonly contextToSummarize: readonly ContextOf<P>[];
+  readonly preservedContext: readonly ContextOf<P>[];
+}
+
+/** 生成外部摘要 prompt 时的完整快照。 */
+export interface SummaryPromptSnapshot<P extends AgentProtocol> extends SummaryCompactSnapshot<P> {
+  readonly selection: SummaryContextSelection<P>;
+}
+
+/** 外部摘要校验器看到的完整候选事务。 */
+export interface SummaryValidationSnapshot<
+  P extends AgentProtocol,
+> extends SummaryPromptSnapshot<P> {
+  readonly prompt: string;
+  readonly summary: string;
+  readonly response: ModelGenerateResult<P>;
+  readonly summaryMessage: ContextOf<P>;
+  readonly candidateActiveContext: readonly ContextOf<P>[];
+}
+
+/** 摘要校验结果；失败原因会进入摘要事务错误。 */
+export type SummaryValidationResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string };
+
+/** 摘要语义完全由外部定义，框架只负责调用、校验和原子提交。 */
+export interface SummaryCompactPolicy<P extends AgentProtocol> {
+  trigger(input: SummaryCompactSnapshot<P>): MaybePromise<boolean>;
+  select?(input: SummaryCompactSnapshot<P>): MaybePromise<SummaryContextSelection<P> | undefined>;
+  prompt(input: SummaryPromptSnapshot<P>): MaybePromise<string>;
+  validate?(input: SummaryValidationSnapshot<P>): MaybePromise<SummaryValidationResult>;
+}
+
+/** Agent context compact 总配置。对象存在时缺省启用两类工具压缩。 */
+export interface ContextCompactOptions<P extends AgentProtocol> {
+  readonly toolInput?: ToolPayloadCompactConfig;
+  readonly toolResult?: ToolPayloadCompactConfig;
+  readonly summary?: SummaryCompactPolicy<P>;
+}
+
+/** 一个逻辑模型请求的累计重试账本。 */
+export interface ModelRetryLedger {
+  readonly requestAttempts: number;
+  readonly totalRetries: number;
+  readonly forcedRetries: number;
+  readonly unhandledRetries: number;
+  readonly contextRecoveryAttempts: number;
+}
+
+/** 已解析并校验的模型错误恢复上限。 */
+export interface ResolvedModelErrorRecoveryLimits {
+  readonly unhandledRetryLimit: number;
+  readonly contextLengthRecoveryLimit: number;
+}
+
+/** 内置恢复 handler 的公开只读身份。 */
+export interface ModelErrorRecoveryHandlerMatch {
+  readonly id: string;
+  readonly kind: ModelErrorKind;
+}
+
+/** 恢复 handler 的实际运行结果。 */
+export type ModelErrorRecoveryHandlerOutcome =
+  | 'not-run'
+  | 'succeeded'
+  | 'failed'
+  | 'unavailable'
+  | 'limit-exceeded';
+
+/** 恢复协调器下一步会重试或停止。 */
+export type ModelErrorRecoveryAction = 'retry' | 'stop';
+
+/** before hook 可执行的控制决策。 */
+export type BeforeModelErrorRecoveryDecision = 'default' | 'retry' | 'continue' | 'stop';
+
+/** after hook 可执行的控制决策。 */
+export type AfterModelErrorRecoveryDecision = 'default' | 'retry' | 'stop';
+
+/** before/after 恢复事件的稳定公共字段。 */
+export interface ModelErrorRecoveryEventBase<P extends AgentProtocol> {
+  readonly cause: unknown;
+  readonly descriptor: ModelErrorDescriptor;
+  readonly purpose: ModelGeneratePurpose;
+  readonly request: Readonly<ModelGenerateRequest<P>>;
+  /** 当前失败请求的 1-based 尝试序号。 */
+  readonly requestAttempt: number;
+  readonly ledger: Readonly<ModelRetryLedger>;
+  readonly limits: Readonly<ResolvedModelErrorRecoveryLimits>;
+  readonly matchedHandler?: Readonly<ModelErrorRecoveryHandlerMatch>;
+  readonly contextRevision: number;
+}
+
+/** handler 执行前发出的控制事件。 */
+export interface BeforeModelErrorRecoveryEvent<
+  P extends AgentProtocol,
+> extends ModelErrorRecoveryEventBase<P> {
+  readonly defaultAction: ModelErrorRecoveryAction;
+}
+
+/** handler 执行或跳过后发出的控制事件。 */
+export interface AfterModelErrorRecoveryEvent<
+  P extends AgentProtocol,
+> extends ModelErrorRecoveryEventBase<P> {
+  readonly beforeDecision: BeforeModelErrorRecoveryDecision;
+  readonly handlerOutcome: ModelErrorRecoveryHandlerOutcome;
+  readonly proposedAction: ModelErrorRecoveryAction;
+  readonly handlerFailure?: unknown;
+}
+
+/** before recovery 控制 hook。`undefined` 等价于 `default`。 */
+export type BeforeModelErrorRecoveryCallback<P extends AgentProtocol> = (
+  event: Readonly<BeforeModelErrorRecoveryEvent<P>>,
+) => MaybePromise<BeforeModelErrorRecoveryDecision | undefined>;
+
+/** after recovery 控制 hook。`undefined` 等价于 `default`。 */
+export type AfterModelErrorRecoveryCallback<P extends AgentProtocol> = (
+  event: Readonly<AfterModelErrorRecoveryEvent<P>>,
+) => MaybePromise<AfterModelErrorRecoveryDecision | undefined>;
+
+/** 模型异常默认恢复额度。 */
+export interface ModelErrorRecoveryOptions {
+  /** 首次失败之后允许的普通额外请求数；默认 3。 */
+  readonly unhandledRetryLimit?: number;
+  /** context-length handler 默认最多真正开始的次数；默认 2。 */
+  readonly contextLengthRecoveryLimit?: number;
+}
+
+/** 有界恢复决策轨迹中的单条记录。 */
+export interface ModelErrorRecoveryDecisionTrace {
+  readonly stage: 'before' | 'handler' | 'after' | 'retry' | 'terminal';
+  readonly requestAttempt: number;
+  readonly decision?: string;
+  readonly handlerOutcome?: ModelErrorRecoveryHandlerOutcome;
+  readonly action?: ModelErrorRecoveryAction;
+}
+
+/** classifier、hook 或 handler 自身失败的稳定记录。 */
+export interface ModelErrorRecoveryStageFailure {
+  readonly stage: 'classify' | 'before-hook' | 'handler' | 'after-hook';
+  readonly cause: unknown;
+  readonly requestAttempt: number;
+  readonly handlerId?: string;
+}
+
+/** 最终停止恢复的原因。 */
+export type ModelErrorRecoveryTerminalReason =
+  | 'stopped'
+  | 'unhandled-retry-limit'
+  | 'context-recovery-limit'
+  | 'handler-unavailable'
+  | 'handler-failed'
+  | 'classifier-failed'
+  | 'before-hook-failed'
+  | 'after-hook-failed';
 
 /** Agent 生成文本输入时使用的协议无关内容块。 */
 export interface AgentTextPart {
@@ -138,23 +408,93 @@ export interface AgentToolCall<P extends AgentProtocol> {
   sourceCall: RawToolCallOf<P>;
 }
 
-/** 技能手册中的一条具体操作流程。 */
-export interface AgentSkillSop {
-  description: string;
-  content: string;
+/** 内置 `skill` 工具的参数。 */
+export interface SkillToolInput {
+  /** 需要激活的 Skill 名称。 */
+  readonly skill: string;
+  /** 可选的 load/read/run 命令字符串；省略时等价于 load。 */
+  readonly args?: string;
 }
 
-/**
- * 技能手册元数据。
- *
- * 框架通过内部 system prompt 暴露技能索引；模型应先调用内置 `get-skill`
- * 获取完整手册，再按照匹配到的流程执行。
- */
-export interface AgentSkill {
-  name: string;
-  description: string;
-  systemContent?: string;
-  sops?: AgentSkillSop[];
+/** Progressive disclosure 第一层允许暴露给模型的 Skill 信息。 */
+export interface AgentSkillDescriptor {
+  readonly name: string;
+  readonly description: string;
+}
+
+/** 直接以内存源码定义的一条 Skill script。 */
+export interface AgentSkillScript {
+  /** 带前导点的单后缀，例如 `.py` 或 `.js`。 */
+  readonly extension: string;
+  readonly content: string;
+  readonly description?: string;
+}
+
+/** 跨运行时的结构化 Skill 定义。 */
+export interface AgentSkill extends AgentSkillDescriptor {
+  readonly license?: string;
+  readonly compatibility?: string;
+  readonly metadata?: Readonly<Record<string, string>>;
+  readonly instructions: string;
+  readonly references?: Readonly<Record<string, string>>;
+  readonly assets?: Readonly<Record<string, string>>;
+  readonly scripts?: Readonly<Record<string, AgentSkillScript>>;
+}
+
+/** Node 文件能力可用时，从 Agent Skills portable text subset 目录或 SKILL.md 加载。 */
+export interface AgentSkillFileSource {
+  readonly source: 'file';
+  readonly path: string;
+}
+
+/** Agent 可配置的 Skill 来源。 */
+export type AgentSkillSource = AgentSkill | AgentSkillFileSource;
+
+/** 一个脚本后缀对应的可直接启动 executable 及其固定前置参数。 */
+export interface SkillScriptExecutor {
+  readonly command: string;
+  readonly commandArgs?: readonly string[];
+}
+
+/** 手工 executor 覆盖；`false` 删除同后缀的自动检测结果。 */
+export type SkillScriptExecutorMap = Readonly<Record<string, SkillScriptExecutor | false>>;
+
+/** Skill 脚本执行配置；所有能力默认关闭。 */
+export interface SkillScriptRuntimeOptions {
+  readonly autoDetect?: boolean;
+  readonly executors?: SkillScriptExecutorMap;
+}
+
+/** Skill 子系统运行配置。 */
+export interface SkillRuntimeOptions {
+  /** `true` 时 Skill 结果才参与全局 tool-result compact；默认 false。 */
+  readonly compactResult?: boolean;
+  /** 省略或 false 时禁止执行任何 Skill script。 */
+  readonly scripts?: false | SkillScriptRuntimeOptions;
+  /** 替换 file source 的缺省文本资源后缀。 */
+  readonly resourceExtensions?: readonly string[];
+}
+
+/** 一次已启动 Skill script 的完整退出结果。 */
+export interface SkillScriptExecutionResult {
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/** file source 在最近一次成功初始化中被忽略的稳定原因。 */
+export type AgentSkillSourceDiagnosticReason =
+  | 'node_unavailable'
+  | 'file_capability_unavailable'
+  | 'read_permission_denied'
+  | 'source_access_denied';
+
+/** 不包含本地路径的 file source 初始化诊断。 */
+export interface AgentSkillSourceDiagnostic {
+  /** configured sources 中的 0-based 下标。 */
+  readonly sourceIndex: number;
+  readonly reason: AgentSkillSourceDiagnosticReason;
 }
 
 /**
@@ -163,7 +503,7 @@ export interface AgentSkill {
  * 装饰器定义属于类级 metadata，本期不将其绑定到具体 Model 协议。
  */
 export interface ToolDescriptionContext {
-  skills: readonly AgentSkill[];
+  skills: readonly AgentSkillDescriptor[];
   subAgents: readonly AgentConstructor<AgentProtocol>[];
   context: readonly unknown[];
   history: readonly unknown[];
@@ -213,8 +553,10 @@ export interface AgentConstructor<P extends AgentProtocol> {
 export interface AgentOptions<P extends AgentProtocol> {
   /** 提供消息构建、反解析和生成能力的协议 Model。 */
   llm: Model<P>;
-  /** 通过内部 system prompt 向模型展示索引的技能手册。 */
-  skills?: readonly AgentSkill[];
+  /** 通过 progressive disclosure 暴露给模型的 Skill 来源。 */
+  skills?: readonly AgentSkillSource[];
+  /** Skill 的文本资源、脚本和 compact 行为配置。 */
+  skillRuntime?: SkillRuntimeOptions;
   /** 可由内置 `agent` 工具调度的同协议子代理类。 */
   subAgents?: readonly AgentConstructor<P>[];
   /** 用户 system prompt；框架内部提示词会排列在这些提示词之前。 */
@@ -225,11 +567,19 @@ export interface AgentOptions<P extends AgentProtocol> {
   initRawContext?: readonly ContextOf<P>[];
   /** 可选的 Agent 循环硬上限；省略表示不显式限制迭代轮数。 */
   maxIterations?: number;
+  /** active-only 工具 payload 与摘要压缩策略。 */
+  contextCompact?: ContextCompactOptions<P>;
+  /** 模型异常的普通重试与 context-length 恢复额度。 */
+  modelErrorRecovery?: ModelErrorRecoveryOptions;
 }
 
 /** before/after 工具调用监听器的行为控制选项。 */
 export interface ToolEventOptions {
-  /** 是否等待该监听器完成后再继续工具执行流程。 */
+  /**
+   * 是否等待该监听器完成后再继续工具执行流程。
+   * 启用工具 compact 时，`false` 仍会在 loop finalization 前等待；永不 settle
+   * 的 listener 会永久阻塞该轮完成。
+   */
   await?: boolean;
   /**
    * 仅对 before 监听器生效：监听器报错时取消真实工具调用。

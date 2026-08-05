@@ -278,10 +278,10 @@ class DebugDumpModel extends OpenAIResponsesModel {
 
 /** 移植到 demo 工具命名体系下的微信搜索、验证与发送操作手册。 */
 export const weixinWindowsSkill: AgentSkill = {
-  name: 'Windows 微信联系人搜索与消息发送',
+  name: 'weixin-windows-send-message',
   description:
     '在 Windows 微信桌面端中搜索联系人、打开聊天、输入消息、发送，并通过截图确认每个关键状态。',
-  systemContent: [
+  instructions: [
     '只能使用当前 demo 暴露的 Windows 工具操作微信窗口，不要使用剪贴板。',
     '联系人名称和消息正文都必须通过 send-text 发送 WM_CHAR 文本。',
     '每次执行关键点击或文字输入后，都调用 capture-window 获取截图；截图会自动作为多模态图片进入下一轮模型请求，请基于图片判断窗口状态。',
@@ -289,28 +289,22 @@ export const weixinWindowsSkill: AgentSkill = {
     '搜索结果下拉窗是独立顶层窗口，点击联系人结果时必须使用下拉窗口 hwnd，不能把下拉坐标换算到主窗口。',
     '发送前必须 capture-window 截取主窗口，并确认聊天标题匹配目标联系人；如果不匹配，停止并报告，不要发送。',
     '下述固定坐标以主窗口 1260x688、下拉窗口 368x194 的截图尺寸为基准；若 capture-window 返回的尺寸不同，必须按实际 width/height 分别缩放 x/y 后再调用 click-window。',
+    '工作流：搜索微信联系人并发送一条已准备好的消息。',
+    '1. 调用 find-window 查找微信主窗口：processName="Weixin"，className="Qt51514QWindowIcon"，exactClassName=true，visibleOnly=true，enabledOnly=true，limit=10。微信标题可能乱码，不要依赖 title。',
+    '2. 对主窗口调用 capture-window，检查截图是否是微信主界面。',
+    '3. 点击主窗口搜索框：click-window({ hwnd: mainHwnd, x: 159, y: 55, button: "left" })。',
+    '4. 若需要确认焦点，点击搜索框后用 send-text 输入 a，再 capture-window 检查 a 是否出现在搜索框；如果 a 出现在聊天输入框，用 send-keyboard-message 发送 backspace 删除后重新点击搜索框。确认后删除探测字符。',
+    '5. 使用 send-text 在主窗口输入目标联系人名称。',
+    '6. 重新调用 find-window 查找搜索下拉窗口：processName="Weixin"，className="Qt51514QWindowToolSaveBits"，exactClassName=true，title="Weixin"，exactTitle=true，visibleOnly=true，enabledOnly=false，limit=10。',
+    '7. 对下拉窗口调用 capture-window，outputName 可包含 weixin-dropdown，printFlags=2；通过多模态截图确认下拉结果里有目标联系人。',
+    '8. 通过下拉窗口 hwnd 点击联系人结果：click-window({ hwnd: dropdownHwnd, x: 122, y: 73, button: "left" })。',
+    '9. 对主窗口调用 capture-window，通过多模态截图确认聊天标题是目标联系人。',
+    '10. 点击聊天输入框：click-window({ hwnd: mainHwnd, x: 330, y: 563, button: "left" })。',
+    '11. 使用 send-text 输入准备好的消息正文。',
+    '12. 对主窗口调用 capture-window，确认消息正文已经出现在聊天输入框。',
+    '13. 点击发送按钮：click-window({ hwnd: mainHwnd, x: 1215, y: 658, button: "left" })。',
+    '14. 最后对主窗口调用 capture-window，确认消息气泡已经出现在聊天记录中。',
   ].join('\n'),
-  sops: [
-    {
-      description: '搜索微信联系人并发送一条已准备好的消息',
-      content: [
-        '1. 调用 find-window 查找微信主窗口：processName="Weixin"，className="Qt51514QWindowIcon"，exactClassName=true，visibleOnly=true，enabledOnly=true，limit=10。微信标题可能乱码，不要依赖 title。',
-        '2. 对主窗口调用 capture-window，检查截图是否是微信主界面。',
-        '3. 点击主窗口搜索框：click-window({ hwnd: mainHwnd, x: 159, y: 55, button: "left" })。',
-        '4. 若需要确认焦点，点击搜索框后用 send-text 输入 a，再 capture-window 检查 a 是否出现在搜索框；如果 a 出现在聊天输入框，用 send-keyboard-message 发送 backspace 删除后重新点击搜索框。确认后删除探测字符。',
-        '5. 使用 send-text 在主窗口输入目标联系人名称。',
-        '6. 重新调用 find-window 查找搜索下拉窗口：processName="Weixin"，className="Qt51514QWindowToolSaveBits"，exactClassName=true，title="Weixin"，exactTitle=true，visibleOnly=true，enabledOnly=false，limit=10。',
-        '7. 对下拉窗口调用 capture-window，outputName 可包含 weixin-dropdown，printFlags=2；通过多模态截图确认下拉结果里有目标联系人。',
-        '8. 通过下拉窗口 hwnd 点击联系人结果：click-window({ hwnd: dropdownHwnd, x: 122, y: 73, button: "left" })。',
-        '9. 对主窗口调用 capture-window，通过多模态截图确认聊天标题是目标联系人。',
-        '10. 点击聊天输入框：click-window({ hwnd: mainHwnd, x: 330, y: 563, button: "left" })。',
-        '11. 使用 send-text 输入准备好的消息正文。',
-        '12. 对主窗口调用 capture-window，确认消息正文已经出现在聊天输入框。',
-        '13. 点击发送按钮：click-window({ hwnd: mainHwnd, x: 1215, y: 658, button: "left" })。',
-        '14. 最后对主窗口调用 capture-window，确认消息气泡已经出现在聊天记录中。',
-      ].join('\n'),
-    },
-  ],
 };
 
 /**
@@ -1230,7 +1224,7 @@ export async function runWindowsDemo(apiKey: string): Promise<void> {
     'Run the Windows Weixin multimodal messaging demo.',
     `Target Weixin contact: ${recipient}`,
     `Prepared message text: ${messageText}`,
-    'First call get-skill to fetch the Weixin Windows send-message handbook, then follow it strictly.',
+    'First call skill with skill "weixin-windows-send-message" to load the handbook, then follow it strictly.',
     'Whenever you need to judge window state, call capture-window and wait for the next model turn to inspect the injected screenshot image.',
     'Before sending, verify from a main-window screenshot that the chat title matches the target contact. If it does not match, stop and report the mismatch.',
     'After sending, capture the main window again and verify the sent message bubble appears.',

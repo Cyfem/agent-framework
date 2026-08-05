@@ -1,20 +1,60 @@
 import { z } from 'zod';
 
+import type { ModelGeneratePurpose, ModelGenerateRequest, ModelGenerateResult } from '../llm/base';
+import {
+  createSummaryCompactSnapshot,
+  hasToolPayloadCompactor,
+  resolveContextCompactOptions,
+  rewriteOpenLoopToolPayloads,
+  runSummaryCompactTransaction,
+  type ResolvedContextCompactOptions,
+  type ToolExecutionRecord,
+} from './context-compact';
+import { ContextStore } from './context-store';
+import type { ContextStoreSummarySnapshot } from './context-store';
+import { DEFAULT_TOOL_PAYLOAD_COMPACT_LIMITS } from './default-tool-payload-compactor';
 import { getToolDefinitions, Tool } from './decorators';
+import {
+  DEFAULT_MODEL_ERROR_RECOVERY_LIMITS,
+  generateWithModelErrorRecovery,
+  MODEL_ERROR_RECOVERY_TRACE_LIMIT,
+  ModelErrorRecoveryError,
+  resolveModelErrorRecoveryLimits,
+} from './model-error-recovery';
 import { getDefaultToolParametersSchema } from './schema';
+import { renderSkillDiscoveryCatalog } from './skill-command';
+import { createSkillFileSourceAdapter } from './skill-file-source';
+import { getSkillNodeCapabilities } from './skill-node-runtime';
+import { SkillRegistry } from './skill-registry';
+import {
+  DEFAULT_SKILL_TEXT_RESOURCE_EXTENSIONS,
+  detectSkillScriptExecutors,
+  resolveSkillRuntimeOptions,
+  SkillScriptRuntime,
+  type ResolvedSkillRuntimeOptions,
+} from './skill-script-runtime';
 import type {
+  AfterModelErrorRecoveryCallback,
   AfterToolCallCallback,
   AgentConstructor,
   AgentErrorCallback,
   AgentOptions,
   AgentProtocol,
-  AgentSkill,
+  AgentSkillSource,
+  AgentSkillSourceDiagnostic,
   AgentStatus,
   AgentStatusChangedCallback,
   AgentToolCall,
+  BeforeModelErrorRecoveryCallback,
   BeforeToolCallCallback,
+  ContextCompactCause,
+  ContextCompactOptions,
   ContextOf,
   ModelResponseCallback,
+  ModelErrorRecoveryOptions,
+  ResolvedModelErrorRecoveryLimits,
+  SkillRuntimeOptions,
+  SkillToolInput,
   ToolOf,
   ToolCallErrorCallback,
   ToolDefinition,
@@ -69,20 +109,37 @@ export class Agent<P extends AgentProtocol> {
     setToolsStorage(this, tools);
   }
 
-  #rawContext: ContextOf<P>[] = [];
-  #context: ContextOf<P>[] = [];
-  #skills: AgentSkill[] = [];
+  #contextStore: ContextStore<P>;
+  #skillSources: AgentSkillSource[] = [];
+  #skillRuntimeConfig: SkillRuntimeOptions | undefined;
+  #skillRuntime!: ResolvedSkillRuntimeOptions;
+  #skillRegistry = SkillRegistry.empty();
+  #skillSourceDiagnostics: readonly AgentSkillSourceDiagnostic[] = Object.freeze([]);
+  #skillConfigurationDirty = true;
+  #builtinSkillRuntimeDefinition: ToolRuntimeDefinition;
   #systemPrompts: string[] = [];
   #status: AgentStatus = 'idle';
   #maxIterations: number | undefined;
   #llm: AgentOptions<P>['llm'];
+  #contextCompactConfig: ContextCompactOptions<P> | undefined;
+  #contextCompact: ResolvedContextCompactOptions<P> = {
+    toolInput: { source: 'disabled' },
+    toolResult: { source: 'disabled' },
+  };
+  #modelErrorRecoveryConfig: ModelErrorRecoveryOptions | undefined;
+  #modelErrorRecoveryLimits: Readonly<ResolvedModelErrorRecoveryLimits> =
+    resolveModelErrorRecoveryLimits();
   #initialized = false;
+  #endRequested = false;
+  #trackedToolListenerPromises: Promise<void>[] | undefined;
 
   #beforeToolListeners: ToolEventListener<BeforeToolCallCallback<P>>[] = [];
   #afterToolListeners: ToolEventListener<AfterToolCallCallback<P>>[] = [];
   #toolCallErrorListeners: ToolCallErrorCallback<P>[] = [];
   #statusListeners: AgentStatusListener<P>[] = [];
   #modelResponseListeners: ModelResponseCallback<P>[] = [];
+  #beforeModelErrorRecoveryListeners: BeforeModelErrorRecoveryCallback<P>[] = [];
+  #afterModelErrorRecoveryListeners: AfterModelErrorRecoveryCallback<P>[] = [];
 
   #agentErrorListeners: AgentErrorCallback[] = [];
 
@@ -177,9 +234,18 @@ export class Agent<P extends AgentProtocol> {
   constructor(options: AgentOptions<P>) {
     this.#llm = options.llm;
     this.#maxIterations = options.maxIterations;
-    this.#context = [...(options.initContext ?? options.initRawContext ?? [])];
-    this.#rawContext = [...(options.initRawContext ?? options.initContext ?? [])];
+    this.#contextStore = new ContextStore(options.initContext, options.initRawContext);
+    this.#contextCompactConfig = options.contextCompact;
+    this.#modelErrorRecoveryConfig = options.modelErrorRecovery;
+    this.#skillRuntimeConfig = options.skillRuntime;
     this.tools ??= [];
+    const builtinSkillRuntimeDefinition = this.tools.find((tool) => tool.name === 'skill');
+
+    if (!builtinSkillRuntimeDefinition) {
+      throw new Error('Internal skill tool was not registered.');
+    }
+
+    this.#builtinSkillRuntimeDefinition = builtinSkillRuntimeDefinition;
     this.subAgents = [...(options.subAgents ?? [])];
 
     if (
@@ -195,12 +261,12 @@ export class Agent<P extends AgentProtocol> {
 
   /** 获取完整历史记录；返回的数组为浅拷贝。 */
   getHistory(): readonly ContextOf<P>[] {
-    return [...this.#rawContext];
+    return this.#contextStore.getRawHistory();
   }
 
   /** 获取模型请求使用的活动上下文，不包含临时注入的内部系统提示词。 */
   getContext(): readonly ContextOf<P>[] {
-    return [...this.#context];
+    return this.#contextStore.getActiveContext();
   }
 
   /**
@@ -210,12 +276,44 @@ export class Agent<P extends AgentProtocol> {
    * 不会清空历史或事件监听。
    */
   init(): this {
+    if (this.#status === 'running') {
+      throw new Error('Cannot initialize an Agent while it is running.');
+    }
+
     this.#initialized = false;
     this.#assertUniqueToolNames();
     this.#assertUniqueSubAgentNames();
+    const capabilities = getSkillNodeCapabilities();
+    const skillRuntime = resolveSkillRuntimeOptions(this.#skillRuntimeConfig, capabilities);
+    const fileSource = createSkillFileSourceAdapter({
+      capabilities,
+      resourceExtensions: skillRuntime.resourceExtensions,
+    });
+    const scriptRuntime = new SkillScriptRuntime(skillRuntime, capabilities);
+    const skills = SkillRegistry.build({
+      sources: this.#skillSources,
+      fileSource,
+      scriptRuntime,
+    });
+    const contextCompact = resolveContextCompactOptions(this.#contextCompactConfig);
+    const modelErrorRecoveryLimits = resolveModelErrorRecoveryLimits(
+      this.#modelErrorRecoveryConfig,
+    );
+
+    this.#skillRuntime = skillRuntime;
+    this.#skillRegistry = skills.registry;
+    this.#skillSourceDiagnostics = skills.diagnostics;
+    this.#contextCompact = contextCompact;
+    this.#modelErrorRecoveryLimits = modelErrorRecoveryLimits;
+    this.#skillConfigurationDirty = false;
     this.#initialized = true;
 
     return this;
+  }
+
+  /** 返回最近一次成功 init 的冻结、无路径 file source 诊断快照。 */
+  getSkillSourceDiagnostics(): readonly AgentSkillSourceDiagnostic[] {
+    return this.#skillSourceDiagnostics;
   }
 
   /** 追加非空系统提示词；请求模型时它们排在框架内部提示词之后。 */
@@ -229,15 +327,29 @@ export class Agent<P extends AgentProtocol> {
     return this;
   }
 
-  /** 追加技能手册；新增技能会从下一次模型请求开始对模型可见。 */
-  addSkill(...skills: AgentSkill[]): this {
-    this.#skills.push(...skills);
+  /** 追加 configured Skill source；重新 init 成功后才进入 effective registry。 */
+  addSkill(...skills: AgentSkillSource[]): this {
+    if (skills.length === 0) {
+      return this;
+    }
+
+    this.#skillSources.push(...skills);
+    this.#skillConfigurationDirty = true;
+
+    if (this.#status !== 'running') {
+      this.#initialized = false;
+    }
+
     return this;
   }
 
   /** 向完整历史和活动上下文同时追加文本或多模态消息。 */
   appendContext(message: ContextOf<P>): this {
-    this.#appendMessage(message);
+    if (this.#contextStore.hasOpenLoopSpan) {
+      this.#contextStore.appendToOpenLoop(message);
+    } else {
+      this.#contextStore.appendStandalone(message, 'external');
+    }
     return this;
   }
 
@@ -290,32 +402,27 @@ export class Agent<P extends AgentProtocol> {
     return addListener(this.#agentErrorListeners, callback);
   }
 
+  /** 在框架执行默认模型错误恢复动作前注册控制 hook。 */
+  onBeforeModelErrorRecovery(callback: BeforeModelErrorRecoveryCallback<P>): Unsubscribe {
+    return addListener(this.#beforeModelErrorRecoveryListeners, callback);
+  }
+
+  /** 在 handler 执行或跳过后注册最终动作控制 hook。 */
+  onAfterModelErrorRecovery(callback: AfterModelErrorRecoveryCallback<P>): Unsubscribe {
+    return addListener(this.#afterModelErrorRecoveryListeners, callback);
+  }
+
   @Tool({
-    name: 'get-skill',
-    description: '获取指定下标的技能手册完整内容。',
+    name: 'skill',
+    description:
+      '按名称渐进加载 Skill。省略 args 或使用 load 获取 instructions；使用 read <resource-id> 读取文本资源；使用 run <script-id> [args...] 运行已登记脚本。',
     parameters: z.object({
-      index: z.number().int().nonnegative(),
+      skill: z.string(),
+      args: z.string().optional(),
     }),
   })
-  #getSkill(parameters: unknown): string {
-    // 技能列表通过 system prompt 暴露索引，工具只负责按索引返回完整手册。
-    const { index } = parameters as { index: number };
-    const skill = this.#skills[index];
-
-    if (!skill) {
-      return `没有找到下标为 ${index} 的技能手册。`;
-    }
-
-    const parts = [
-      `手册标题：${skill.name}`,
-      `手册描述：${skill.description}`,
-      skill.systemContent ? `全局适用内容：${skill.systemContent}` : '',
-      ...(skill.sops ?? []).map((sop, sopIndex) =>
-        [`工作流${sopIndex + 1}：${sop.description}`, `执行流程：\n${sop.content}`].join('\n'),
-      ),
-    ].filter((part) => part.length > 0);
-
-    return parts.join('\n\n');
+  async #skillTool(parameters: unknown): Promise<unknown> {
+    return this.#skillRegistry.dispatch(parameters as SkillToolInput);
   }
 
   @Tool({
@@ -324,8 +431,8 @@ export class Agent<P extends AgentProtocol> {
       '当你认为你已经彻底完成了用户交代的任务，并且不需要更多信息时，请调用这个工具。该工具必须在任务确定结束时单独调用，不能跟其他工具一起调用。',
   })
   #endAgent(): string {
-    // Agent 的结束条件集中在该内置工具中，避免自然语言回答误判为完成。
-    this.#changeStatus('ended');
+    // loop 内先记录结束请求；只有 result/listener/compact 均成功后才提交 ended。
+    this.#endRequested = true;
     return 'Agent 已结束。';
   }
 
@@ -337,33 +444,54 @@ export class Agent<P extends AgentProtocol> {
    */
   async toolCall(callInfo: AgentToolCall<P>): Promise<ContextOf<P>> {
     this.#assertInitialized();
+    const standalone = !this.#contextStore.hasOpenLoopSpan;
+    let record: ToolExecutionRecord<P>;
 
+    try {
+      record = await this.#executeToolCallWithRecord(callInfo);
+    } catch (error) {
+      if (standalone) {
+        this.#endRequested = false;
+      }
+      throw error;
+    }
+
+    // standalone toolCall 没有 loop compact 阶段；只等待其 awaited listeners 后提交结束。
+    if (standalone && this.#endRequested) {
+      this.#endRequested = false;
+      this.#changeStatus('ended');
+    }
+
+    return record.resultMessage;
+  }
+
+  async #executeToolCallWithRecord(callInfo: AgentToolCall<P>): Promise<ToolExecutionRecord<P>> {
     const tool = this.tools.find((candidate) => candidate.name === callInfo.name);
     const fallbackParameters: unknown = {};
 
     if (!tool) {
       const error = new Error(`Unknown tool: ${callInfo.name}`);
       await this.#emitToolCallError(callInfo.name, 'calling', error, fallbackParameters, callInfo);
-      return this.#appendToolMessage(
-        this.#createToolMessage(callInfo.id, normalizeErrorMessage(error)),
-      );
+      return this.#createToolExecutionRecord(callInfo, normalizeErrorMessage(error), true);
     }
+
+    const compactResult =
+      tool === this.#builtinSkillRuntimeDefinition ? this.#skillRuntime.compactResult : true;
 
     const parsedArguments = await this.#parseToolArguments(tool, callInfo);
 
     if (!parsedArguments.ok) {
-      return this.#appendToolMessage(this.#createToolMessage(callInfo.id, parsedArguments.message));
+      return this.#createToolExecutionRecord(callInfo, parsedArguments.message, compactResult);
     }
 
     const parameters = parsedArguments.parameters;
     const beforeResult = await this.#runBeforeToolListeners(tool.name, parameters, callInfo);
 
     if (beforeResult.canceled) {
-      return this.#appendToolMessage(
-        this.#createToolMessage(
-          callInfo.id,
-          `${beforeToolErrorPrefix}${normalizeErrorMessage(beforeResult.error)}`,
-        ),
+      return this.#createToolExecutionRecord(
+        callInfo,
+        `${beforeToolErrorPrefix}${normalizeErrorMessage(beforeResult.error)}`,
+        compactResult,
       );
     }
 
@@ -373,18 +501,18 @@ export class Agent<P extends AgentProtocol> {
       result = await tool.handler(parameters);
     } catch (error) {
       await this.#emitToolCallError(tool.name, 'calling', error, parameters, callInfo);
-      return this.#appendToolMessage(
-        this.#createToolMessage(callInfo.id, normalizeErrorMessage(error)),
-      );
+      return this.#createToolExecutionRecord(callInfo, normalizeErrorMessage(error), compactResult);
     }
 
-    const resultMessage = this.#appendToolMessage(
-      this.#createToolMessage(callInfo.id, serializeToolResult(result)),
+    const record = this.#createToolExecutionRecord(
+      callInfo,
+      serializeToolResult(result),
+      compactResult,
     );
 
     await this.#runAfterToolListeners(tool.name, parameters, callInfo, result);
 
-    return resultMessage;
+    return record;
   }
 
   /**
@@ -409,7 +537,7 @@ export class Agent<P extends AgentProtocol> {
         throw new Error('Agent streaming is not supported in this version.');
       }
 
-      this.#appendMessage(
+      this.#contextStore.appendStandalone(
         this.#llm.buildUserMessage(
           typeof input === 'string'
             ? {
@@ -417,6 +545,7 @@ export class Agent<P extends AgentProtocol> {
               }
             : input,
         ),
+        'user',
       );
 
       this.#changeStatus('running');
@@ -426,21 +555,59 @@ export class Agent<P extends AgentProtocol> {
         this.#maxIterations === undefined || iteration < this.#maxIterations;
         iteration += 1
       ) {
-        const response = await this.#generateWithEmptyMessagesRetry();
+        const initialRequest = await this.#runProactiveSummary(iteration);
+        const response = await this.#generateWithEmptyMessagesRetry(iteration, initialRequest);
+        const records: ToolExecutionRecord<P>[] = [];
+        let loopFinalized = false;
 
-        await this.#emitModelResponse(response.messages);
+        this.#contextStore.openLoopSpan();
+        this.#endRequested = false;
+        this.#trackedToolListenerPromises = hasToolPayloadCompactor(this.#contextCompact)
+          ? []
+          : undefined;
 
-        // 模型消息可能带有提供方元数据，必须整批原样保存后再执行本地工具。
-        for (const message of response.messages) {
-          this.#appendMessage(message);
+        try {
+          await this.#emitModelResponse(response.messages);
+
+          // 模型消息可能带有提供方元数据，必须整批原样保存后再执行本地工具。
+          for (const message of response.messages) {
+            this.#contextStore.appendToOpenLoop(message);
+          }
+
+          for (const call of this.#llm.parseToolCalls(response.messages)) {
+            records.push(await this.#executeToolCallWithRecord(call));
+          }
+
+          if (records.length === 0 || !hasToolPayloadCompactor(this.#contextCompact)) {
+            this.#contextStore.closeOpenLoopSpan();
+          } else {
+            await Promise.all(this.#trackedToolListenerPromises ?? []);
+            const snapshot = this.#contextStore.snapshotOpenLoop();
+            const rewritten = await rewriteOpenLoopToolPayloads({
+              model: this.#llm,
+              iteration,
+              snapshot,
+              records,
+              compactors: this.#contextCompact,
+            });
+            this.#contextStore.commitOpenLoopRewrite(snapshot, rewritten);
+          }
+
+          loopFinalized = true;
+        } finally {
+          this.#trackedToolListenerPromises = undefined;
+
+          if (!loopFinalized) {
+            this.#contextStore.abortOpenLoopSpan();
+            this.#endRequested = false;
+            records.length = 0;
+          }
         }
 
-        for (const call of this.#llm.parseToolCalls(response.messages)) {
-          await this.toolCall(call);
-        }
-
-        if (this.#status === 'ended') {
-          return [...this.#context];
+        if (this.#endRequested) {
+          this.#endRequested = false;
+          this.#changeStatus('ended');
+          return [...this.#contextStore.getActiveContext()];
         }
       }
 
@@ -500,23 +667,18 @@ export class Agent<P extends AgentProtocol> {
       ...this.#systemPrompts,
     ].map((content) => this.#llm.buildSystemMessage({ content }));
 
-    return [...systemMessages, ...this.#context];
+    return [...systemMessages, ...this.#contextStore.getActiveContext()];
   }
 
   #buildSkillPrompt(): string {
-    // 技能选择指引放在 system prompt 中，让 `get-skill` 的工具描述保持精简。
+    const descriptors = this.#skillRegistry.getDescriptors();
     const skillList =
-      this.#skills.length === 0
-        ? '当前没有可查询的技能手册，不要调用 get-skill。'
-        : this.#skills
-            .map(
-              (skill, index) =>
-                `技能手册${index}：\n名称：${skill.name}\n描述：${skill.description}`,
-            )
-            .join('\n\n');
+      descriptors.length === 0
+        ? '当前没有可用 Skill，不要调用 skill 工具。'
+        : renderSkillDiscoveryCatalog(descriptors);
 
     return [
-      '框架技能约束：当正在执行的任务匹配到如下技能手册描述时，必须先调用 get-skill 工具获取对应下标的完整手册内容，然后检查手册内是否有具体工作流；如果匹配到具体工作流，必须按照该工作流执行。',
+      '框架 Skill 约束：首轮只披露 name 和 description。任务匹配时先调用 skill({ skill, args? })；省略 args 或使用 load 获取 instructions 和 manifest，再按 manifest 使用 read/run。不得猜测未登记的 resource 或 script id。',
       skillList,
     ].join('\n\n');
   }
@@ -543,12 +705,12 @@ export class Agent<P extends AgentProtocol> {
       const description =
         typeof tool.description === 'function'
           ? tool.description({
-              skills: [...this.#skills],
+              skills: this.#skillRegistry.getDescriptors(),
               subAgents: [
                 ...this.subAgents,
               ] as unknown as readonly AgentConstructor<AgentProtocol>[],
-              context: [...this.#context],
-              history: [...this.#rawContext],
+              context: [...this.#contextStore.getActiveContext()],
+              history: [...this.#contextStore.getRawHistory()],
               systemPrompts: [...this.#systemPrompts],
               tool: toolContext,
             })
@@ -563,15 +725,94 @@ export class Agent<P extends AgentProtocol> {
     });
   }
 
-  async #generateWithEmptyMessagesRetry() {
-    // 只重试“成功响应但没有消息”的情况；网络/API 异常由外层 catch 统一处理。
+  #buildAgentRequest(): ModelGenerateRequest<P> {
+    // 普通请求故意不写 purpose，保持旧自定义 Model 的 request 快照兼容。
+    return {
+      context: this.#buildContextForModel(),
+      tools: this.#buildToolsForModel(),
+    };
+  }
+
+  async #runProactiveSummary(iteration: number): Promise<ModelGenerateRequest<P>> {
+    const policy = this.#contextCompact.summary;
+    const request = this.#buildAgentRequest();
+
+    if (!policy) {
+      return request;
+    }
+
+    const storeSnapshot = this.#contextStore.getSummarySnapshot();
+    const defaultSelection = this.#contextStore.getDefaultSummarySelection('trigger');
+    const snapshot = createSummaryCompactSnapshot({
+      storeSnapshot,
+      cause: { type: 'trigger' },
+      iteration,
+      pendingRequest: request,
+    });
+
+    if (!(await policy.trigger(snapshot))) {
+      return this.#contextStore.revision === storeSnapshot.revision
+        ? request
+        : this.#buildAgentRequest();
+    }
+
+    const compacted = await this.#runSummaryTransaction(
+      { type: 'trigger' },
+      iteration,
+      request,
+      storeSnapshot,
+      defaultSelection,
+      true,
+    );
+
+    return compacted || this.#contextStore.revision !== storeSnapshot.revision
+      ? this.#buildAgentRequest()
+      : request;
+  }
+
+  async #runSummaryTransaction(
+    cause: ContextCompactCause,
+    iteration: number,
+    pendingRequest: Readonly<ModelGenerateRequest<P>>,
+    storeSnapshot?: ContextStoreSummarySnapshot<P>,
+    defaultSelection?: ReturnType<ContextStore<P>['getDefaultSummarySelection']>,
+    defaultSelectionCaptured = false,
+  ): Promise<boolean> {
+    const policy = this.#contextCompact.summary;
+
+    if (!policy) {
+      return false;
+    }
+
+    return runSummaryCompactTransaction({
+      model: this.#llm,
+      store: this.#contextStore,
+      policy,
+      cause,
+      iteration,
+      pendingRequest,
+      ...(storeSnapshot === undefined ? {} : { storeSnapshot }),
+      ...(defaultSelection === undefined ? {} : { defaultSelection }),
+      defaultSelectionCaptured,
+      generate: (summaryRequest) =>
+        this.#generateWithRecovery('context-summary', () => summaryRequest, iteration),
+    });
+  }
+
+  async #generateWithEmptyMessagesRetry(
+    iteration: number,
+    initialRequest: ModelGenerateRequest<P>,
+  ) {
+    // “成功但 messages 为空”的 4 次尝试与模型异常 recovery ledger 相互独立。
     let lastResponseText = 'Model returned no messages.';
 
     for (let attempt = 0; attempt <= 3; attempt += 1) {
-      const response = await this.#llm.generate({
-        context: this.#buildContextForModel(),
-        tools: this.#buildToolsForModel(),
-      });
+      const response = await this.#generateWithRecovery(
+        'agent',
+        () => this.#buildAgentRequest(),
+        iteration,
+        attempt === 0 ? initialRequest : undefined,
+      );
 
       if (response.messages.length > 0) {
         return response;
@@ -581,6 +822,55 @@ export class Agent<P extends AgentProtocol> {
     }
 
     throw new Error(lastResponseText);
+  }
+
+  async #generateWithRecovery(
+    purpose: ModelGeneratePurpose,
+    buildRequest: () => ModelGenerateRequest<P>,
+    iteration: number,
+    initialRequest?: ModelGenerateRequest<P>,
+  ): Promise<ModelGenerateResult<P>> {
+    let pendingInitialRequest = initialRequest;
+
+    return generateWithModelErrorRecovery({
+      model: this.#llm,
+      purpose,
+      buildRequest: () => {
+        if (pendingInitialRequest !== undefined) {
+          const request = pendingInitialRequest;
+          pendingInitialRequest = undefined;
+          return request;
+        }
+
+        return buildRequest();
+      },
+      limits: this.#modelErrorRecoveryLimits,
+      getContextRevision: () => this.#contextStore.revision,
+      beforeListeners: () => [...this.#beforeModelErrorRecoveryListeners],
+      afterListeners: () => [...this.#afterModelErrorRecoveryListeners],
+      matchHandler: (descriptor, requestPurpose) =>
+        requestPurpose === 'agent' &&
+        descriptor.kind === 'context_length_exceeded' &&
+        this.#contextCompact.summary
+          ? {
+              id: 'core.context_compaction',
+              kind: 'context_length_exceeded',
+            }
+          : undefined,
+      runHandler: async (_match, handlerContext) => {
+        const compacted = await this.#runSummaryTransaction(
+          {
+            type: 'context_length_exceeded',
+            error: handlerContext.descriptor,
+            cause: handlerContext.cause,
+          },
+          iteration,
+          handlerContext.request,
+        );
+
+        return { outcome: compacted ? 'succeeded' : 'unavailable' };
+      },
+    });
   }
 
   async #parseToolArguments(
@@ -647,9 +937,11 @@ export class Agent<P extends AgentProtocol> {
         if (listener.options.await) {
           await result;
         } else {
-          void Promise.resolve(result).catch((error: unknown) => {
-            void this.#emitToolCallError(toolName, 'before', error, parameters, message);
+          const tracked = Promise.resolve(result).catch(async (error: unknown) => {
+            await this.#emitToolCallError(toolName, 'before', error, parameters, message);
           });
+
+          this.#trackToolListener(tracked);
         }
       } catch (error) {
         await this.#emitToolCallError(toolName, 'before', error, parameters, message);
@@ -682,9 +974,11 @@ export class Agent<P extends AgentProtocol> {
         if (listener.options.await) {
           await callbackResult;
         } else {
-          void Promise.resolve(callbackResult).catch((error: unknown) => {
-            void this.#emitToolCallError(toolName, 'after', error, parameters, message, result);
+          const tracked = Promise.resolve(callbackResult).catch(async (error: unknown) => {
+            await this.#emitToolCallError(toolName, 'after', error, parameters, message, result);
           });
+
+          this.#trackToolListener(tracked);
         }
       } catch (error) {
         // after listener 的失败可以被观察，但不能中断 Agent 主循环。
@@ -736,14 +1030,38 @@ export class Agent<P extends AgentProtocol> {
     }
   }
 
-  #appendMessage(message: ContextOf<P>): void {
-    this.#rawContext.push(message);
-    this.#context.push(message);
+  #trackToolListener(listener: Promise<void>): void {
+    if (this.#trackedToolListenerPromises) {
+      this.#trackedToolListenerPromises.push(listener);
+    } else {
+      void listener;
+    }
   }
 
   #appendToolMessage(message: ContextOf<P>): ContextOf<P> {
-    this.#appendMessage(message);
+    if (this.#contextStore.hasOpenLoopSpan) {
+      this.#contextStore.appendToOpenLoop(message);
+    } else {
+      this.#contextStore.appendStandalone(message, 'external');
+    }
+
     return message;
+  }
+
+  #createToolExecutionRecord(
+    call: AgentToolCall<P>,
+    output: string,
+    compactResult: boolean,
+  ): ToolExecutionRecord<P> {
+    const resultMessage = this.#appendToolMessage(this.#createToolMessage(call.id, output));
+
+    return {
+      call,
+      resultMessage,
+      originalInput: call.arguments,
+      originalResult: output,
+      compactResult,
+    };
   }
 
   #createToolMessage(callId: string, output: string): ContextOf<P> {
@@ -758,14 +1076,22 @@ export class Agent<P extends AgentProtocol> {
       return;
     }
 
+    const previousStatus = this.#status;
     this.#status = status;
 
+    if (previousStatus === 'running' && status !== 'running' && this.#skillConfigurationDirty) {
+      this.#initialized = false;
+    }
+
     for (const listener of this.#statusListeners.filter((item) => item.status === status)) {
-      void Promise.resolve(listener.callback([...this.#rawContext], [...this.#context])).catch(
-        () => {
-          // 状态 listener 仅用于观察，不应打断状态迁移。
-        },
-      );
+      void Promise.resolve(
+        listener.callback(
+          [...this.#contextStore.getRawHistory()],
+          [...this.#contextStore.getActiveContext()],
+        ),
+      ).catch(() => {
+        // 状态 listener 仅用于观察，不应打断状态迁移。
+      });
     }
   }
 }
@@ -861,5 +1187,13 @@ function formatStaticToolDescription(tool: ToolDefinition, index: number): strin
   ].join('\n');
 }
 
-export { Tool };
+export {
+  DEFAULT_SKILL_TEXT_RESOURCE_EXTENSIONS,
+  DEFAULT_MODEL_ERROR_RECOVERY_LIMITS,
+  DEFAULT_TOOL_PAYLOAD_COMPACT_LIMITS,
+  MODEL_ERROR_RECOVERY_TRACE_LIMIT,
+  ModelErrorRecoveryError,
+  Tool,
+  detectSkillScriptExecutors,
+};
 export type * from './types';

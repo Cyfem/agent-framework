@@ -310,7 +310,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
       'You are running an automated integration demo for a Node.js agent framework through Ark Coding Plan.',
       [
         'Use tools to exercise framework features. Follow this order as closely as possible:',
-        '1. call get-skill with index 0.',
+        '1. call skill with skill "ark-complex-demo-playbook".',
         '2. call read-project-config.',
         '3. call create-ticket for a high-priority demo ticket.',
         '4. call append-ticket-note with ticketId "T-1".',
@@ -330,15 +330,10 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
       {
         name: 'ark-complex-demo-playbook',
         description: 'A playbook for exercising tool calls, events, dynamic skills, and errors.',
-        systemContent:
+        instructions: [
           'Prefer concrete tool calls over prose. Recover from expected tool errors and continue the scenario.',
-        sops: [
-          {
-            description: 'Feature coverage flow',
-            content:
-              'Inspect the skill, create and update a ticket, search memory, summarize state, trigger expected errors, then end.',
-          },
-        ],
+          'Inspect the skill, create and update a ticket, search memory, summarize state, trigger expected errors, then end.',
+        ].join('\n'),
       },
     ],
   });
@@ -364,6 +359,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   agent.addSkill({
     name: 'runtime-skill-before-run',
     description: 'Added before the first model request and visible in the skill system prompt.',
+    instructions: 'This Skill demonstrates configured sources added before init.',
   });
 
   const unsubscribeModelResponse = agent.onModelResponse(() => {
@@ -371,7 +367,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   });
   unsubscribeModelResponse();
 
-  // 首轮响应后注入提示词与技能，验证下一次请求即可读取动态变更。
+  // 首轮响应后登记 Skill；当前 run 继续使用旧 registry，结束并重新 init 后才生效。
   agent.onModelResponse((output) => {
     const summary = summarizeOutput(output);
 
@@ -383,7 +379,10 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
       agent.addSystemPrompts('This prompt was added while the Ark demo was running.');
       agent.addSkill({
         name: 'runtime-skill-during-run',
-        description: 'Added from onModelResponse and visible from the next model request.',
+        description:
+          'Added from onModelResponse and visible only after run finalization and re-init.',
+        instructions:
+          'This Skill demonstrates the immutable registry snapshot used by a running Agent.',
       });
     }
   });
@@ -401,7 +400,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
   });
 
   for (const toolName of [
-    'get-skill',
+    'skill',
     'read-project-config',
     'create-ticket',
     'append-ticket-note',
@@ -532,6 +531,8 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
 
   console.log('context:', agent.getContext());
 
+  // 运行中登记的 Skill 使 Agent 在结束后回到未初始化；显式重建 snapshot。
+  agent.init();
   await runExpectedAgentErrorDemo(agent);
 }
 

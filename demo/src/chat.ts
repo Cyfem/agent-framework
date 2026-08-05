@@ -18,19 +18,14 @@ import {
 } from '@manee/agent-framework';
 
 const billingSkill: AgentSkill = {
-  name: '账单回复流程',
+  name: 'billing-reply',
   description: '当用户需要处理客户账单疑问时，先查客户资料，再计算可用补偿，最后生成回复。',
-  systemContent: '账单相关回复需要清楚说明事实、金额和下一步动作，语气保持克制友好。',
-  sops: [
-    {
-      description: '处理客户账单疑问',
-      content: [
-        '1. 读取客户资料和最近账单摘要。',
-        '2. 计算本次可提供的补偿或抵扣额度。',
-        '3. 生成一段可以直接发送给客户的回复。',
-      ].join('\n'),
-    },
-  ],
+  instructions: [
+    '账单相关回复需要清楚说明事实、金额和下一步动作，语气保持克制友好。',
+    '1. 读取客户资料和最近账单摘要。',
+    '2. 计算本次可提供的补偿或抵扣额度。',
+    '3. 生成一段可以直接发送给客户的回复。',
+  ].join('\n'),
 };
 
 /** 使用私有装饰器工具模拟账单客服处理流程。 */
@@ -101,7 +96,7 @@ class ChatMockModel extends OpenAIChatModel {
     this.#turn += 1;
 
     if (this.#turn === 1) {
-      assertToolStrict(request.tools, 'get-skill', undefined);
+      assertToolStrict(request.tools, 'skill', undefined);
       assertToolStrict(request.tools, 'calculate-credit', false);
       assertToolStrict(request.tools, 'compose-reply', true);
 
@@ -115,8 +110,8 @@ class ChatMockModel extends OpenAIChatModel {
                 id: 'call_skill',
                 type: 'function',
                 function: {
-                  name: 'get-skill',
-                  arguments: JSON.stringify({ index: 0 }),
+                  name: 'skill',
+                  arguments: JSON.stringify({ skill: 'billing-reply' }),
                 },
               },
               {
@@ -243,7 +238,7 @@ agent.onModelResponse((messages) => {
   );
 });
 
-for (const toolName of ['get-skill', 'lookup-customer', 'calculate-credit', 'compose-reply']) {
+for (const toolName of ['skill', 'lookup-customer', 'calculate-credit', 'compose-reply']) {
   agent.onBeforeToolCall(toolName, (_parameters, call) => {
     observedToolCalls.push(call.name);
     console.log(`before tool: ${call.name} ${call.arguments}`);
@@ -284,7 +279,7 @@ assertDemo(parsedUsers.length === 1, 'chat parser should recover the initial use
 assertDemo(parsedAssistants.length === 3, 'chat parser should recover assistant messages');
 assertDemo(
   parsedToolCalls.map((call) => call.name).join(',') ===
-    'get-skill,lookup-customer,calculate-credit,compose-reply,end-agent',
+    'skill,lookup-customer,calculate-credit,compose-reply,end-agent',
   'chat parser should expand tool_calls in protocol order',
 );
 assertDemo(
@@ -292,7 +287,7 @@ assertDemo(
   'chat tool result parser should recover all tool outputs',
 );
 assertDemo(
-  observedToolCalls.join(',') === 'get-skill,lookup-customer,calculate-credit,compose-reply',
+  observedToolCalls.join(',') === 'skill,lookup-customer,calculate-credit,compose-reply',
   'before hooks should observe business tool calls in order',
 );
 assertDemo(

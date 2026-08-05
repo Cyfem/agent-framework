@@ -181,7 +181,7 @@ async function runWindowsChatDemo(apiKey: string): Promise<void> {
       'Run the Windows Weixin multimodal messaging demo.',
       `Target Weixin contact: ${recipient}`,
       `Prepared message text: ${messageText}`,
-      'First call get-skill to fetch the Weixin Windows send-message handbook, then follow it strictly.',
+      'First call skill with skill "weixin-windows-send-message" to load the handbook, then follow it strictly.',
       'When visual confirmation is needed, call capture-window and inspect the image in the next turn.',
       interactiveEnabled
         ? 'Interactive actions are enabled for this Weixin workflow.'

@@ -17,8 +17,11 @@ import type {
   AgentTextPart,
   AgentToolCall,
   AgentToolDefinitionInput,
+  ModelErrorDescriptor,
+  ToolPayloadReplacements,
 } from '../../agent/types';
 import { Model, type ModelGenerateRequest, type ModelGenerateResult } from '../base';
+import { classifyOpenAICompatibleError } from '../openai-error';
 import { toOpenAIToolParameters } from '../openai-schema';
 import type {
   OpenAIFileObject,
@@ -80,7 +83,9 @@ export class OpenAIResponsesModel extends Model<OpenAIResponsesProtocol> {
       input: request.context as unknown as ResponseInput,
     };
 
-    if (request.tools.length > 0) {
+    if (request.purpose === 'context-summary') {
+      deleteToolOnlyResponsesParams(params);
+    } else if (request.tools.length > 0) {
       params.tools = request.tools as unknown as ResponseTool[];
     }
 
@@ -250,6 +255,85 @@ export class OpenAIResponsesModel extends Model<OpenAIResponsesProtocol> {
     );
   }
 
+  /** Copy-on-write 改写 Responses function_call 与 function_call_output。 */
+  rewriteToolPayloads(
+    context: readonly OpenAIResponsesContext[],
+    replacements: ToolPayloadReplacements<OpenAIResponsesProtocol>,
+  ): readonly OpenAIResponsesContext[] {
+    const rewritten = [...context];
+    const inputTargets = new Map<number, string>();
+    const resultTargets = new Map<number, string>();
+
+    for (const replacement of replacements.inputs) {
+      const messageIndex = findUniqueMessageIndex(
+        context,
+        replacement.sourceMessage,
+        'Responses tool input replacement',
+      );
+      const message = context[messageIndex];
+
+      if (message?.type !== 'function_call' || message !== replacement.sourceCall) {
+        throw new Error(
+          'Responses tool input replacement must identify the same function_call as sourceMessage and sourceCall.',
+        );
+      }
+      if (inputTargets.has(messageIndex)) {
+        throw new Error('Responses tool input replacement targets the same call more than once.');
+      }
+      inputTargets.set(messageIndex, replacement.replacement);
+    }
+
+    for (const replacement of replacements.results) {
+      const messageIndex = findUniqueMessageIndex(
+        context,
+        replacement.sourceMessage,
+        'Responses tool result replacement',
+      );
+      const message = context[messageIndex];
+
+      if (message?.type !== 'function_call_output' || message.call_id !== replacement.callId) {
+        throw new Error(
+          'Responses tool result replacement sourceMessage must be a function_call_output with the same call id.',
+        );
+      }
+      if (resultTargets.has(messageIndex)) {
+        throw new Error(
+          'Responses tool result replacement targets the same message more than once.',
+        );
+      }
+      resultTargets.set(messageIndex, replacement.replacement);
+    }
+
+    for (const [messageIndex, replacement] of inputTargets) {
+      const message = context[messageIndex];
+      if (message?.type !== 'function_call') {
+        throw new Error('Responses tool input replacement target changed during rewrite.');
+      }
+      rewritten[messageIndex] = {
+        ...message,
+        arguments: replacement,
+      };
+    }
+
+    for (const [messageIndex, replacement] of resultTargets) {
+      const message = context[messageIndex];
+      if (message?.type !== 'function_call_output') {
+        throw new Error('Responses tool result replacement target changed during rewrite.');
+      }
+      rewritten[messageIndex] = {
+        ...message,
+        output: replacement,
+      };
+    }
+
+    return rewritten;
+  }
+
+  /** 使用共享 OpenAI-compatible 规则识别 context-length 等 provider 错误。 */
+  classifyError(error: unknown): ModelErrorDescriptor {
+    return classifyOpenAICompatibleError(error);
+  }
+
   /**
    * 上传本地文件，供后续 Responses 输入内容块通过 `file_id` 引用。
    *
@@ -265,6 +349,28 @@ export class OpenAIResponsesModel extends Model<OpenAIResponsesProtocol> {
       purpose: options.purpose ?? 'user_data',
     } as FileCreateParams);
   }
+}
+
+function deleteToolOnlyResponsesParams(params: ResponseCreateParamsNonStreaming): void {
+  const mutable = params as ResponseCreateParamsNonStreaming & Record<string, unknown>;
+
+  delete mutable.tools;
+  delete mutable.tool_choice;
+  delete mutable.parallel_tool_calls;
+  delete mutable.max_tool_calls;
+}
+
+function findUniqueMessageIndex(
+  context: readonly OpenAIResponsesContext[],
+  sourceMessage: OpenAIResponsesContext,
+  label: string,
+): number {
+  const indexes = context.flatMap((message, index) => (message === sourceMessage ? [index] : []));
+  if (indexes.length !== 1) {
+    throw new Error(`${label} sourceMessage must match exactly once; matched ${indexes.length}.`);
+  }
+
+  return indexes[0]!;
 }
 
 function parseInputParts(
