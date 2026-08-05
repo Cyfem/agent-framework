@@ -84,12 +84,12 @@ console.log(context);
 
 ## 仓库结构
 
-| 路径                   | 说明                                                        |
-| ---------------------- | ----------------------------------------------------------- |
-| `packages/core`        | 唯一发布到 npm 的核心库，输出 ESM、CJS 和 TypeScript 声明。 |
-| `demo/src`             | CLI 示例、离线回归、真实方舟调用、金融新闻和 Windows 工具。 |
-| `demo/electron-weixin` | Windows Electron 微信消息示例。                             |
-| `plans`                | 尚未实现的架构与技术改造方案；不能视为当前公共 API。        |
+| 路径                   | 说明                                                                   |
+| ---------------------- | ---------------------------------------------------------------------- |
+| `packages/core`        | 唯一发布到 npm 的核心库，输出 ESM、CJS 和 TypeScript 声明。            |
+| `demo/src`             | CLI 示例、离线回归、真实方舟调用、金融新闻和 Windows 工具。            |
+| `demo/electron-weixin` | Windows Electron 微信消息示例。                                        |
+| `plans`                | Subagent v2 的目标架构与验收方案；已实现范围以源码和各包 README 为准。 |
 
 核心包没有 `bin` CLI；下文命令都是本仓库的 pnpm workspace scripts。demo 源码中的 `@manee/agent-framework` 是 pnpm workspace alias，实际指向发布包 `@ruixutong.manee/maneeagent-framework`；它只是 demo 的本地 import 名，不是另一个 npm 包。
 
@@ -233,4 +233,4 @@ const agent = new Agent({
 
 核心 API、事件、上下文、Skills、子代理、Responses/Chat 适配和自定义 Model 的完整说明见 [`packages/core/README.md`](./packages/core/README.md)。
 
-Subagent v2 的生产运行时改造仍处于设计阶段，范围与分期见 [`plans/subagent-v2-production-runtime/PLAN.md`](./plans/subagent-v2-production-runtime/PLAN.md)，接口、状态机和文件级改造见 [`TECHNICAL_CHANGES.md`](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md)，离线、故障注入与真实方舟 Agent Plan 的完整门禁见 [`TEST_ACCEPTANCE_PLAN.md`](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)。其中内容不代表当前版本已经实现。
+Subagent v2 正按上述计划分批实施。当前 Core workspace 已进入 `2.0.0` 开发线，完成 JSON-safe/JCS、Definition、Executor、StateStore、Artifact、checkpoint、child-runner、telemetry 和 Runtime 的公共 contracts；Catalog/Router、持久状态控制、Local Executor 与 `Agent` loop 切换属于后续批次。因此 plans 中的未接线 API 仍不能当作已可运行能力，实际边界见 [`packages/core/README.md`](./packages/core/README.md)。

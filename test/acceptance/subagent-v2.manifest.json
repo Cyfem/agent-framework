@@ -72,6 +72,77 @@
       ]
     },
     {
+      "requirementId": "C2-JSON",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["jcs"],
+      "cases": [
+        {
+          "caseId": "JSON-01.l1.jcs",
+          "variant": "jcs",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-json.test.ts",
+            "testName": "[acceptance:JSON-01.l1.jcs][variant:jcs]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C2-DEFINITION",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["definition"],
+      "cases": [
+        {
+          "caseId": "DEF-01.l1.contract",
+          "variant": "definition",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-definition.test.ts",
+            "testName": "[acceptance:DEF-01.l1.contract][variant:definition]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C2-CONTRACTS",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L0", "L1"],
+      "requiredVariants": ["contracts", "public-api"],
+      "cases": [
+        {
+          "caseId": "CON-01.l1.runtime-contracts",
+          "variant": "contracts",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-contracts.test.ts",
+            "testName": "[acceptance:CON-01.l1.runtime-contracts][variant:contracts]"
+          }
+        },
+        {
+          "caseId": "API-02.l0.public-contracts",
+          "variant": "public-api",
+          "phase": "phase-1",
+          "layer": "L0",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-public-api.test.ts",
+            "testName": "[acceptance:API-02.l0.public-contracts][variant:public-api]"
+          }
+        }
+      ]
+    },
+    {
       "requirementId": "PHASE-1",
       "status": "planned",
       "phase": "phase-1",

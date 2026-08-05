@@ -506,7 +506,22 @@ Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL
 
 `addSkill()` 只修改 configured sources。非运行状态下会立即使 Agent 回到未初始化；运行中添加只标记 dirty，当前 run 继续使用旧 snapshot。两种情况都必须在下一次运行前重新 `init()`，新 Skill 才会生效。父 Agent 的 Skill 和 runtime 配置不会自动传播给动态子代理。
 
-## 子代理
+## Subagent v2 contracts（C2）
+
+当前 workspace 版本为 `2.0.0`，包根已导出下列协议无关 contracts，供后续 Runtime 和独立 Executor 包实现：
+
+- 严格 JSON-safe 边界、duplicate-aware parser、RFC 8785/JCS canonical JSON、UTF-8 尺寸与 SHA-256。
+- `SubAgentDefinition`、Executor policy、显式 context projection、Artifact opaque reference 与固定 IO/projection/artifact limits。
+- `SubAgentExecutor`、版本化 binding codec、availability probe、create/resume/reconnect operation 和隐藏 binding 的 host handle。
+- task/result/error/approval/budget contracts，以及 exactly-once `ResultReceipt` / `CompletionReceipt`。
+- `AgentRuntimeStateStore`、run/task 独立 revision、lease/fencing、稳定 provenance checkpoint、Chat/Responses codec 和 migrator SPI。
+- `SubAgentChildRunner`、`ToolRuntimeContext`、`AgentRunOutcome`、安全 telemetry sink 与 `SubAgentRuntime` contract。
+
+`ModelSubAgentRequest` 的公开字段精确为 `{ subAgent, executor, input }`。task/session/binding/retry/approval 等 host metadata 不属于模型 wire。`ArtifactReference` 也只包含版本、opaque ID、media type、大小和 SHA-256，不含路径、URL 或凭据。
+
+这一批只冻结并发布 contracts：`createSubAgentRuntime()`、持久状态机、Catalog/Router 和官方 Local Executor 还在后续批次实现。在 C6 原子切换前，下方现有 `AgentOptions.subAgents` 说明仍对应当前可运行的迁移前 Agent loop，不是 v2 兼容层承诺。
+
+## 子代理（迁移前 Agent loop）
 
 子代理必须与父代理使用同一个协议规格。父代理通过内置 `agent` 工具按子代理类名调度子代理，子代理通过运行时注入的 `agent-result` 工具汇报结果。
 
