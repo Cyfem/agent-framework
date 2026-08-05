@@ -12,7 +12,7 @@
 
 ## Working Rules
 
-- 修改前确认改动属于核心库、demo，还是跨项目工作，并理解 workspace link 与发布包名的区别。
+- 修改前确认改动属于核心库、demo，还是跨项目工作，并理解 demo workspace alias 与发布包名的区别。
 - 实现 Subagent v2 前先阅读对应 plans；plans 描述未来设计，不能当成当前公共 API 或已交付能力。
 - 如果改动影响目录结构、命令、公共 API、协议、依赖、外部集成或环境变量，必须同步更新根 README 和相关项目 README。
 - 每次完成改动后，复核 `README.md`、相关项目文档、`AGENTS.md` 与 `CLAUDE.md` 是否仍与仓库事实一致。

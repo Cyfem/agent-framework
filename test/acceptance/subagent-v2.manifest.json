@@ -1,0 +1,99 @@
+{
+  "schema": "subagent-v2-acceptance-manifest/v1",
+  "design": "subagent-v2",
+  "packageVersion": "2.0.0",
+  "providerProfiles": [
+    {
+      "profileId": "smoke",
+      "status": "planned",
+      "expectedSdkAttempts": 24,
+      "hardLimit": 24
+    },
+    {
+      "profileId": "worker",
+      "status": "planned",
+      "expectedSdkAttempts": 19,
+      "hardLimit": 21
+    },
+    {
+      "profileId": "process",
+      "status": "planned",
+      "expectedSdkAttempts": 19,
+      "hardLimit": 21
+    },
+    {
+      "profileId": "http",
+      "status": "planned",
+      "expectedSdkAttempts": 11,
+      "hardLimit": 13
+    },
+    {
+      "profileId": "bullmq",
+      "status": "planned",
+      "expectedSdkAttempts": 15,
+      "hardLimit": 16
+    },
+    {
+      "profileId": "docker",
+      "status": "planned",
+      "expectedSdkAttempts": 15,
+      "hardLimit": 16
+    },
+    {
+      "profileId": "core-full",
+      "status": "planned",
+      "expectedSdkAttempts": 110,
+      "hardLimit": 112
+    }
+  ],
+  "providerTotals": {
+    "expectedSdkAttempts": 213,
+    "hardLimit": 223
+  },
+  "requirements": [
+    {
+      "requirementId": "C1-GROUNDWORK",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["testkit"],
+      "cases": [
+        {
+          "caseId": "TST-GROUND-01",
+          "variant": "testkit",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/testkit-groundwork.test.ts",
+            "testName": "[acceptance:TST-GROUND-01][variant:testkit]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "PHASE-1",
+      "status": "planned",
+      "phase": "phase-1",
+      "requiredLayers": ["L0", "L1", "L2", "L3", "L4", "L5"],
+      "requiredVariants": [],
+      "cases": []
+    },
+    {
+      "requirementId": "PHASE-2",
+      "status": "planned",
+      "phase": "phase-2",
+      "requiredLayers": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"],
+      "requiredVariants": ["worker", "process", "http"],
+      "cases": []
+    },
+    {
+      "requirementId": "PHASE-3",
+      "status": "planned",
+      "phase": "phase-3",
+      "requiredLayers": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"],
+      "requiredVariants": ["bullmq", "docker"],
+      "cases": []
+    }
+  ]
+}

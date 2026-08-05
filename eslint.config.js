@@ -11,6 +11,8 @@ export default tseslint.config(
       '**/coverage/**',
       '**/.vite/**',
       '**/.electron/**',
+      '**/.artifacts/**',
+      '**/.tools/**',
     ],
   },
   js.configs.recommended,

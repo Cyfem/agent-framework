@@ -91,7 +91,7 @@ console.log(context);
 | `demo/electron-weixin` | Windows Electron 微信消息示例。                             |
 | `plans`                | 尚未实现的架构与技术改造方案；不能视为当前公共 API。        |
 
-核心包没有 `bin` CLI；下文命令都是本仓库的 pnpm workspace scripts。demo 源码中的 `@manee/agent-framework` 是指向 `packages/core` 的本地 link alias，不是 npm 发布名。
+核心包没有 `bin` CLI；下文命令都是本仓库的 pnpm workspace scripts。demo 源码中的 `@manee/agent-framework` 是 pnpm workspace alias，实际指向发布包 `@ruixutong.manee/maneeagent-framework`；它只是 demo 的本地 import 名，不是另一个 npm 包。
 
 ## 本地开发
 
@@ -106,6 +106,10 @@ pnpm demo
 ```
 
 `pnpm demo` 是无需 API key 的离线综合回归，可用于确认本地环境和核心构建链正常。
+
+正式验收证据使用固定的 Node.js 22 和 `pnpm@11.1.3`。Windows 上可运行 `pnpm toolchain:node22`，脚本会把便携工具链安装到被忽略的 `.tools/` 目录，并在解压前核对 Node.js 官方 SHA-256；日常开发可继续使用满足版本要求的本机工具链。
+
+Subagent v2 实施期间可运行 `pnpm validate:subagent:v2:manifest`、`pnpm validate:subagent:v2:legacy` 和 `pnpm validate:subagent:v2:pack` 校验需求追踪、旧 wire 基线与发布包内容；`validate:subagent:v2:evidence` 还需通过 `--evidence=<repo-relative.json>` 显式指定本次证据 shard。这些是仓库验收命令，不是 npm 包 CLI。
 
 ## Skills
 

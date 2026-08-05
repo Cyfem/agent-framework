@@ -1,6 +1,6 @@
 # Agent Framework Demo
 
-`demo` 是仓库内可运行的示例包，通过 workspace link `@manee/agent-framework` 直接使用 [`packages/core`](../packages/core) 源码构建产物。该别名只用于本地 workspace；npm 用户应安装 `@ruixutong.manee/maneeagent-framework`。
+`demo` 是仓库内可运行的示例包，通过 pnpm workspace alias `@manee/agent-framework` 引用 [`packages/core`](../packages/core) 的实际发布包名 `@ruixutong.manee/maneeagent-framework`。该别名只用于本地 demo import；npm 用户应安装后者。
 
 ## 方舟 Agent Plan 综合验收
 

@@ -1,47 +1,11 @@
-import { transformAsync } from '@babel/core';
 import { fileURLToPath } from 'node:url';
-import type { Plugin } from 'vite';
 import { defineConfig } from 'vitest/config';
+import { createDecoratorsPlugin } from '../../tooling/vite/decorators';
 
 const entry = fileURLToPath(new URL('./src/index.ts', import.meta.url));
 
-/**
- * 使用 Babel 在库构建前转换 TypeScript 源码中的 2023-11 decorators。
- *
- * Vite/rolldown 本身不会替我们处理当前装饰器提案语义，因此库包和 demo 都复用
- * 这段插件，确保 `@Tool` initializer 行为与 TypeScript 类型检查保持一致。
- */
-function decoratorsBabelPlugin(): Plugin {
-  return {
-    name: 'babel-2023-11-decorators',
-    enforce: 'pre',
-    async transform(code, id) {
-      if (id.includes('\0') || id.endsWith('.d.ts') || !/\.[cm]?tsx?$/.test(id)) {
-        return null;
-      }
-
-      const result = await transformAsync(code, {
-        filename: id,
-        babelrc: false,
-        configFile: false,
-        sourceMaps: false,
-        plugins: [['@babel/plugin-proposal-decorators', { version: '2023-11' }]],
-        presets: [['@babel/preset-typescript', { allowDeclareFields: true }]],
-      });
-
-      if (!result?.code) {
-        return null;
-      }
-
-      return {
-        code: result.code,
-      };
-    },
-  };
-}
-
 export default defineConfig({
-  plugins: [decoratorsBabelPlugin()],
+  plugins: [createDecoratorsPlugin()],
   test: {
     environment: 'node',
     globals: false,

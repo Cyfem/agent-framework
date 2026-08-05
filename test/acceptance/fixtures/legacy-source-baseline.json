@@ -1,0 +1,313 @@
+{
+  "schema": "subagent-v2-legacy-source-baseline/v1",
+  "scanRoots": ["packages/core", "demo"],
+  "rules": [
+    "v1-sub-agents-option",
+    "v1-agent-constructor",
+    "v1-runtime-sub-agent",
+    "v1-wire-agent-name",
+    "v1-wire-output-description"
+  ],
+  "entries": [
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "demo/src/ark-subagent.ts",
+      "lineDigest": "7f6deb3720b84a159bf7f7c9f449a911da61f62e90a0e4c89dd1c4fdf7154cec",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "demo/src/ark-subagent.ts",
+      "lineDigest": "f66c7399a949d3fd2a4c23e8dbb5352f156384e0bc52fb5368661c982bc53ae8",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "demo/src/ark-subagent.ts",
+      "lineDigest": "082fa53541ae4fa252d88a976e4ea1018cfe0f5516c73e2230cb72be8c1c29a2",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "demo/src/ark-subagent.ts",
+      "lineDigest": "149f4e2ee350f5420505bebbf2a7e77b36f12609dd0914ac2c70ffa416e1ade9",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "demo/src/ark-subagent.ts",
+      "lineDigest": "458fe2a522e4aafe86e029d10c0d889769e14901f27acbc7600af23b0939ce60",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "demo/src/ark-subagent.ts",
+      "lineDigest": "87269728418b544316d5cf1cf1239d82216509add40e76704750555c9acc36db",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "demo/src/complex.ts",
+      "lineDigest": "16aaae8d47f9a586ee7aa966d3f89c5bd7ae178967170d25104b81469948ece0",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "demo/src/complex.ts",
+      "lineDigest": "92b7d38a1dce647f6e2e8c68c98e5ca1a429b8b003c823e52c2b932a0b0a4cbb",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "demo/src/complex.ts",
+      "lineDigest": "92b7d38a1dce647f6e2e8c68c98e5ca1a429b8b003c823e52c2b932a0b0a4cbb",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "demo/src/feature-suite/ark-agent-plan.ts",
+      "lineDigest": "5aa93dadf8979dce9d0af1c75391c8c4283ea0008de09aa93ffafb4ecc1ca9a3",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "demo/src/feature-suite/ark-agent-plan.ts",
+      "lineDigest": "c682a185d6cd8c9822083a08f05ef9be70f9e5538bfd23228797404ffcb3bf84",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "demo/src/feature-suite/ark-agent-plan.ts",
+      "lineDigest": "f3fe075f728aada5280016091612be53a16ae71f66601e354a98fa9c4c0e9d18",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "demo/src/feature-suite/ark-agent-plan.ts",
+      "lineDigest": "5b9ef2882724c2d15ce23764c965af272208a1e066df339f42dad36cc47fece4",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "demo/src/main.ts",
+      "lineDigest": "0c92cd4dd2d167491398549bccd221f2efc3496bd3f1d3a1d7ccc3585f05bb08",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "demo/src/main.ts",
+      "lineDigest": "e8d6dec57fffdb176421edf107698e452e5107cdef49cf0c253d5c8a24b65823",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "demo/src/main.ts",
+      "lineDigest": "6b95ed0297e52350bb29bf188d4f10b98a0714f1efc2eb9b12015778cdbe1b1d",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "demo/src/main.ts",
+      "lineDigest": "f5b3348f9503c92bc40f251efec1604734c1fcde1230fecc37e0b1795039daff",
+      "count": 1
+    },
+    {
+      "rule": "v1-agent-constructor",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "290ac057fc741dbb1ecbe01bc32858027753ed056823a620cdc0e468ac25daf1",
+      "count": 1
+    },
+    {
+      "rule": "v1-agent-constructor",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "a378ebecf4d828fb52122103a054cb2d3fdbde01bca4755d4ab54f18cdb67f0c",
+      "count": 1
+    },
+    {
+      "rule": "v1-agent-constructor",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "d1c5878cd02a82231029b1016d795c96b717ba9d45fc3659446ec998d331a8c8",
+      "count": 1
+    },
+    {
+      "rule": "v1-agent-constructor",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "fd94fbe98443788edd8d42d3d2ad4587d0c751fb2caaf94490d6606c781efc00",
+      "count": 1
+    },
+    {
+      "rule": "v1-runtime-sub-agent",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "416108fc32d12350f5dc09fd1dfa8edfcd2feec9ec929096a277a481911c0e14",
+      "count": 1
+    },
+    {
+      "rule": "v1-runtime-sub-agent",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "c3f4fd1692d2afc486e8374d40e206af392d899f8f9c9163ec1194364285c9f6",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "198ae11bc78285ef9b291436790d69dbe0b5250c802ed21c7366304930479f11",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "38326df748f1d3bb2e7a7dec0a9dcbea14e16e5c951db862ae405b6cf155127b",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "5c77c97e9702416df0c19f385891db8683d235ddc281cbabc41b296d37d64151",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "6bef8a37547133bd1565798214ff31fa320e65b041d984047de60e8d50bd07d5",
+      "count": 2
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "89a1e718ce05a707dbe9752c5c7a9f32d53e969e63b8ba123652caa4b616f16d",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "9b6abae3ddd6f08b678482107cd6de689a5a5ea79bd73c553ce5c34778f8aa4a",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "a378ebecf4d828fb52122103a054cb2d3fdbde01bca4755d4ab54f18cdb67f0c",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "a837de4e12a57687f1c6238e8516e913dbaac596bf74cf550152466e38a14340",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "dfcbf0b32fea7cd2f805a39a12140a7eba0edb4f24f33d37ef8916a41a5c170b",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "edfadc90c5b7440a0ad0677e5762938cda798137afef135857b4624af8bd2fe4",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "0d6c533390574ea1162b23b424eb8d565e3c8d62cee19e8171c83f5458eb6c2f",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "198ae11bc78285ef9b291436790d69dbe0b5250c802ed21c7366304930479f11",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "20f5402ad641d5da144b798318f245408340326afebb1c4cf1b9652a8a38c8fc",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "a2212278d41211a7ddad30014d80669bd61dee9d2ca2a2c7aa3b02df59781b33",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "b355e1656e8146f65ba85e78f0e1d6ab71a4b6a674b924cd49ad545a31466002",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-agent-name",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "ffa1f4fb9b55a638e82c1523343a7ad10bf7cbea1024fc979c96bd8b0a89257f",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "0d6c533390574ea1162b23b424eb8d565e3c8d62cee19e8171c83f5458eb6c2f",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "259f3f006e935076fb0316fb57fd5c8c0636879084d117834ae838a3d0b7be7c",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "3c94c0d6f64ffc1e3bd4a70b991bfef60119148762a07488d8385fe885e7bdc7",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "4a1e0d8f2e98499e62924942b26fd377df80a79eaec2d78d59ebee3a730b06d4",
+      "count": 1
+    },
+    {
+      "rule": "v1-wire-output-description",
+      "path": "packages/core/src/agent/index.ts",
+      "lineDigest": "c97197461cf819fa8a2e5e776dd7ea5476a086db36614d76a9ec35788e63ed28",
+      "count": 1
+    },
+    {
+      "rule": "v1-agent-constructor",
+      "path": "packages/core/src/agent/types.ts",
+      "lineDigest": "42e0b4d483bb8b661e9509a9f207c2e3f7d1bbd65d6b6355a027377956743b08",
+      "count": 1
+    },
+    {
+      "rule": "v1-agent-constructor",
+      "path": "packages/core/src/agent/types.ts",
+      "lineDigest": "ba237e0463a98cb7c6343509f14e24ea4513bad8efeaffc9284be23de78badf1",
+      "count": 1
+    },
+    {
+      "rule": "v1-agent-constructor",
+      "path": "packages/core/src/agent/types.ts",
+      "lineDigest": "c802e04a2ad57da680a34c2913c79a6ad4d69513003c041225eeaf50282e725e",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/types.ts",
+      "lineDigest": "713fbf9f19ad57be9e9b1400d7b2c804c5b4116a3f70555853a94336e94bc7ad",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/types.ts",
+      "lineDigest": "ba237e0463a98cb7c6343509f14e24ea4513bad8efeaffc9284be23de78badf1",
+      "count": 1
+    },
+    {
+      "rule": "v1-sub-agents-option",
+      "path": "packages/core/src/agent/types.ts",
+      "lineDigest": "c802e04a2ad57da680a34c2913c79a6ad4d69513003c041225eeaf50282e725e",
+      "count": 1
+    }
+  ]
+}

@@ -57,7 +57,7 @@ importers:
   demo:
     dependencies:
       '@manee/agent-framework':
-        specifier: link:../packages/core
+        specifier: workspace:@ruixutong.manee/maneeagent-framework@*
         version: link:../packages/core
       '@types/pngjs':
         specifier: ^6.0.5

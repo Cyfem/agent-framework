@@ -3,6 +3,7 @@ dist/
 coverage/
 .vite/
 .artifacts/
+.tools/
 demo/electron-weixin/.electron/
 plans/*
 !plans/subagent-v2-production-runtime/
