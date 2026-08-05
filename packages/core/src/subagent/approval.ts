@@ -24,6 +24,7 @@ export interface ApprovalDecision {
 /** Durable exactly-once record of one host approval decision or atomic expiry. */
 export interface ApprovalDecisionRecord {
   readonly approvalId: string;
+  readonly callId: string;
   readonly expectedRevision: number;
   readonly decision: ApprovalDecision['decision'] | 'expired';
   readonly reason?: string;

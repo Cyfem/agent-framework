@@ -295,6 +295,7 @@ describe('Subagent v2 pure state machine', () => {
     });
     expect(expired.decision.decision).toBe('expired');
     expect(expired.task.approvalDecisions).toEqual([expired.decision]);
+    expect(expired.decision.callId).toBe('safe-tool');
     expectCode(
       () =>
         decideApproval(waiting, {

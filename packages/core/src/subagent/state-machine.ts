@@ -555,6 +555,7 @@ export function decideApproval(
 
   const record: Readonly<ApprovalDecisionRecord> = Object.freeze({
     approvalId: requested.approvalId,
+    callId: request.callId,
     expectedRevision: requested.expectedRevision,
     decision: committedDecision,
     ...(requested.reason === undefined ? {} : { reason: requested.reason }),
