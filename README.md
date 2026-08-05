@@ -89,6 +89,7 @@ console.log(context);
 | `packages/core`        | 唯一发布到 npm 的核心库，输出 ESM、CJS 和 TypeScript 声明。 |
 | `demo/src`             | CLI 示例、离线回归、真实方舟调用、金融新闻和 Windows 工具。 |
 | `demo/electron-weixin` | Windows Electron 微信消息示例。                             |
+| `plans`                | 尚未实现的架构与技术改造方案；不能视为当前公共 API。        |
 
 核心包没有 `bin` CLI；下文命令都是本仓库的 pnpm workspace scripts。demo 源码中的 `@manee/agent-framework` 是指向 `packages/core` 的本地 link alias，不是 npm 发布名。
 
@@ -227,3 +228,5 @@ const agent = new Agent({
 ## 更多文档
 
 核心 API、事件、上下文、Skills、子代理、Responses/Chat 适配和自定义 Model 的完整说明见 [`packages/core/README.md`](./packages/core/README.md)。
+
+Subagent v2 的生产运行时改造仍处于设计阶段，范围与分期见 [`plans/subagent-v2-production-runtime/PLAN.md`](./plans/subagent-v2-production-runtime/PLAN.md)，接口、状态机和文件级改造见 [`TECHNICAL_CHANGES.md`](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md)，离线、故障注入与真实方舟 Agent Plan 的完整门禁见 [`TEST_ACCEPTANCE_PLAN.md`](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)。其中内容不代表当前版本已经实现。

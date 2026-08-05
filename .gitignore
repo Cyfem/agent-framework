@@ -4,7 +4,9 @@ coverage/
 .vite/
 .artifacts/
 demo/electron-weixin/.electron/
-plans/
+plans/*
+!plans/subagent-v2-production-runtime/
+!plans/subagent-v2-production-runtime/*.md
 demo/.env
 *.log
 .DS_Store

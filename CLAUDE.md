@@ -6,6 +6,7 @@
 
 - 开始工作前先阅读 [README.md](./README.md)，了解仓库结构、跨项目关系、开发命令与运行风险。
 - 核心框架改动继续阅读 [packages/core/README.md](./packages/core/README.md)；demo、真实模型或桌面集成改动继续阅读 [demo/README.md](./demo/README.md)。
+- Subagent v2 改造继续阅读尚未实现的 [PLAN.md](./plans/subagent-v2-production-runtime/PLAN.md)、[TECHNICAL_CHANGES.md](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md) 与 [TEST_ACCEPTANCE_PLAN.md](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)，不要把计划接口或验收命令当成当前能力。
 
 ## Documentation Maintenance
 
