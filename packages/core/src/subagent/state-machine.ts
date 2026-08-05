@@ -42,7 +42,13 @@ const TERMINAL_STATE_SET = new Set<SubAgentTaskState>(TERMINAL_SUBAGENT_TASK_STA
 
 const LEGAL_TRANSITIONS: Readonly<Record<SubAgentTaskState, ReadonlySet<SubAgentTaskState>>> =
   Object.freeze({
-    queued: new Set<SubAgentTaskState>(['running', 'cancelled', 'timed_out', 'budget_exceeded']),
+    queued: new Set<SubAgentTaskState>([
+      'running',
+      'failed',
+      'cancelled',
+      'timed_out',
+      'budget_exceeded',
+    ]),
     running: new Set<SubAgentTaskState>([
       'waiting_approval',
       'result_submitted',
@@ -727,6 +733,7 @@ const SAFE_EVENT_DATA_KEYS = new Set([
   'durationMs',
   'checkpointRevision',
   'usage',
+  'outcomeUnknown',
 ]);
 const SAFE_USAGE_KEYS = new Set(['turns', 'providerCalls', 'inputTokens', 'outputTokens', 'cost']);
 

@@ -17,6 +17,7 @@ import type {
   ModelErrorDescriptor,
   ToolPayloadReplacements,
 } from '../../agent/types';
+import { createAbortScope, throwIfAborted } from '../base/abort';
 import { Model, type ModelGenerateRequest, type ModelGenerateResult } from '../base';
 import { classifyOpenAICompatibleError } from '../openai-error';
 import { toOpenAIToolParameters } from '../openai-schema';
@@ -85,13 +86,26 @@ export class OpenAIChatModel extends Model<OpenAIChatProtocol> {
       params.tools = request.tools as unknown as ChatCompletionTool[];
     }
 
-    const response = await this.#openai.chat.completions.create(params);
-    const message = response.choices[0]?.message;
+    throwIfAborted(request.signal, request.deadlineAt);
+    const deadlineScope =
+      request.signal === undefined && request.deadlineAt !== undefined
+        ? createAbortScope(undefined, request.deadlineAt)
+        : undefined;
+    const signal = request.signal ?? deadlineScope?.signal;
 
-    return {
-      messages: message ? [message as unknown as OpenAIChatContext] : [],
-      raw: response,
-    };
+    try {
+      const response = signal
+        ? await this.#openai.chat.completions.create(params, { signal })
+        : await this.#openai.chat.completions.create(params);
+      const message = response.choices[0]?.message;
+
+      return {
+        messages: message ? [message as unknown as OpenAIChatContext] : [],
+        raw: response,
+      };
+    } finally {
+      deadlineScope?.dispose();
+    }
   }
 
   /**

@@ -227,6 +227,101 @@
       ]
     },
     {
+      "requirementId": "C4-CATALOG-ROUTER",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["active-recovery", "catalog-refresh", "oneof-zod"],
+      "cases": [
+        {
+          "caseId": "DEF-02.l1.catalog",
+          "variant": "active-recovery",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-catalog.test.ts",
+            "testName": "[acceptance:DEF-02.l1.catalog][variant:active-recovery]"
+          }
+        },
+        {
+          "caseId": "EXE-04.l1.no-fallback",
+          "variant": "catalog-refresh",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-catalog.test.ts",
+            "testName": "[acceptance:EXE-04.l1.no-fallback][variant:catalog-refresh]"
+          }
+        },
+        {
+          "caseId": "API-02.l1.dynamic-wire",
+          "variant": "oneof-zod",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-model-tool-schema.test.ts",
+            "testName": "[acceptance:API-02.l1.dynamic-wire][variant:oneof-zod]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C4-RUNTIME",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["typed-result", "approval-resume", "attempt-fencing", "outcome-unknown"],
+      "cases": [
+        {
+          "caseId": "RUNTIME-01.l1.execute",
+          "variant": "typed-result",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime.test.ts",
+            "testName": "[acceptance:RUNTIME-01.l1.execute][variant:typed-result]"
+          }
+        },
+        {
+          "caseId": "APP-01.l1.resume",
+          "variant": "approval-resume",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime.test.ts",
+            "testName": "[acceptance:APP-01.l1.resume][variant:approval-resume]"
+          }
+        },
+        {
+          "caseId": "REC-01.l1.attempt-fencing",
+          "variant": "attempt-fencing",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime-adversarial.test.ts",
+            "testName": "[acceptance:REC-01.l1.attempt-fencing][variant:attempt-fencing]"
+          }
+        },
+        {
+          "caseId": "ERR-01.l1.outcome-unknown",
+          "variant": "outcome-unknown",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime-adversarial.test.ts",
+            "testName": "[acceptance:ERR-01.l1.outcome-unknown][variant:outcome-unknown]"
+          }
+        }
+      ]
+    },
+    {
       "requirementId": "PHASE-1",
       "status": "planned",
       "phase": "phase-1",

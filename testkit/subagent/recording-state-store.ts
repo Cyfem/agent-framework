@@ -1,5 +1,6 @@
 import {
   isTerminalSubAgentTaskState,
+  StateLeaseUnavailableError,
   SubAgentRuntimeError,
   type AgentRuntimeStateStore,
   type AgentRuntimeStateTransaction,
@@ -197,7 +198,7 @@ export class RecordingRuntimeStateStore implements AgentRuntimeStateStore {
     const now = this.#now();
     const current = this.#leases.get(key);
     if (current && !current.released && now < current.expiresAt) {
-      throw new Error(`Lease ${key} is already held.`);
+      throw new StateLeaseUnavailableError(key);
     }
 
     const fencingToken = (current?.fencingToken ?? 0n) + 1n;

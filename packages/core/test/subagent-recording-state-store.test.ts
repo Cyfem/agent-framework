@@ -208,7 +208,7 @@ describe('RecordingRuntimeStateStore', () => {
     const store = new RecordingRuntimeStateStore({ now: clock.now });
     const first = await store.acquireLease('owner-1', 100);
     expect(first.fencingToken).toBe('1');
-    await expect(store.acquireLease('owner-1', 100)).rejects.toThrow(/already held/iu);
+    await expect(store.acquireLease('owner-1', 100)).rejects.toThrow(/currently unavailable/iu);
 
     clock.advanceTo(5_099);
     const renewed = await first.renew(100);

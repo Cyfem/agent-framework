@@ -18,7 +18,12 @@ import type {
 } from '../../agent/types';
 import type { ModelGenerateRequest, ModelGenerateResult } from './types';
 
-export type { ModelGeneratePurpose, ModelGenerateRequest, ModelGenerateResult } from './types';
+export type {
+  ModelGeneratePurpose,
+  ModelGenerateRequest,
+  ModelGenerateResult,
+  ModelRuntimeMetadata,
+} from './types';
 
 /**
  * Agent 使用的协议适配器抽象基类。

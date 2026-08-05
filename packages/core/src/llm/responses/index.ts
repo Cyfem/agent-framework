@@ -20,6 +20,7 @@ import type {
   ModelErrorDescriptor,
   ToolPayloadReplacements,
 } from '../../agent/types';
+import { createAbortScope, throwIfAborted } from '../base/abort';
 import { Model, type ModelGenerateRequest, type ModelGenerateResult } from '../base';
 import { classifyOpenAICompatibleError } from '../openai-error';
 import { toOpenAIToolParameters } from '../openai-schema';
@@ -89,12 +90,25 @@ export class OpenAIResponsesModel extends Model<OpenAIResponsesProtocol> {
       params.tools = request.tools as unknown as ResponseTool[];
     }
 
-    const response = await this.#openai.responses.create(params);
+    throwIfAborted(request.signal, request.deadlineAt);
+    const deadlineScope =
+      request.signal === undefined && request.deadlineAt !== undefined
+        ? createAbortScope(undefined, request.deadlineAt)
+        : undefined;
+    const signal = request.signal ?? deadlineScope?.signal;
 
-    return {
-      messages: response.output as unknown as readonly OpenAIResponsesContext[],
-      raw: response,
-    };
+    try {
+      const response = signal
+        ? await this.#openai.responses.create(params, { signal })
+        : await this.#openai.responses.create(params);
+
+      return {
+        messages: response.output as unknown as readonly OpenAIResponsesContext[],
+        raw: response,
+      };
+    } finally {
+      deadlineScope?.dispose();
+    }
   }
 
   /**

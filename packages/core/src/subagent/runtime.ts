@@ -6,7 +6,7 @@ import type {
   ExecutorCatalogSnapshot,
   SubAgentCatalogEntry,
 } from './catalog';
-import type { SubAgentDefinition } from './definition';
+import type { SubAgentDefinitionRegistration } from './definition';
 import type { SubAgentExecutor } from './executor';
 import type { SubAgentSessionSnapshot, SubAgentTaskSnapshot } from './identity';
 import type { JsonValue } from './json';
@@ -30,6 +30,7 @@ export interface SubAgentDispatchContext {
   readonly parentTaskId?: string;
   readonly parentContext: readonly unknown[];
   readonly parentRawHistory: readonly unknown[];
+  readonly stream?: boolean;
   readonly signal: AbortSignal;
   readonly deadlineAt?: number;
 }
@@ -42,6 +43,7 @@ export interface SubAgentExecuteRequest<
   readonly requestId: string;
   readonly parentTaskId?: string;
   readonly retryOf?: string;
+  readonly stream?: boolean;
   readonly parentContext?: readonly unknown[];
   readonly parentRawHistory?: readonly unknown[];
   readonly signal?: AbortSignal;
@@ -81,8 +83,8 @@ export interface SubAgentTaskHandle {
 
 export interface SubAgentRuntimeOptions {
   readonly sessionId: string;
-  readonly activeDefinitions: readonly SubAgentDefinition[];
-  readonly recoveryDefinitions?: readonly SubAgentDefinition[];
+  readonly activeDefinitions: readonly SubAgentDefinitionRegistration[];
+  readonly recoveryDefinitions?: readonly SubAgentDefinitionRegistration[];
   readonly executors: readonly SubAgentExecutor[];
   readonly stateStore: AgentRuntimeStateStore;
   readonly artifactStore?: ArtifactStore;

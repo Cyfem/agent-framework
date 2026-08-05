@@ -16,6 +16,7 @@ export interface SafeEventData {
   readonly durationMs?: number;
   readonly checkpointRevision?: number;
   readonly usage?: SubAgentUsage;
+  readonly outcomeUnknown?: boolean;
 }
 
 export type SubAgentTaskEventType =

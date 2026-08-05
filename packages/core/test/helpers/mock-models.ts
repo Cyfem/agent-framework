@@ -98,6 +98,9 @@ export class MockModel extends Model<TestProtocol> {
       context: [...request.context],
       tools: [...request.tools],
       ...('purpose' in request ? { purpose: request.purpose } : {}),
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+      ...(request.deadlineAt === undefined ? {} : { deadlineAt: request.deadlineAt }),
+      ...(request.runtime === undefined ? {} : { runtime: { ...request.runtime } }),
     };
     this.requests.push(requestSnapshot);
 

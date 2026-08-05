@@ -3,6 +3,17 @@ import type { AgentProtocol, ContextOf, ToolOf } from '../../agent/types';
 /** 区分普通 Agent 调用与框架内部摘要调用。 */
 export type ModelGeneratePurpose = 'agent' | 'context-summary';
 
+/** Framework-owned identity and attempt metadata; adapters must not copy it into provider bodies. */
+export interface ModelRuntimeMetadata {
+  readonly sessionId?: string;
+  readonly runId?: string;
+  readonly taskId?: string;
+  /** Zero-based logical Agent loop iteration. */
+  readonly iteration?: number;
+  /** One-based request attempt within model error recovery. */
+  readonly requestAttempt?: number;
+}
+
 /** Model 执行一轮模型调用时接收的协议上下文与工具。 */
 export interface ModelGenerateRequest<P extends AgentProtocol> {
   /** 已由 Model builder 构建好的协议上下文，包含临时 system prompt 与持久历史。 */
@@ -14,6 +25,12 @@ export interface ModelGenerateRequest<P extends AgentProtocol> {
    * `context-summary`。
    */
   purpose?: ModelGeneratePurpose;
+  /** Cooperative cancellation shared by Model, Tool, summary and recovery work. */
+  signal?: AbortSignal;
+  /** Absolute Unix-epoch deadline in milliseconds. */
+  deadlineAt?: number;
+  /** Host-only runtime metadata. Protocol adapters must not serialize it into provider payloads. */
+  runtime?: Readonly<ModelRuntimeMetadata>;
 }
 
 /** Model 执行一轮模型调用后返回的协议消息与可选完整响应。 */

@@ -79,7 +79,7 @@ export interface SubAgentExecutionRequest<I extends JsonValue = JsonValue> {
 /** Exactly-once result publication and terminal completion controller. */
 export interface SubAgentCompletionController {
   submitResult(callId: string, candidate: JsonValue): Promise<ResultReceipt>;
-  complete(callId: string): Promise<CompletionReceipt>;
+  complete(callId: string, proof: { readonly isStandalone: boolean }): Promise<CompletionReceipt>;
 }
 
 /** Task-scoped capabilities exposed to a trusted child runner. */

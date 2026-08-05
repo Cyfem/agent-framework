@@ -226,6 +226,8 @@ unsubscribe();
 
 `before` listener 如果希望异步异常取消真实工具调用，必须同时设置 `{ await: true, errorCancel: true }`。`after` listener 异常只会上报，不会中断 Agent 主循环。
 
+`agent(input, options)` 与 `toolCall(call, options)` 可接收 `signal`、绝对 Unix 毫秒时间戳 `deadlineAt` 和只在宿主内部传播的 `runtime` identity。同一 run 的 Model、Tool、摘要、payload compactor、listener 和 model-error recovery 共用取消链路；取消/超时不会进入普通模型错误分类与 retry。声明两个参数的 Tool handler 会收到第二个 `ToolRuntimeContext`，其中包含当前 call、signal、deadline 和可选的 session/run/task identity；单参数 handler 保持原调用方式。自定义异步实现必须协作式监听 signal，框架不能强制终止任意第三方 Promise。
+
 ## 上下文与历史
 
 Agent 维护两份上下文：
@@ -506,7 +508,7 @@ Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL
 
 `addSkill()` 只修改 configured sources。非运行状态下会立即使 Agent 回到未初始化；运行中添加只标记 dirty，当前 run 继续使用旧 snapshot。两种情况都必须在下一次运行前重新 `init()`，新 Skill 才会生效。父 Agent 的 Skill 和 runtime 配置不会自动传播给动态子代理。
 
-## Subagent v2 contracts 与持久状态域（C2–C3）
+## Subagent v2 Core Runtime（C2–C4）
 
 当前 workspace 版本为 `2.0.0`，包根已导出下列协议无关 contracts，供后续 Runtime 和独立 Executor 包实现：
 
@@ -520,10 +522,13 @@ Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL
 - 纯任务状态机：终态不可逆、首个合法 revision/fencing CAS 胜出、JCS result receipt、持久 completion receipt、严格 approval 过期边界、树级 budget 与安全事件序列。
 - `commitRuntimeStateMutation()`：用声明式 plan 在同一 StateStore transaction 中提交 root run、child task 与事件；事务 callback 不向调用者开放，内部只等待 transaction-local Store 操作。
 - `createStoredTaskIdempotently()`：在最终写入点执行 transaction-local 幂等 lookup/create，关闭并发 create 竞态。
+- `SubAgentDefinitionRegistry` 与 `SubAgentExecutorRegistry`：区分 active/recovery-only definition，`init()` 冻结 `supports()`，仅 `refreshCatalog()` 更新 availability revision；allowlist、capability 与 availability 取保守交集。
+- `createModelSubAgentToolDefinition()`：只在非空目录时生成模型工具，wire 精确为 `{ subAgent, executor, input }`，JSON schema 使用根 object 与 `oneOf`，空目录时返回 `null`。
+- `createSubAgentRuntime()`：同步构造、异步 `init()`，支持无 fallback 的显式 placement、run-scope 幂等 create、树级 limits/budget、typed result、standalone completion、后台 handle、session guard、审批 open-loop resume、Host-only retry、取消、事件 cursor 与精确版本恢复。
 
 `ModelSubAgentRequest` 的公开字段精确为 `{ subAgent, executor, input }`。task/session/binding/retry/approval 等 host metadata 不属于模型 wire。`ArtifactReference` 也只包含版本、opaque ID、media type、大小和 SHA-256，不含路径、URL 或凭据。
 
-当前仍未实现 `createSubAgentRuntime()`、Catalog/Router、官方 Local Executor 与 v2 Agent loop 接线。C3 的状态函数和控制器已经可单独使用并由离线测试覆盖，但还不是完整的子代理执行入口。在 C6 原子切换前，下方现有 `AgentOptions.subAgents` 说明仍对应当前可运行的迁移前 Agent loop，不是 v2 兼容层承诺。
+当前仍未实现官方 Local Executor、父 Agent batch checkpoint/恢复与 v2 Agent loop 接线。C4 Runtime 已可由自定义 StateStore/Executor 独立使用，但还不会替换下方迁移前 `AgentOptions.subAgents` 路径。在 C6 原子切换前，下方说明仍对应当前可运行的迁移前 Agent loop，不是 v2 兼容层承诺。
 
 ## 子代理（迁移前 Agent loop）
 

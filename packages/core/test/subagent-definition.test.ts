@@ -3,7 +3,7 @@ import { acceptanceIt } from '../../../testkit';
 import { z } from 'zod';
 
 import { assertArtifactReference, DEFAULT_ARTIFACT_LIMITS } from '../src/subagent/artifact';
-import { defineSubAgent } from '../src/subagent/definition';
+import { defineSubAgent, type SubAgentDefinitionRegistration } from '../src/subagent/definition';
 import {
   DEFAULT_SUBAGENT_IO_LIMITS,
   DEFAULT_SUBAGENT_LIMITS,
@@ -12,6 +12,20 @@ import {
 } from '../src/subagent/limits';
 
 describe('defineSubAgent', () => {
+  it('preserves a typed definition while accepting it in a heterogeneous runtime catalog', () => {
+    const typed = defineSubAgent({
+      name: 'typed-reviewer',
+      version: '2',
+      description: 'Typed registration variance proof.',
+      inputSchema: z.object({ text: z.string() }),
+      outputSchema: z.object({ score: z.number() }),
+      contextProjector: ({ input }) => [{ kind: 'text', name: 'source', text: input.text }],
+    });
+    const registrations: readonly SubAgentDefinitionRegistration[] = [typed];
+
+    expect(registrations[0]?.name).toBe('typed-reviewer');
+  });
+
   it('snapshots and freezes policy arrays without freezing caller schemas', () => {
     const inputSchema = z.object({ topic: z.string() });
     const outputSchema = z.object({ answer: z.string() });

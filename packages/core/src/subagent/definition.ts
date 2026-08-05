@@ -48,6 +48,12 @@ export type SubAgentContextProjector<I extends JsonValue = JsonValue> = (
   input: SubAgentContextProjectionInput<I>,
 ) => readonly SubAgentContextItem[] | Promise<readonly SubAgentContextItem[]>;
 
+type RegisteredContextProjector = {
+  bivarianceHack(
+    input: SubAgentContextProjectionInput<JsonValue>,
+  ): readonly SubAgentContextItem[] | Promise<readonly SubAgentContextItem[]>;
+}['bivarianceHack'];
+
 export interface SubAgentDefinition<
   I extends JsonValue = JsonValue,
   O extends JsonValue = JsonValue,
@@ -64,6 +70,19 @@ export interface SubAgentDefinition<
         readonly definitions: readonly string[];
         readonly allowSelf?: boolean;
       };
+}
+
+/**
+ * Existential registration shape accepted by a Runtime. It preserves typed definitions at their
+ * declaration site while intentionally erasing schema parameters inside the heterogeneous catalog.
+ */
+export interface SubAgentDefinitionRegistration extends SubAgentDefinitionRef {
+  readonly description: string;
+  readonly inputSchema: z.ZodTypeAny;
+  readonly outputSchema: z.ZodTypeAny;
+  readonly executorPolicy?: SubAgentExecutorPolicy;
+  readonly contextProjector?: RegisteredContextProjector;
+  readonly delegation?: SubAgentDefinition['delegation'];
 }
 
 /** Validates and snapshots host-owned definition policy without mutating or freezing Zod schemas. */

@@ -1,5 +1,10 @@
 export { Model } from './base';
-export type { ModelGeneratePurpose, ModelGenerateRequest, ModelGenerateResult } from './base';
+export type {
+  ModelGeneratePurpose,
+  ModelGenerateRequest,
+  ModelGenerateResult,
+  ModelRuntimeMetadata,
+} from './base';
 export { OpenAIChatModel } from './chat';
 export type {
   OpenAIChatContext,

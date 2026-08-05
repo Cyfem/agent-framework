@@ -7,7 +7,7 @@
 - 开始工作前先阅读 [README.md](./README.md)，了解仓库结构、跨项目关系、开发命令与运行风险。
 - 核心框架改动继续阅读 [packages/core/README.md](./packages/core/README.md)；demo、真实模型或桌面集成改动继续阅读 [demo/README.md](./demo/README.md)。
 - Subagent v2 改造继续阅读分批实施中的 [PLAN.md](./plans/subagent-v2-production-runtime/PLAN.md)、[TECHNICAL_CHANGES.md](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md) 与 [TEST_ACCEPTANCE_PLAN.md](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)；区分目标设计与源码、测试、README 已证明的当前能力。
-- 当前源码已完成 C3 持久状态域；Catalog/Router、Executor 和 Agent v2 接线尚未完成，不能把 plans 中的目标 API 当作当前行为。
+- 当前源码已完成 C4 Core Runtime、Catalog/Router 与全链路取消；官方 Executor 和 Agent v2 接线尚未完成，不能把 plans 中的目标 API 当作当前行为。
 
 ## Documentation Maintenance
 

@@ -1,4 +1,5 @@
 import type { Model } from '../llm/base';
+import { awaitWithAbort, throwIfAborted } from '../llm/base/abort';
 import type { ModelGenerateRequest, ModelGenerateResult } from '../llm/base/types';
 import {
   ContextStore,
@@ -95,7 +96,9 @@ export async function rewriteOpenLoopToolPayloads<P extends AgentProtocol>(input
   readonly snapshot: OpenLoopSnapshot<P>;
   readonly records: readonly ToolExecutionRecord<P>[];
   readonly compactors: ResolvedContextCompactOptions<P>;
+  readonly signal?: AbortSignal;
 }): Promise<readonly ContextOf<P>[]> {
+  throwIfAborted(input.signal);
   const inputs: ToolPayloadReplacements<P>['inputs'][number][] = [];
   const results: ToolPayloadReplacements<P>['results'][number][] = [];
 
@@ -113,6 +116,7 @@ export async function rewriteOpenLoopToolPayloads<P extends AgentProtocol>(input
         iteration: input.iteration,
         call: callSnapshot,
       }),
+      input.signal,
     );
 
     if (compactedInput !== undefined && compactedInput !== record.originalInput) {
@@ -132,6 +136,7 @@ export async function rewriteOpenLoopToolPayloads<P extends AgentProtocol>(input
             iteration: input.iteration,
             call: callSnapshot,
           }),
+          input.signal,
         )
       : undefined;
 
@@ -155,6 +160,7 @@ export async function rewriteOpenLoopToolPayloads<P extends AgentProtocol>(input
   const targetIndexes = findTargetIndexes(input.snapshot.activeContext, replacements);
   const rewritten = input.model.rewriteToolPayloads(input.snapshot.activeContext, replacements);
 
+  throwIfAborted(input.signal);
   validateRewrittenContext(input.snapshot.activeContext, rewritten, targetIndexes);
   return rewritten;
 }
@@ -173,6 +179,7 @@ export async function runSummaryCompactTransaction<P extends AgentProtocol>(inpu
   readonly defaultSelectionCaptured?: boolean;
   readonly generate: (request: ModelGenerateRequest<P>) => Promise<ModelGenerateResult<P>>;
 }): Promise<boolean> {
+  throwIfAborted(input.pendingRequest.signal, input.pendingRequest.deadlineAt);
   const storeSnapshot = input.storeSnapshot ?? input.store.getSummarySnapshot();
   const publicSnapshot = createSummaryCompactSnapshot({
     storeSnapshot,
@@ -186,7 +193,12 @@ export async function runSummaryCompactTransaction<P extends AgentProtocol>(inpu
       : input.store.getDefaultSummarySelection(
           input.cause.type === 'trigger' ? 'trigger' : 'context_length_exceeded',
         );
-  const customSelection = await input.policy.select?.(publicSnapshot);
+  const customSelection = input.policy.select
+    ? await awaitWithAbort(
+        Promise.resolve(input.policy.select(publicSnapshot)),
+        input.pendingRequest.signal,
+      )
+    : undefined;
   const selected = customSelection ?? defaultSelection;
 
   if (!selected || selected.contextToSummarize.length === 0) {
@@ -198,7 +210,12 @@ export async function runSummaryCompactTransaction<P extends AgentProtocol>(inpu
     ...publicSnapshot,
     selection,
   });
-  const prompt = (await input.policy.prompt(promptSnapshot)).trim();
+  const prompt = (
+    await awaitWithAbort(
+      Promise.resolve(input.policy.prompt(promptSnapshot)),
+      input.pendingRequest.signal,
+    )
+  ).trim();
 
   if (prompt.length === 0) {
     throw new Error('Summary compact prompt must not be empty.');
@@ -213,8 +230,18 @@ export async function runSummaryCompactTransaction<P extends AgentProtocol>(inpu
       ...selection.contextToSummarize,
       input.model.buildUserMessage({ content: [{ type: 'text', text: prompt }] }),
     ],
+    ...(input.pendingRequest.signal === undefined ? {} : { signal: input.pendingRequest.signal }),
+    ...(input.pendingRequest.deadlineAt === undefined
+      ? {}
+      : { deadlineAt: input.pendingRequest.deadlineAt }),
+    ...(input.pendingRequest.runtime === undefined
+      ? {}
+      : { runtime: input.pendingRequest.runtime }),
   };
-  const response = await input.generate(summaryRequest);
+  const response = await awaitWithAbort(
+    input.generate(summaryRequest),
+    input.pendingRequest.signal,
+  );
 
   if (input.model.parseToolCalls(response.messages).length > 0) {
     throw new Error('Summary response must not contain tool calls.');
@@ -249,7 +276,10 @@ export async function runSummaryCompactTransaction<P extends AgentProtocol>(inpu
       summaryMessage,
       candidateActiveContext,
     });
-    const validation = await input.policy.validate(validationSnapshot);
+    const validation = await awaitWithAbort(
+      Promise.resolve(input.policy.validate(validationSnapshot)),
+      input.pendingRequest.signal,
+    );
 
     if (
       typeof validation !== 'object' ||
@@ -267,6 +297,7 @@ export async function runSummaryCompactTransaction<P extends AgentProtocol>(inpu
     }
   }
 
+  throwIfAborted(input.pendingRequest.signal, input.pendingRequest.deadlineAt);
   input.store.commitSummary({
     revision: storeSnapshot.revision,
     summaryText: summary,
@@ -353,12 +384,14 @@ async function runCompactor(
   compactor: ResolvedToolPayloadCompactor,
   original: string,
   info: Parameters<ToolPayloadCompactor>[1],
+  signal?: AbortSignal,
 ): Promise<string | undefined> {
+  throwIfAborted(signal);
   if (compactor.source === 'disabled') {
     return undefined;
   }
 
-  const result = await compactor.compact(original, info);
+  const result = await awaitWithAbort(Promise.resolve(compactor.compact(original, info)), signal);
 
   if (result !== undefined && typeof result !== 'string') {
     throw new TypeError('Tool payload compactor must return a string or undefined.');

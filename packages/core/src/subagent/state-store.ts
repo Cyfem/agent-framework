@@ -120,6 +120,16 @@ export interface StateLease {
   release(): Promise<void>;
 }
 
+/** Retryable contention signal emitted when a non-expired lease is already owned elsewhere. */
+export class StateLeaseUnavailableError extends Error {
+  readonly code = 'STATE_LEASE_UNAVAILABLE';
+
+  constructor(readonly key: string) {
+    super(`State lease ${key} is currently unavailable.`);
+    this.name = 'StateLeaseUnavailableError';
+  }
+}
+
 /** Transaction-local API. Callbacks must not wait on Model, Tool, Executor or network I/O. */
 export interface AgentRuntimeStateTransaction {
   loadRun(runId: string): Promise<StoredAgentRun | undefined>;

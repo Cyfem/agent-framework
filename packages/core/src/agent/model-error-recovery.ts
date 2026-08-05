@@ -1,4 +1,5 @@
 import type { Model } from '../llm/base';
+import { awaitWithAbort, isAbortError, throwIfAborted } from '../llm/base/abort';
 import type {
   ModelGeneratePurpose,
   ModelGenerateRequest,
@@ -173,12 +174,18 @@ export async function generateWithModelErrorRecovery<P extends AgentProtocol>(
   let hadRecoveryActivity = false;
 
   while (true) {
-    const request = options.buildRequest();
     ledger.requestAttempts += 1;
+    const request = withRequestAttempt(options.buildRequest(), ledger.requestAttempts);
+    throwIfAborted(request.signal, request.deadlineAt);
 
     try {
-      return await options.model.generate(request);
+      return await awaitWithAbort(options.model.generate(request), request.signal);
     } catch (cause) {
+      if (isAbortError(cause, request.signal)) {
+        throwIfAborted(request.signal, request.deadlineAt);
+        throw cause;
+      }
+
       if (!hasInitialError) {
         initialError = cause;
         hasInitialError = true;
@@ -243,8 +250,14 @@ export async function generateWithModelErrorRecovery<P extends AgentProtocol>(
             ...eventBase,
             defaultAction,
           },
+          request.signal,
         );
       } catch (hookFailure) {
+        if (isAbortError(hookFailure, request.signal)) {
+          throwIfAborted(request.signal, request.deadlineAt);
+          throw hookFailure;
+        }
+
         stageFailures.push({
           stage: 'before-hook',
           cause: hookFailure,
@@ -306,17 +319,25 @@ export async function generateWithModelErrorRecovery<P extends AgentProtocol>(
           hadRecoveryActivity = true;
 
           try {
-            const result = await options.runHandler(matchedHandler, {
-              cause,
-              descriptor,
-              request,
-              requestAttempt,
-            });
+            const result = await awaitWithAbort(
+              options.runHandler(matchedHandler, {
+                cause,
+                descriptor,
+                request,
+                requestAttempt,
+              }),
+              request.signal,
+            );
             handlerOutcome = result.outcome;
             proposedAction = result.outcome === 'succeeded' || forceHandler ? 'retry' : 'stop';
             proposedTerminalReason =
               result.outcome === 'succeeded' ? 'stopped' : 'handler-unavailable';
           } catch (failure) {
+            if (isAbortError(failure, request.signal)) {
+              throwIfAborted(request.signal, request.deadlineAt);
+              throw failure;
+            }
+
             handlerOutcome = 'failed';
             handlerFailure = failure;
             proposedAction = forceHandler ? 'retry' : 'stop';
@@ -363,8 +384,14 @@ export async function generateWithModelErrorRecovery<P extends AgentProtocol>(
         afterDecision = await aggregateAfterDecision(
           resolveListenerSnapshot(options.afterListeners),
           afterEvent,
+          request.signal,
         );
       } catch (hookFailure) {
+        if (isAbortError(hookFailure, request.signal)) {
+          throwIfAborted(request.signal, request.deadlineAt);
+          throw hookFailure;
+        }
+
         stageFailures.push({
           stage: 'after-hook',
           cause: hookFailure,
@@ -438,11 +465,12 @@ function resolveListenerSnapshot<T>(source: readonly T[] | (() => readonly T[]))
 async function aggregateBeforeDecision<P extends AgentProtocol>(
   listeners: readonly BeforeModelErrorRecoveryCallback<P>[],
   event: Parameters<BeforeModelErrorRecoveryCallback<P>>[0],
+  signal?: AbortSignal,
 ): Promise<BeforeModelErrorRecoveryDecision> {
   let finalDecision: BeforeModelErrorRecoveryDecision = 'default';
 
   for (const listener of [...listeners]) {
-    const decision = (await listener(event)) ?? 'default';
+    const decision = (await awaitWithAbort(Promise.resolve(listener(event)), signal)) ?? 'default';
 
     if (!isBeforeDecision(decision)) {
       throw new TypeError(`Invalid before model recovery decision: ${String(decision)}.`);
@@ -459,11 +487,12 @@ async function aggregateBeforeDecision<P extends AgentProtocol>(
 async function aggregateAfterDecision<P extends AgentProtocol>(
   listeners: readonly AfterModelErrorRecoveryCallback<P>[],
   event: Parameters<AfterModelErrorRecoveryCallback<P>>[0],
+  signal?: AbortSignal,
 ): Promise<AfterModelErrorRecoveryDecision> {
   let finalDecision: AfterModelErrorRecoveryDecision = 'default';
 
   for (const listener of [...listeners]) {
-    const decision = (await listener(event)) ?? 'default';
+    const decision = (await awaitWithAbort(Promise.resolve(listener(event)), signal)) ?? 'default';
 
     if (!isAfterDecision(decision)) {
       throw new TypeError(`Invalid after model recovery decision: ${String(decision)}.`);
@@ -475,6 +504,19 @@ async function aggregateAfterDecision<P extends AgentProtocol>(
   }
 
   return finalDecision;
+}
+
+function withRequestAttempt<P extends AgentProtocol>(
+  request: ModelGenerateRequest<P>,
+  requestAttempt: number,
+): ModelGenerateRequest<P> {
+  return {
+    ...request,
+    runtime: Object.freeze({
+      ...request.runtime,
+      requestAttempt,
+    }),
+  };
 }
 
 function isBeforeDecision(value: unknown): value is BeforeModelErrorRecoveryDecision {

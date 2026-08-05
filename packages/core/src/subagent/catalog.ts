@@ -46,10 +46,16 @@ export interface ExecutorCatalogPolicy {
   readonly requiredCapabilities?: ExecutorCapabilityRequirement;
 }
 
+/** Model-safe Executor metadata retained after conservative catalog filtering. */
+export interface SubAgentCatalogExecutorEntry extends SubAgentExecutorDescriptor {
+  readonly status: 'available' | 'degraded';
+  readonly reasonCode?: string;
+}
+
 /** Host catalog entry after availability, support, allowlist and capability intersection. */
 export interface SubAgentCatalogEntry<I extends JsonValue = JsonValue> {
   readonly definition: SubAgentDefinitionRef;
   readonly description: string;
   readonly inputSchema: z.ZodType<I>;
-  readonly executors: readonly SubAgentExecutorDescriptor[];
+  readonly executors: readonly SubAgentCatalogExecutorEntry[];
 }

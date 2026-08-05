@@ -2,6 +2,14 @@ import { z } from 'zod';
 
 import type { ModelGeneratePurpose, ModelGenerateRequest, ModelGenerateResult } from '../llm/base';
 import {
+  awaitWithAbort,
+  createAbortScope,
+  isAbortError,
+  throwIfAborted,
+  type AbortScope,
+} from '../llm/base/abort';
+import type { ToolRuntimeContext } from '../subagent/agent-run';
+import {
   createSummaryCompactSnapshot,
   hasToolPayloadCompactor,
   resolveContextCompactOptions,
@@ -38,6 +46,7 @@ import type {
   AfterToolCallCallback,
   AgentConstructor,
   AgentErrorCallback,
+  AgentExecutionOptions,
   AgentOptions,
   AgentProtocol,
   AgentSkillSource,
@@ -59,6 +68,7 @@ import type {
   ToolCallErrorCallback,
   ToolDefinition,
   ToolEventOptions,
+  ToolCallExecutionOptions,
   ToolRuntimeDefinition,
   Unsubscribe,
   UserMessageOf,
@@ -73,6 +83,15 @@ interface ToolEventListener<TCallback> {
 interface AgentStatusListener<P extends AgentProtocol> {
   status: AgentStatus;
   callback: AgentStatusChangedCallback<P>;
+}
+
+interface ActiveAgentExecution extends AbortScope {
+  readonly deadlineAt?: number;
+  readonly runtime?: AgentExecutionOptions['runtime'];
+}
+
+interface ResolvedAgentExecutionOptions extends AgentExecutionOptions {
+  readonly stream: boolean;
 }
 
 const beforeToolErrorPrefix = '函数调用的前置工作出现异常，异常为：';
@@ -178,7 +197,7 @@ export class Agent<P extends AgentProtocol> {
         .describe('需要让子代理最后交付你的东西的描述，比如任务的报告、问题的回答'),
     }),
   })
-  async #toolSubAgent(parameters: unknown): Promise<string> {
+  async #toolSubAgent(parameters: unknown, runtime: ToolRuntimeContext<P>): Promise<string> {
     // `agent` 工具的 handler 只接收一个参数对象，便于所有协议共用同一套调用约定。
     const { agentName, input, outputDescription } = parameters as {
       agentName: string;
@@ -225,7 +244,10 @@ export class Agent<P extends AgentProtocol> {
     });
 
     subAgent.init();
-    await subAgent.agent(input);
+    await subAgent.agent(input, {
+      signal: runtime.signal,
+      ...(runtime.deadlineAt === undefined ? {} : { deadlineAt: runtime.deadlineAt }),
+    });
 
     return agentResult ?? '子代理已结束但未通过 agent-result 汇报结果。';
   }
@@ -442,18 +464,25 @@ export class Agent<P extends AgentProtocol> {
    * 成功结果会先由 Model 构建并写入上下文，再触发 after listener，使 listener
    * 追加的消息排在对应工具结果之后。
    */
-  async toolCall(callInfo: AgentToolCall<P>): Promise<ContextOf<P>> {
+  async toolCall(
+    callInfo: AgentToolCall<P>,
+    options?: ToolCallExecutionOptions,
+  ): Promise<ContextOf<P>> {
     this.#assertInitialized();
+    const execution = createActiveAgentExecution(options);
     const standalone = !this.#contextStore.hasOpenLoopSpan;
     let record: ToolExecutionRecord<P>;
 
     try {
-      record = await this.#executeToolCallWithRecord(callInfo);
+      throwIfAborted(execution.signal, execution.deadlineAt);
+      record = await this.#executeToolCallWithRecord(callInfo, execution);
     } catch (error) {
       if (standalone) {
         this.#endRequested = false;
       }
       throw error;
+    } finally {
+      execution.dispose();
     }
 
     // standalone toolCall 没有 loop compact 阶段；只等待其 awaited listeners 后提交结束。
@@ -465,13 +494,18 @@ export class Agent<P extends AgentProtocol> {
     return record.resultMessage;
   }
 
-  async #executeToolCallWithRecord(callInfo: AgentToolCall<P>): Promise<ToolExecutionRecord<P>> {
+  async #executeToolCallWithRecord(
+    callInfo: AgentToolCall<P>,
+    execution: ActiveAgentExecution,
+  ): Promise<ToolExecutionRecord<P>> {
+    throwIfAborted(execution.signal, execution.deadlineAt);
     const tool = this.tools.find((candidate) => candidate.name === callInfo.name);
     const fallbackParameters: unknown = {};
 
     if (!tool) {
       const error = new Error(`Unknown tool: ${callInfo.name}`);
       await this.#emitToolCallError(callInfo.name, 'calling', error, fallbackParameters, callInfo);
+      throwIfAborted(execution.signal, execution.deadlineAt);
       return this.#createToolExecutionRecord(callInfo, normalizeErrorMessage(error), true);
     }
 
@@ -479,13 +513,20 @@ export class Agent<P extends AgentProtocol> {
       tool === this.#builtinSkillRuntimeDefinition ? this.#skillRuntime.compactResult : true;
 
     const parsedArguments = await this.#parseToolArguments(tool, callInfo);
+    throwIfAborted(execution.signal, execution.deadlineAt);
 
     if (!parsedArguments.ok) {
       return this.#createToolExecutionRecord(callInfo, parsedArguments.message, compactResult);
     }
 
     const parameters = parsedArguments.parameters;
-    const beforeResult = await this.#runBeforeToolListeners(tool.name, parameters, callInfo);
+    const beforeResult = await this.#runBeforeToolListeners(
+      tool.name,
+      parameters,
+      callInfo,
+      execution.signal,
+    );
+    throwIfAborted(execution.signal, execution.deadlineAt);
 
     if (beforeResult.canceled) {
       return this.#createToolExecutionRecord(
@@ -496,13 +537,31 @@ export class Agent<P extends AgentProtocol> {
     }
 
     let result: unknown;
+    const runtimeContext: ToolRuntimeContext<P> = Object.freeze({
+      ...execution.runtime,
+      call: callInfo,
+      signal: execution.signal,
+      ...(execution.deadlineAt === undefined ? {} : { deadlineAt: execution.deadlineAt }),
+    });
 
     try {
-      result = await tool.handler(parameters);
+      const handlerArguments =
+        tool.handler.length >= 2 ? [parameters, runtimeContext] : [parameters];
+      result = await awaitWithAbort(
+        Promise.resolve(Reflect.apply(tool.handler, tool, handlerArguments)),
+        execution.signal,
+      );
     } catch (error) {
+      if (isAbortError(error, execution.signal)) {
+        throwIfAborted(execution.signal, execution.deadlineAt);
+        throw error;
+      }
+
       await this.#emitToolCallError(tool.name, 'calling', error, parameters, callInfo);
       return this.#createToolExecutionRecord(callInfo, normalizeErrorMessage(error), compactResult);
     }
+
+    throwIfAborted(execution.signal, execution.deadlineAt);
 
     const record = this.#createToolExecutionRecord(
       callInfo,
@@ -510,7 +569,8 @@ export class Agent<P extends AgentProtocol> {
       compactResult,
     );
 
-    await this.#runAfterToolListeners(tool.name, parameters, callInfo, result);
+    await this.#runAfterToolListeners(tool.name, parameters, callInfo, result, execution.signal);
+    throwIfAborted(execution.signal, execution.deadlineAt);
 
     return record;
   }
@@ -522,20 +582,28 @@ export class Agent<P extends AgentProtocol> {
    * 只有内置 `end-agent` 工具把状态改为 `ended` 后任务才结束；当前版本
    * 尚不支持流式调用。
    */
-  async agent(input: string | UserMessageOf<P>, stream = false): Promise<ContextOf<P>[]> {
+  async agent(
+    input: string | UserMessageOf<P>,
+    streamOrOptions: boolean | AgentExecutionOptions = false,
+  ): Promise<ContextOf<P>[]> {
     let shouldFailOnError = true;
+    let execution: ActiveAgentExecution | undefined;
 
     try {
       this.#assertInitialized();
+      const options = normalizeAgentExecutionOptions(streamOrOptions);
 
       if (this.#status === 'running') {
         shouldFailOnError = false;
         throw new Error('Agent is already running.');
       }
 
-      if (stream) {
+      if (options.stream) {
         throw new Error('Agent streaming is not supported in this version.');
       }
+
+      execution = createActiveAgentExecution(options);
+      throwIfAborted(execution.signal, execution.deadlineAt);
 
       this.#contextStore.appendStandalone(
         this.#llm.buildUserMessage(
@@ -555,8 +623,13 @@ export class Agent<P extends AgentProtocol> {
         this.#maxIterations === undefined || iteration < this.#maxIterations;
         iteration += 1
       ) {
-        const initialRequest = await this.#runProactiveSummary(iteration);
-        const response = await this.#generateWithEmptyMessagesRetry(iteration, initialRequest);
+        throwIfAborted(execution.signal, execution.deadlineAt);
+        const initialRequest = await this.#runProactiveSummary(iteration, execution);
+        const response = await this.#generateWithEmptyMessagesRetry(
+          iteration,
+          initialRequest,
+          execution,
+        );
         const records: ToolExecutionRecord<P>[] = [];
         let loopFinalized = false;
 
@@ -567,7 +640,7 @@ export class Agent<P extends AgentProtocol> {
           : undefined;
 
         try {
-          await this.#emitModelResponse(response.messages);
+          await this.#emitModelResponse(response.messages, execution.signal);
 
           // 模型消息可能带有提供方元数据，必须整批原样保存后再执行本地工具。
           for (const message of response.messages) {
@@ -575,13 +648,17 @@ export class Agent<P extends AgentProtocol> {
           }
 
           for (const call of this.#llm.parseToolCalls(response.messages)) {
-            records.push(await this.#executeToolCallWithRecord(call));
+            records.push(await this.#executeToolCallWithRecord(call, execution));
           }
 
           if (records.length === 0 || !hasToolPayloadCompactor(this.#contextCompact)) {
             this.#contextStore.closeOpenLoopSpan();
           } else {
-            await Promise.all(this.#trackedToolListenerPromises ?? []);
+            await awaitWithAbort(
+              Promise.all(this.#trackedToolListenerPromises ?? []),
+              execution.signal,
+            );
+            throwIfAborted(execution.signal, execution.deadlineAt);
             const snapshot = this.#contextStore.snapshotOpenLoop();
             const rewritten = await rewriteOpenLoopToolPayloads({
               model: this.#llm,
@@ -589,6 +666,7 @@ export class Agent<P extends AgentProtocol> {
               snapshot,
               records,
               compactors: this.#contextCompact,
+              signal: execution.signal,
             });
             this.#contextStore.commitOpenLoopRewrite(snapshot, rewritten);
           }
@@ -622,6 +700,8 @@ export class Agent<P extends AgentProtocol> {
       this.#emitAgentError(agentError);
 
       throw error instanceof Error ? error : agentError;
+    } finally {
+      execution?.dispose();
     }
   }
 
@@ -725,17 +805,26 @@ export class Agent<P extends AgentProtocol> {
     });
   }
 
-  #buildAgentRequest(): ModelGenerateRequest<P> {
+  #buildAgentRequest(iteration: number, execution: ActiveAgentExecution): ModelGenerateRequest<P> {
     // 普通请求故意不写 purpose，保持旧自定义 Model 的 request 快照兼容。
     return {
       context: this.#buildContextForModel(),
       tools: this.#buildToolsForModel(),
+      signal: execution.signal,
+      ...(execution.deadlineAt === undefined ? {} : { deadlineAt: execution.deadlineAt }),
+      runtime: Object.freeze({
+        ...execution.runtime,
+        iteration,
+      }),
     };
   }
 
-  async #runProactiveSummary(iteration: number): Promise<ModelGenerateRequest<P>> {
+  async #runProactiveSummary(
+    iteration: number,
+    execution: ActiveAgentExecution,
+  ): Promise<ModelGenerateRequest<P>> {
     const policy = this.#contextCompact.summary;
-    const request = this.#buildAgentRequest();
+    const request = this.#buildAgentRequest(iteration, execution);
 
     if (!policy) {
       return request;
@@ -750,23 +839,24 @@ export class Agent<P extends AgentProtocol> {
       pendingRequest: request,
     });
 
-    if (!(await policy.trigger(snapshot))) {
+    if (!(await awaitWithAbort(Promise.resolve(policy.trigger(snapshot)), execution.signal))) {
       return this.#contextStore.revision === storeSnapshot.revision
         ? request
-        : this.#buildAgentRequest();
+        : this.#buildAgentRequest(iteration, execution);
     }
 
     const compacted = await this.#runSummaryTransaction(
       { type: 'trigger' },
       iteration,
       request,
+      execution,
       storeSnapshot,
       defaultSelection,
       true,
     );
 
     return compacted || this.#contextStore.revision !== storeSnapshot.revision
-      ? this.#buildAgentRequest()
+      ? this.#buildAgentRequest(iteration, execution)
       : request;
   }
 
@@ -774,6 +864,7 @@ export class Agent<P extends AgentProtocol> {
     cause: ContextCompactCause,
     iteration: number,
     pendingRequest: Readonly<ModelGenerateRequest<P>>,
+    execution: ActiveAgentExecution,
     storeSnapshot?: ContextStoreSummarySnapshot<P>,
     defaultSelection?: ReturnType<ContextStore<P>['getDefaultSummarySelection']>,
     defaultSelectionCaptured = false,
@@ -795,13 +886,14 @@ export class Agent<P extends AgentProtocol> {
       ...(defaultSelection === undefined ? {} : { defaultSelection }),
       defaultSelectionCaptured,
       generate: (summaryRequest) =>
-        this.#generateWithRecovery('context-summary', () => summaryRequest, iteration),
+        this.#generateWithRecovery('context-summary', () => summaryRequest, iteration, execution),
     });
   }
 
   async #generateWithEmptyMessagesRetry(
     iteration: number,
     initialRequest: ModelGenerateRequest<P>,
+    execution: ActiveAgentExecution,
   ) {
     // “成功但 messages 为空”的 4 次尝试与模型异常 recovery ledger 相互独立。
     let lastResponseText = 'Model returned no messages.';
@@ -809,8 +901,9 @@ export class Agent<P extends AgentProtocol> {
     for (let attempt = 0; attempt <= 3; attempt += 1) {
       const response = await this.#generateWithRecovery(
         'agent',
-        () => this.#buildAgentRequest(),
+        () => this.#buildAgentRequest(iteration, execution),
         iteration,
+        execution,
         attempt === 0 ? initialRequest : undefined,
       );
 
@@ -828,6 +921,7 @@ export class Agent<P extends AgentProtocol> {
     purpose: ModelGeneratePurpose,
     buildRequest: () => ModelGenerateRequest<P>,
     iteration: number,
+    execution: ActiveAgentExecution,
     initialRequest?: ModelGenerateRequest<P>,
   ): Promise<ModelGenerateResult<P>> {
     let pendingInitialRequest = initialRequest;
@@ -866,6 +960,7 @@ export class Agent<P extends AgentProtocol> {
           },
           iteration,
           handlerContext.request,
+          execution,
         );
 
         return { outcome: compacted ? 'succeeded' : 'unavailable' };
@@ -921,6 +1016,7 @@ export class Agent<P extends AgentProtocol> {
     toolName: string,
     parameters: unknown,
     message: AgentToolCall<P>,
+    signal?: AbortSignal,
   ): Promise<
     | {
         canceled: true;
@@ -932,10 +1028,11 @@ export class Agent<P extends AgentProtocol> {
   > {
     for (const listener of this.#beforeToolListeners.filter((item) => item.toolName === toolName)) {
       try {
+        throwIfAborted(signal);
         const result = listener.callback(parameters, message);
 
         if (listener.options.await) {
-          await result;
+          await awaitWithAbort(Promise.resolve(result), signal);
         } else {
           const tracked = Promise.resolve(result).catch(async (error: unknown) => {
             await this.#emitToolCallError(toolName, 'before', error, parameters, message);
@@ -944,6 +1041,11 @@ export class Agent<P extends AgentProtocol> {
           this.#trackToolListener(tracked);
         }
       } catch (error) {
+        if (isAbortError(error, signal)) {
+          throwIfAborted(signal);
+          throw error;
+        }
+
         await this.#emitToolCallError(toolName, 'before', error, parameters, message);
 
         // 只有 before listener 可以通过异常取消真实工具调用。
@@ -966,13 +1068,15 @@ export class Agent<P extends AgentProtocol> {
     parameters: unknown,
     message: AgentToolCall<P>,
     result: unknown,
+    signal?: AbortSignal,
   ): Promise<void> {
     for (const listener of this.#afterToolListeners.filter((item) => item.toolName === toolName)) {
       try {
+        throwIfAborted(signal);
         const callbackResult = listener.callback(parameters, message, result);
 
         if (listener.options.await) {
-          await callbackResult;
+          await awaitWithAbort(Promise.resolve(callbackResult), signal);
         } else {
           const tracked = Promise.resolve(callbackResult).catch(async (error: unknown) => {
             await this.#emitToolCallError(toolName, 'after', error, parameters, message, result);
@@ -981,17 +1085,27 @@ export class Agent<P extends AgentProtocol> {
           this.#trackToolListener(tracked);
         }
       } catch (error) {
+        if (isAbortError(error, signal)) {
+          throwIfAborted(signal);
+          throw error;
+        }
+
         // after listener 的失败可以被观察，但不能中断 Agent 主循环。
         await this.#emitToolCallError(toolName, 'after', error, parameters, message, result);
       }
     }
   }
 
-  async #emitModelResponse(messages: readonly ContextOf<P>[]): Promise<void> {
+  async #emitModelResponse(messages: readonly ContextOf<P>[], signal?: AbortSignal): Promise<void> {
     for (const listener of this.#modelResponseListeners) {
       try {
-        await listener(messages);
-      } catch {
+        await awaitWithAbort(Promise.resolve(listener(messages)), signal);
+      } catch (error) {
+        if (isAbortError(error, signal)) {
+          throwIfAborted(signal);
+          throw error;
+        }
+
         // 模型响应 listener 仅用于观察，不应打断 Agent 主循环。
       }
     }
@@ -1107,6 +1221,88 @@ function addListener<TListener>(listeners: TListener[], listener: TListener): Un
       listeners.splice(index, 1);
     }
   };
+}
+
+function normalizeAgentExecutionOptions(
+  input: boolean | AgentExecutionOptions,
+): ResolvedAgentExecutionOptions {
+  if (typeof input === 'boolean') {
+    return { stream: input };
+  }
+
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    throw new TypeError('Agent execution options must be a non-null object or a stream boolean.');
+  }
+
+  if (input.stream !== undefined && typeof input.stream !== 'boolean') {
+    throw new TypeError('Agent execution options.stream must be a boolean.');
+  }
+
+  return {
+    stream: input.stream ?? false,
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    ...(input.deadlineAt === undefined ? {} : { deadlineAt: input.deadlineAt }),
+    ...(input.runtime === undefined ? {} : { runtime: input.runtime }),
+  };
+}
+
+function createActiveAgentExecution(
+  options?: AgentExecutionOptions | ToolCallExecutionOptions,
+): ActiveAgentExecution {
+  if (
+    options !== undefined &&
+    (typeof options !== 'object' || options === null || Array.isArray(options))
+  ) {
+    throw new TypeError('Tool execution options must be a non-null object.');
+  }
+
+  if (options?.signal !== undefined && !isAbortSignal(options.signal)) {
+    throw new TypeError('signal must be an AbortSignal.');
+  }
+
+  const runtime = normalizeRuntimeMetadata(options?.runtime);
+  const abortScope = createAbortScope(options?.signal, options?.deadlineAt);
+
+  return {
+    signal: abortScope.signal,
+    ...(options?.deadlineAt === undefined ? {} : { deadlineAt: options.deadlineAt }),
+    ...(runtime === undefined ? {} : { runtime }),
+    dispose: () => abortScope.dispose(),
+  };
+}
+
+function normalizeRuntimeMetadata(
+  input: AgentExecutionOptions['runtime'],
+): AgentExecutionOptions['runtime'] {
+  if (input === undefined) {
+    return undefined;
+  }
+
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    throw new TypeError('runtime metadata must be a non-null object.');
+  }
+
+  const normalized: { sessionId?: string; runId?: string; taskId?: string } = {};
+
+  for (const key of ['sessionId', 'runId', 'taskId'] as const) {
+    const value = input[key];
+    if (value !== undefined && (typeof value !== 'string' || value.length === 0)) {
+      throw new TypeError(`runtime.${key} must be a non-empty string.`);
+    }
+    if (value !== undefined) normalized[key] = value;
+  }
+
+  return Object.freeze(normalized);
+}
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof Reflect.get(value, 'aborted') === 'boolean' &&
+    typeof Reflect.get(value, 'addEventListener') === 'function' &&
+    typeof Reflect.get(value, 'removeEventListener') === 'function'
+  );
 }
 
 function normalizeToolEventOptions(options?: ToolEventOptions): Required<ToolEventOptions> {

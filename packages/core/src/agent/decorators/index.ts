@@ -1,4 +1,5 @@
 import type { ToolDefinition, ToolRuntimeDefinition } from '../types';
+import type { ToolRuntimeContext } from '../../subagent/agent-run';
 
 const toolDefinitionsMetadataKey = Symbol.for('@manee/agent-framework/toolDefinitions');
 
@@ -18,7 +19,11 @@ export function Tool(definition: ToolDefinition) {
       throw new Error('@Tool can only decorate methods.');
     }
 
-    const method = value as (this: object, parameters: unknown) => unknown | Promise<unknown>;
+    const method = value as (
+      this: object,
+      parameters: unknown,
+      runtime: ToolRuntimeContext,
+    ) => unknown | Promise<unknown>;
 
     // 2023-11 decorator metadata 位于类级别；写入前复制继承数组，避免子类工具
     // 污染父类的 `toolsDefinition`。

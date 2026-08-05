@@ -197,6 +197,8 @@ pnpm format:check
 - 父子代理必须使用同一个协议规格。
 - `@Tool` 需要应用构建链支持 2023-11 decorators。
 
+`agent()` 和独立 `toolCall()` 支持传入 `AbortSignal` 与绝对 `deadlineAt`。取消信号会贯穿 Model、Tool、摘要、payload compactor 和模型错误恢复；Chat/Responses 适配器只把 `signal` 作为 SDK request option 传递，不会把截止时间或运行时身份写入 provider body。取消是协作式的，第三方 Model、Tool 或 callback 仍需主动遵守收到的 signal。
+
 ## Context compact
 
 `contextCompact` 整体未配置时不压缩。只要传入对象，缺省的 `toolInput` 与 `toolResult` 都会启用框架内置字符裁剪：input 为 `8192 → 4096`，result 为 `16384 → 8192`（UTF-16 code unit）。
@@ -233,4 +235,4 @@ const agent = new Agent({
 
 核心 API、事件、上下文、Skills、子代理、Responses/Chat 适配和自定义 Model 的完整说明见 [`packages/core/README.md`](./packages/core/README.md)。
 
-Subagent v2 正按上述计划分批实施。当前 Core workspace 已进入 `2.0.0` 开发线：C2 已冻结 JSON-safe/JCS、Definition、Executor、StateStore、Artifact、checkpoint、child-runner、telemetry 和 Runtime contracts；C3 已实现稳定 ID 的 `ContextStore` checkpoint、纯 task/result/approval/budget/event 状态机，以及带 revision CAS、lease/fencing 和事务内事件提交的声明式状态控制器。Catalog/Router、可执行 Runtime、官方 Local Executor 与 `Agent` loop 切换仍属于后续批次，因此 plans 中的未接线 API 不能当作已可运行能力。实际边界见 [`packages/core/README.md`](./packages/core/README.md)。
+Subagent v2 正按上述计划分批实施。当前 Core workspace 已进入 `2.0.0` 开发线：C2 已冻结公共 contracts；C3 已实现稳定 ID checkpoint、状态机与事务状态控制器；C4 已实现显式 Catalog 刷新、保守能力交集、动态根 `object + oneOf` 模型 schema、无 fallback Router，以及可执行的 `createSubAgentRuntime()`（幂等 create、审批暂停/恢复、Host retry、取消、事件和精确恢复目标）。官方 Local Executor、父 Agent batch checkpoint 与 `Agent` loop 的 v2 原子切换仍属于后续批次；当前可执行 Runtime 需要调用方自行提供 `AgentRuntimeStateStore` 和 `SubAgentExecutor`。实际边界见 [`packages/core/README.md`](./packages/core/README.md)。

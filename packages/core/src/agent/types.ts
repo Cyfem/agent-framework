@@ -3,7 +3,9 @@ import type {
   ModelGeneratePurpose,
   ModelGenerateRequest,
   ModelGenerateResult,
+  ModelRuntimeMetadata,
 } from '../llm/base/types';
+import type { ToolRuntimeContext } from '../subagent/agent-run';
 
 /** 同步或异步扩展点的统一返回类型。 */
 export type MaybePromise<T> = T | Promise<T>;
@@ -528,12 +530,30 @@ export interface ToolDefinition {
 }
 
 /** 参数解析和校验成功后执行的运行时工具函数。 */
-export type ToolHandler = (parameters: unknown) => unknown | Promise<unknown>;
+export type ToolHandler<P extends AgentProtocol = AgentProtocol> = {
+  bivarianceHack(parameters: unknown, context: ToolRuntimeContext<P>): unknown | Promise<unknown>;
+}['bivarianceHack'];
 
 /** 绑定了实例 handler、可由 Agent 执行的运行时工具定义。 */
-export interface ToolRuntimeDefinition extends ToolDefinition {
-  handler: ToolHandler;
+export interface ToolRuntimeDefinition<
+  P extends AgentProtocol = AgentProtocol,
+> extends ToolDefinition {
+  handler: ToolHandler<P>;
 }
+
+/** Identity supplied by a host runtime when invoking the current Agent instance. */
+export type AgentRuntimeMetadata = Omit<ModelRuntimeMetadata, 'iteration' | 'requestAttempt'>;
+
+/** Additive execution controls accepted by the pre-v2 Agent loop. */
+export interface AgentExecutionOptions {
+  readonly stream?: boolean;
+  readonly signal?: AbortSignal;
+  readonly deadlineAt?: number;
+  readonly runtime?: Readonly<AgentRuntimeMetadata>;
+}
+
+/** Execution controls for a standalone parsed Tool call. */
+export type ToolCallExecutionOptions = Omit<AgentExecutionOptions, 'stream'>;
 
 /** 子代理实例必须满足的最小契约。 */
 export interface AgentInstance<P extends AgentProtocol> {
