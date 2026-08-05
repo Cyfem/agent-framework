@@ -1,4 +1,14 @@
 import type { AgentProtocol, ContextOf } from './types';
+import type {
+  AgentProtocolCheckpointCodec,
+  ContextStoreCheckpointV1,
+} from '../subagent/checkpoint';
+import {
+  assertJsonValue,
+  canonicalizeJson,
+  parseJsonValue,
+  type JsonValue,
+} from '../subagent/json';
 
 /** ContextStore tracks messages in atomic provenance spans. */
 export type ContextEntryKind = 'seed' | 'user' | 'external' | 'loop' | 'summary' | 'preserved';
@@ -61,6 +71,9 @@ export interface ContextStoreSummaryTransaction<P extends AgentProtocol> {
 
 export type ContextStoreErrorCode =
   | 'concurrent_context_mutation'
+  | 'context_checkpoint_codec_mismatch'
+  | 'context_checkpoint_version_mismatch'
+  | 'invalid_context_checkpoint'
   | 'invalid_open_loop_snapshot'
   | 'invalid_open_loop_rewrite'
   | 'open_loop_already_exists'
@@ -84,6 +97,7 @@ interface MutableActiveContextEntry<P extends AgentProtocol> {
   spanId: string;
   kind: ContextEntryKind;
   active: ContextOf<P>;
+  rawItemId?: string;
   rawHistoryIndex?: number;
   original?: ContextOf<P>;
 }
@@ -109,11 +123,13 @@ interface PreviousSummary {
  */
 export class ContextStore<P extends AgentProtocol> {
   #rawHistory: ContextOf<P>[];
+  #rawItemIds: string[];
   #activeSpans: MutableContextSpan<P>[] = [];
   #summaryBoundarySpanId: string | undefined;
   #previousSummary: PreviousSummary | undefined;
   #openLoopSpanId: string | undefined;
   #revision = 0;
+  #nextRawItemId = 1;
   #nextSpanId = 1;
   #nextEntryId = 1;
 
@@ -122,6 +138,7 @@ export class ContextStore<P extends AgentProtocol> {
     const raw = [...(initRawContext ?? initContext ?? [])];
 
     this.#rawHistory = raw;
+    this.#rawItemIds = raw.map(() => this.#newRawItemId());
 
     // When both arrays are supplied they form an opaque, possibly non-aligned
     // seed. A missing side explicitly means the other projection is shared and
@@ -161,6 +178,139 @@ export class ContextStore<P extends AgentProtocol> {
   }
 
   /**
+   * Export the complete ContextStore state using one exact protocol codec.
+   * Every protocol value is copied through the codec and every provenance edge
+   * is persisted by stable ID rather than by JavaScript object identity.
+   */
+  exportCheckpoint(codec: AgentProtocolCheckpointCodec<P>): ContextStoreCheckpointV1 {
+    assertCheckpointCodec(codec);
+
+    const encode = (message: ContextOf<P>): JsonValue =>
+      cloneJsonValue(codec.encode([message]), 'Protocol checkpoint codec output');
+
+    return {
+      version: '1',
+      protocol: codec.protocol,
+      codecVersion: codec.version,
+      revision: this.#revision,
+      rawHistory: this.#rawHistory.map((message, index) => ({
+        itemId: this.#rawItemIds[index] as string,
+        value: encode(message),
+      })),
+      activeSpans: this.#activeSpans.map((span) => ({
+        spanId: span.spanId,
+        kind: span.kind,
+        closed: span.closed,
+        originalContext: span.originalContext.map(encode),
+        entries: span.entries.map((entry) => ({
+          entryId: entry.entryId,
+          spanId: entry.spanId,
+          kind: entry.kind,
+          active: encode(entry.active),
+          ...(entry.rawItemId === undefined ? {} : { rawItemId: entry.rawItemId }),
+          ...(entry.original === undefined ? {} : { original: encode(entry.original) }),
+        })),
+      })),
+      ...(this.#summaryBoundarySpanId === undefined
+        ? {}
+        : { summaryBoundarySpanId: this.#summaryBoundarySpanId }),
+      ...(this.#previousSummary === undefined
+        ? {}
+        : { previousSummary: { ...this.#previousSummary } }),
+      ...(this.#openLoopSpanId === undefined ? {} : { openLoopSpanId: this.#openLoopSpanId }),
+      nextRawItemId: this.#nextRawItemId,
+      nextSpanId: this.#nextSpanId,
+      nextEntryId: this.#nextEntryId,
+    };
+  }
+
+  /**
+   * Restore a checkpoint without mutating it. Structural, relationship,
+   * protocol, and version checks all complete before the first codec decode.
+   */
+  static restoreCheckpoint<P extends AgentProtocol>(
+    checkpoint: ContextStoreCheckpointV1,
+    codec: AgentProtocolCheckpointCodec<P>,
+  ): ContextStore<P> {
+    assertCheckpointCodec(codec);
+    validateContextStoreCheckpoint(checkpoint, codec);
+
+    const decode = (value: JsonValue, label: string): ContextOf<P> => {
+      let context: readonly ContextOf<P>[];
+
+      try {
+        context = codec.decode(cloneJsonValue(value, label));
+      } catch (error) {
+        throw new ContextStoreError(
+          'invalid_context_checkpoint',
+          `${label} could not be decoded by ${codec.protocol}@${codec.version}: ${errorMessage(error)}`,
+        );
+      }
+
+      if (!Array.isArray(context) || context.length !== 1) {
+        throw new ContextStoreError(
+          'invalid_context_checkpoint',
+          `${label} must decode to exactly one protocol context item.`,
+        );
+      }
+
+      return context[0] as ContextOf<P>;
+    };
+
+    // Decode into detached local state first. A later decode failure therefore
+    // cannot expose a partially restored store.
+    const rawHistory = checkpoint.rawHistory.map((item, index) =>
+      decode(item.value, `rawHistory[${index}].value`),
+    );
+    const rawHistoryIndexById = new Map(
+      checkpoint.rawHistory.map((item, index) => [item.itemId, index] as const),
+    );
+    const activeSpans: MutableContextSpan<P>[] = checkpoint.activeSpans.map((span, spanIndex) => ({
+      spanId: span.spanId,
+      kind: span.kind,
+      closed: span.closed,
+      originalContext: span.originalContext.map((value, originalIndex) =>
+        decode(value, `activeSpans[${spanIndex}].originalContext[${originalIndex}]`),
+      ),
+      entries: span.entries.map((entry, entryIndex) => ({
+        entryId: entry.entryId,
+        spanId: entry.spanId,
+        kind: entry.kind,
+        active: decode(entry.active, `activeSpans[${spanIndex}].entries[${entryIndex}].active`),
+        ...(entry.rawItemId === undefined
+          ? {}
+          : {
+              rawItemId: entry.rawItemId,
+              rawHistoryIndex: rawHistoryIndexById.get(entry.rawItemId) as number,
+            }),
+        ...(entry.original === undefined
+          ? {}
+          : {
+              original: decode(
+                entry.original,
+                `activeSpans[${spanIndex}].entries[${entryIndex}].original`,
+              ),
+            }),
+      })),
+    }));
+
+    const store = new ContextStore<P>();
+    store.#rawHistory = rawHistory;
+    store.#rawItemIds = checkpoint.rawHistory.map((item) => item.itemId);
+    store.#activeSpans = activeSpans;
+    store.#summaryBoundarySpanId = checkpoint.summaryBoundarySpanId;
+    store.#previousSummary = checkpoint.previousSummary
+      ? { ...checkpoint.previousSummary }
+      : undefined;
+    store.#openLoopSpanId = checkpoint.openLoopSpanId;
+    store.#revision = checkpoint.revision;
+    store.#nextRawItemId = checkpoint.nextRawItemId;
+    store.#nextSpanId = checkpoint.nextSpanId;
+    store.#nextEntryId = checkpoint.nextEntryId;
+    return store;
+  }
+
+  /**
    * Append a closed one-message span to raw and active context.
    * Standalone writes while a loop is open are rejected so callers cannot
    * accidentally place a loop listener message outside its atomic span.
@@ -177,8 +327,10 @@ export class ContextStore<P extends AgentProtocol> {
     }
 
     const rawHistoryIndex = this.#rawHistory.push(message) - 1;
+    const rawItemId = this.#newRawItemId();
+    this.#rawItemIds.push(rawItemId);
     const span = this.#newSpan(kind, true, [message]);
-    span.entries.push(this.#newEntry(span, message, rawHistoryIndex, message));
+    span.entries.push(this.#newEntry(span, message, rawHistoryIndex, message, rawItemId));
     this.#activeSpans.push(span);
     this.#bumpRevision();
   }
@@ -200,9 +352,11 @@ export class ContextStore<P extends AgentProtocol> {
   appendToOpenLoop(message: ContextOf<P>): void {
     const span = this.#requireOpenLoopSpan();
     const rawHistoryIndex = this.#rawHistory.push(message) - 1;
+    const rawItemId = this.#newRawItemId();
+    this.#rawItemIds.push(rawItemId);
 
     span.originalContext.push(message);
-    span.entries.push(this.#newEntry(span, message, rawHistoryIndex, message));
+    span.entries.push(this.#newEntry(span, message, rawHistoryIndex, message, rawItemId));
     this.#bumpRevision();
   }
 
@@ -464,6 +618,14 @@ export class ContextStore<P extends AgentProtocol> {
       return entry.original;
     }
 
+    if (entry.rawItemId !== undefined) {
+      const rawHistoryIndex = this.#rawItemIds.indexOf(entry.rawItemId);
+
+      if (rawHistoryIndex >= 0) {
+        return this.#rawHistory[rawHistoryIndex] as ContextOf<P>;
+      }
+    }
+
     if (entry.rawHistoryIndex !== undefined && entry.rawHistoryIndex in this.#rawHistory) {
       return this.#rawHistory[entry.rawHistoryIndex] as ContextOf<P>;
     }
@@ -531,12 +693,16 @@ export class ContextStore<P extends AgentProtocol> {
     active: ContextOf<P>,
     rawHistoryIndex?: number,
     original?: ContextOf<P>,
+    rawItemId: string | undefined = rawHistoryIndex === undefined
+      ? undefined
+      : this.#rawItemIds[rawHistoryIndex],
   ): MutableActiveContextEntry<P> {
     return {
       entryId: `context-entry-${this.#nextEntryId++}`,
       spanId: span.spanId,
       kind: span.kind,
       active,
+      ...(rawItemId === undefined ? {} : { rawItemId }),
       ...(rawHistoryIndex === undefined ? {} : { rawHistoryIndex }),
       ...(original === undefined ? {} : { original }),
     };
@@ -563,6 +729,10 @@ export class ContextStore<P extends AgentProtocol> {
     return this.#activeSpans.find((span) => span.spanId === spanId);
   }
 
+  #newRawItemId(): string {
+    return `context-raw-item-${this.#nextRawItemId++}`;
+  }
+
   #bumpRevision(): void {
     this.#revision += 1;
   }
@@ -576,4 +746,240 @@ function countByIdentity<T>(values: readonly T[]): ReadonlyMap<T, number> {
   }
 
   return counts;
+}
+
+const CONTEXT_ENTRY_KINDS = new Set<ContextEntryKind>([
+  'seed',
+  'user',
+  'external',
+  'loop',
+  'summary',
+  'preserved',
+]);
+
+function checkpointError(message: string): never {
+  throw new ContextStoreError('invalid_context_checkpoint', message);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function cloneJsonValue(value: unknown, label: string): JsonValue {
+  try {
+    assertJsonValue(value);
+    return parseJsonValue(canonicalizeJson(value));
+  } catch (error) {
+    throw new ContextStoreError(
+      'invalid_context_checkpoint',
+      `${label} is not a JSON-safe value: ${errorMessage(error)}`,
+    );
+  }
+}
+
+function assertCheckpointCodec<P extends AgentProtocol>(
+  codec: AgentProtocolCheckpointCodec<P>,
+): void {
+  if (
+    typeof codec !== 'object' ||
+    codec === null ||
+    typeof codec.protocol !== 'string' ||
+    codec.protocol.length === 0 ||
+    typeof codec.version !== 'string' ||
+    codec.version.length === 0 ||
+    typeof codec.encode !== 'function' ||
+    typeof codec.decode !== 'function'
+  ) {
+    throw new TypeError(
+      'A protocol checkpoint codec requires protocol, version, encode, and decode.',
+    );
+  }
+}
+
+function assertNonNegativeSafeInteger(value: unknown, label: string): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    checkpointError(`${label} must be a non-negative safe integer.`);
+  }
+}
+
+function assertPositiveSafeInteger(value: unknown, label: string): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0) {
+    checkpointError(`${label} must be a positive safe integer.`);
+  }
+}
+
+function parseGeneratedId(id: unknown, prefix: string, label: string): number {
+  if (typeof id !== 'string') {
+    checkpointError(`${label} must be a string.`);
+  }
+
+  const match = new RegExp(`^${prefix}(\\d+)$`, 'u').exec(id);
+  const numericId = match?.[1] === undefined ? Number.NaN : Number(match[1]);
+
+  if (!Number.isSafeInteger(numericId) || numericId <= 0) {
+    checkpointError(`${label} is not a valid generated ID.`);
+  }
+
+  return numericId;
+}
+
+function assertUniqueId(ids: Set<string>, id: string, label: string): void {
+  if (ids.has(id)) {
+    checkpointError(`${label} duplicates ${id}.`);
+  }
+  ids.add(id);
+}
+
+function validateContextStoreCheckpoint<P extends AgentProtocol>(
+  checkpoint: ContextStoreCheckpointV1,
+  codec: AgentProtocolCheckpointCodec<P>,
+): void {
+  // Validate the complete JSON boundary first. This rejects accessors, proxies,
+  // cycles, sparse arrays, undefined properties, and other non-durable values.
+  try {
+    assertJsonValue(checkpoint as unknown);
+  } catch (error) {
+    checkpointError(`Context checkpoint is not JSON-safe: ${errorMessage(error)}`);
+  }
+
+  if (checkpoint.version !== '1') {
+    throw new ContextStoreError(
+      'context_checkpoint_version_mismatch',
+      `Unsupported ContextStore checkpoint version ${String(checkpoint.version)}.`,
+    );
+  }
+  if (checkpoint.protocol !== codec.protocol || checkpoint.codecVersion !== codec.version) {
+    throw new ContextStoreError(
+      'context_checkpoint_codec_mismatch',
+      `Checkpoint requires ${checkpoint.protocol}@${checkpoint.codecVersion}; received ${codec.protocol}@${codec.version}.`,
+    );
+  }
+
+  assertNonNegativeSafeInteger(checkpoint.revision, 'revision');
+  assertPositiveSafeInteger(checkpoint.nextRawItemId, 'nextRawItemId');
+  assertPositiveSafeInteger(checkpoint.nextSpanId, 'nextSpanId');
+  assertPositiveSafeInteger(checkpoint.nextEntryId, 'nextEntryId');
+
+  if (!Array.isArray(checkpoint.rawHistory)) {
+    checkpointError('rawHistory must be an array.');
+  }
+  if (!Array.isArray(checkpoint.activeSpans) || checkpoint.activeSpans.length === 0) {
+    checkpointError('activeSpans must be a non-empty array.');
+  }
+
+  const rawItemIds = new Set<string>();
+  let maxRawItemId = 0;
+  checkpoint.rawHistory.forEach((item, index) => {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      checkpointError(`rawHistory[${index}] must be an object.`);
+    }
+    const numericId = parseGeneratedId(
+      item.itemId,
+      'context-raw-item-',
+      `rawHistory[${index}].itemId`,
+    );
+    assertUniqueId(rawItemIds, item.itemId, `rawHistory[${index}].itemId`);
+    maxRawItemId = Math.max(maxRawItemId, numericId);
+  });
+
+  const spanIds = new Set<string>();
+  const entryIds = new Set<string>();
+  const openSpanIds: string[] = [];
+  let maxSpanId = 0;
+  let maxEntryId = 0;
+
+  checkpoint.activeSpans.forEach((span, spanIndex) => {
+    if (typeof span !== 'object' || span === null || Array.isArray(span)) {
+      checkpointError(`activeSpans[${spanIndex}] must be an object.`);
+    }
+    const numericSpanId = parseGeneratedId(
+      span.spanId,
+      'context-span-',
+      `activeSpans[${spanIndex}].spanId`,
+    );
+    assertUniqueId(spanIds, span.spanId, `activeSpans[${spanIndex}].spanId`);
+    maxSpanId = Math.max(maxSpanId, numericSpanId);
+
+    if (!CONTEXT_ENTRY_KINDS.has(span.kind)) {
+      checkpointError(`activeSpans[${spanIndex}].kind is invalid.`);
+    }
+    if (typeof span.closed !== 'boolean') {
+      checkpointError(`activeSpans[${spanIndex}].closed must be boolean.`);
+    }
+    if (!span.closed) openSpanIds.push(span.spanId);
+    if (!Array.isArray(span.originalContext) || !Array.isArray(span.entries)) {
+      checkpointError(`activeSpans[${spanIndex}] contexts and entries must be arrays.`);
+    }
+
+    span.entries.forEach((entry: (typeof span.entries)[number], entryIndex: number) => {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+        checkpointError(`activeSpans[${spanIndex}].entries[${entryIndex}] must be an object.`);
+      }
+      const numericEntryId = parseGeneratedId(
+        entry.entryId,
+        'context-entry-',
+        `activeSpans[${spanIndex}].entries[${entryIndex}].entryId`,
+      );
+      assertUniqueId(
+        entryIds,
+        entry.entryId,
+        `activeSpans[${spanIndex}].entries[${entryIndex}].entryId`,
+      );
+      maxEntryId = Math.max(maxEntryId, numericEntryId);
+
+      if (entry.spanId !== span.spanId || entry.kind !== span.kind) {
+        checkpointError(
+          `activeSpans[${spanIndex}].entries[${entryIndex}] provenance does not match its span.`,
+        );
+      }
+      if (entry.rawItemId !== undefined && !rawItemIds.has(entry.rawItemId)) {
+        checkpointError(`activeSpans[${spanIndex}].entries[${entryIndex}].rawItemId is unknown.`);
+      }
+    });
+  });
+
+  if (checkpoint.nextRawItemId <= maxRawItemId) {
+    checkpointError('nextRawItemId must be greater than every persisted raw item ID.');
+  }
+  if (checkpoint.nextSpanId <= maxSpanId) {
+    checkpointError('nextSpanId must be greater than every persisted span ID.');
+  }
+  if (checkpoint.nextEntryId <= maxEntryId) {
+    checkpointError('nextEntryId must be greater than every persisted entry ID.');
+  }
+
+  if (checkpoint.openLoopSpanId === undefined) {
+    if (openSpanIds.length !== 0) {
+      checkpointError('An unclosed span requires openLoopSpanId.');
+    }
+  } else {
+    const lastSpan = checkpoint.activeSpans.at(-1);
+    if (
+      openSpanIds.length !== 1 ||
+      openSpanIds[0] !== checkpoint.openLoopSpanId ||
+      lastSpan?.spanId !== checkpoint.openLoopSpanId ||
+      lastSpan.kind !== 'loop'
+    ) {
+      checkpointError('openLoopSpanId must identify the single trailing open loop span.');
+    }
+  }
+
+  const hasBoundary = checkpoint.summaryBoundarySpanId !== undefined;
+  const hasPreviousSummary = checkpoint.previousSummary !== undefined;
+  if (hasBoundary !== hasPreviousSummary) {
+    checkpointError('summaryBoundarySpanId and previousSummary must appear together.');
+  }
+  if (checkpoint.summaryBoundarySpanId !== undefined && checkpoint.previousSummary !== undefined) {
+    const summarySpan = checkpoint.activeSpans[0];
+    if (
+      summarySpan?.spanId !== checkpoint.summaryBoundarySpanId ||
+      summarySpan.kind !== 'summary' ||
+      !summarySpan.closed ||
+      summarySpan.entries.length !== 1 ||
+      summarySpan.entries[0]?.entryId !== checkpoint.previousSummary.entryId ||
+      typeof checkpoint.previousSummary.text !== 'string'
+    ) {
+      checkpointError('The rolling summary boundary or previousSummary provenance is invalid.');
+    }
+  }
 }

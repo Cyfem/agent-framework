@@ -16,13 +16,18 @@ import {
   RESOURCE_NOT_FOUND_ERROR,
   SUBAGENT_ERROR_CODES,
   SubAgentRuntimeError,
+  TERMINAL_SUBAGENT_TASK_STATES,
   assertArtifactReference,
   assertJsonValue,
+  assertSubAgentTaskTransition,
   canonicalJsonSha256,
   canonicalizeJson,
   createResourceNotFoundError,
+  createStoredTaskIdempotently,
+  commitRuntimeStateMutation,
   defineSubAgent,
   isJsonValue,
+  isTerminalSubAgentTaskState,
   measureCanonicalJsonBytes,
   parseJsonValue,
   resolveSubAgentLimits,
@@ -33,10 +38,12 @@ import {
   type AgentTelemetrySink,
   type ArtifactReference,
   type ArtifactStore,
+  type ApprovalDecisionRecord,
   type ExecutorTaskHandle,
   type JsonValue,
   type ModelSubAgentRequest,
   type StateLease,
+  type RuntimeStateMutation,
   type SubAgentChildRunner,
   type SubAgentDefinition,
   type SubAgentExecutionControl,
@@ -59,13 +66,18 @@ const publicValues = [
   RESOURCE_NOT_FOUND_ERROR,
   SUBAGENT_ERROR_CODES,
   SubAgentRuntimeError,
+  TERMINAL_SUBAGENT_TASK_STATES,
   assertArtifactReference,
   assertJsonValue,
+  assertSubAgentTaskTransition,
   canonicalJsonSha256,
   canonicalizeJson,
   createResourceNotFoundError,
+  createStoredTaskIdempotently,
+  commitRuntimeStateMutation,
   defineSubAgent,
   isJsonValue,
+  isTerminalSubAgentTaskState,
   measureCanonicalJsonBytes,
   parseJsonValue,
   resolveSubAgentLimits,
@@ -79,9 +91,11 @@ type PublicContractTypes =
   | AgentTelemetrySink
   | ArtifactReference
   | ArtifactStore
+  | ApprovalDecisionRecord
   | ExecutorTaskHandle
   | JsonValue
   | ModelSubAgentRequest
+  | RuntimeStateMutation
   | StateLease
   | SubAgentChildRunner
   | SubAgentDefinition
@@ -94,7 +108,7 @@ type PublicContractTypes =
 void (undefined as PublicContractTypes | undefined);
 
 describe('Subagent v2 package root', () => {
-  it('exports all C2 runtime values from the public root', () => {
+  it('exports the implemented C2-C3 runtime values from the public root', () => {
     expect(publicValues.every((value) => value !== undefined)).toBe(true);
   });
 

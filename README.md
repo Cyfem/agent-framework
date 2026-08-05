@@ -233,4 +233,4 @@ const agent = new Agent({
 
 核心 API、事件、上下文、Skills、子代理、Responses/Chat 适配和自定义 Model 的完整说明见 [`packages/core/README.md`](./packages/core/README.md)。
 
-Subagent v2 正按上述计划分批实施。当前 Core workspace 已进入 `2.0.0` 开发线，完成 JSON-safe/JCS、Definition、Executor、StateStore、Artifact、checkpoint、child-runner、telemetry 和 Runtime 的公共 contracts；Catalog/Router、持久状态控制、Local Executor 与 `Agent` loop 切换属于后续批次。因此 plans 中的未接线 API 仍不能当作已可运行能力，实际边界见 [`packages/core/README.md`](./packages/core/README.md)。
+Subagent v2 正按上述计划分批实施。当前 Core workspace 已进入 `2.0.0` 开发线：C2 已冻结 JSON-safe/JCS、Definition、Executor、StateStore、Artifact、checkpoint、child-runner、telemetry 和 Runtime contracts；C3 已实现稳定 ID 的 `ContextStore` checkpoint、纯 task/result/approval/budget/event 状态机，以及带 revision CAS、lease/fencing 和事务内事件提交的声明式状态控制器。Catalog/Router、可执行 Runtime、官方 Local Executor 与 `Agent` loop 切换仍属于后续批次，因此 plans 中的未接线 API 不能当作已可运行能力。实际边界见 [`packages/core/README.md`](./packages/core/README.md)。

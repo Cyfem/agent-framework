@@ -9,6 +9,7 @@
   - 核心库、公共 API、Skills 和上下文压缩：[packages/core/README.md](./packages/core/README.md)
   - 可运行示例、真实模型配置和费用边界：[demo/README.md](./demo/README.md)
   - 分批实施中的 Subagent v2 生产运行时设计与验收：[PLAN.md](./plans/subagent-v2-production-runtime/PLAN.md)、[TECHNICAL_CHANGES.md](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md) 与 [TEST_ACCEPTANCE_PLAN.md](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)
+  - 当前实现已完成 C3 持久状态域；Catalog/Router、Executor 与 Agent v2 接线仍以源码和 README 的后续批次状态为准。
 
 ## Working Rules
 

@@ -12,5 +12,7 @@ export * from './json';
 export * from './limits';
 export * from './result';
 export * from './runtime';
+export * from './state-controller';
+export * from './state-machine';
 export * from './state-store';
 export * from './telemetry';

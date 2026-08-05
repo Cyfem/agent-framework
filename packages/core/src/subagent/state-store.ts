@@ -1,11 +1,17 @@
-import type { ApprovalRequest } from './approval';
+import type { ApprovalDecisionRecord, ApprovalRequest } from './approval';
 import type { ContextStoreCheckpointV1, EncodedAgentProtocolCheckpoint } from './checkpoint';
 import type { SubAgentContextItem, SubAgentDefinitionRef } from './definition';
 import type { SubAgentErrorDescriptor } from './errors';
 import type { SubAgentExecutorBinding } from './executor';
 import type { JsonValue } from './json';
 import type { TreeBudgetSnapshot } from './limits';
-import type { ResultReceipt, SubAgentTaskResult, SubAgentTaskState, SubAgentUsage } from './result';
+import type {
+  CompletionReceipt,
+  ResultReceipt,
+  SubAgentTaskResult,
+  SubAgentTaskState,
+  SubAgentUsage,
+} from './result';
 import type { SubAgentTaskEvent } from './telemetry';
 
 export type StoredAgentRunStatus =
@@ -83,12 +89,14 @@ export interface StoredTask {
   readonly retryOf?: string;
   readonly binding?: SubAgentExecutorBinding;
   readonly resultReceipt?: ResultReceipt;
+  readonly completionReceipt?: CompletionReceipt;
   readonly result?: SubAgentTaskResult;
   readonly output?: JsonValue;
   readonly partialOutput?: JsonValue;
   readonly error?: SubAgentErrorDescriptor;
   readonly usage?: SubAgentUsage;
   readonly approvals: readonly ApprovalRequest[];
+  readonly approvalDecisions: readonly ApprovalDecisionRecord[];
   readonly recoveryRequired: boolean;
   readonly activeElapsedMs: number;
   readonly activeStartedAt?: number;

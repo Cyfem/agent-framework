@@ -6,4 +6,5 @@ export * from './deterministic-id-factory';
 export * from './fault-injector';
 export * from './manual-clock';
 export * from './network-deny-guard';
+export * from './recording-state-store';
 export * from './scripted-operation-queue';

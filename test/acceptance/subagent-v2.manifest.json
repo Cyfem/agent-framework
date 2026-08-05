@@ -143,6 +143,90 @@
       ]
     },
     {
+      "requirementId": "C3-CHECKPOINT",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["chat-context-store"],
+      "cases": [
+        {
+          "caseId": "CHECKPOINT-01",
+          "variant": "chat-context-store",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/context-store-checkpoint.test.ts",
+            "testName": "[acceptance:CHECKPOINT-01][variant:chat-context-store]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C3-STATE",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["recording-store", "state-controller", "task-state-machine"],
+      "cases": [
+        {
+          "caseId": "STATE-01",
+          "variant": "recording-store",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-recording-state-store.test.ts",
+            "testName": "[acceptance:STATE-01][variant:recording-store]"
+          }
+        },
+        {
+          "caseId": "STATE-02",
+          "variant": "recording-store",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-recording-state-store.test.ts",
+            "testName": "[acceptance:STATE-02][variant:recording-store]"
+          }
+        },
+        {
+          "caseId": "STATE-03",
+          "variant": "state-controller",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-state-controller.test.ts",
+            "testName": "[acceptance:STATE-03][variant:state-controller]"
+          }
+        },
+        {
+          "caseId": "STATE-04",
+          "variant": "state-controller",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-state-controller.test.ts",
+            "testName": "[acceptance:STATE-04][variant:state-controller]"
+          }
+        },
+        {
+          "caseId": "STATE-05",
+          "variant": "task-state-machine",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-state-machine.test.ts",
+            "testName": "[acceptance:STATE-05][variant:task-state-machine]"
+          }
+        }
+      ]
+    },
+    {
       "requirementId": "PHASE-1",
       "status": "planned",
       "phase": "phase-1",

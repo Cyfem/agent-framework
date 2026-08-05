@@ -61,6 +61,10 @@ export interface ContextStoreCheckpointSpanV1 {
 /** Stable-ID provenance checkpoint; it never relies on JavaScript object identity. */
 export interface ContextStoreCheckpointV1 {
   readonly version: '1';
+  /** Protocol identity checked before any persisted payload is decoded. */
+  readonly protocol: string;
+  /** Exact codec version checked before any persisted payload is decoded. */
+  readonly codecVersion: string;
   readonly revision: number;
   readonly rawHistory: readonly ContextStoreCheckpointRawItemV1[];
   readonly activeSpans: readonly ContextStoreCheckpointSpanV1[];
@@ -70,6 +74,7 @@ export interface ContextStoreCheckpointV1 {
     readonly text: string;
   };
   readonly openLoopSpanId?: string;
+  readonly nextRawItemId: number;
   readonly nextSpanId: number;
   readonly nextEntryId: number;
 }

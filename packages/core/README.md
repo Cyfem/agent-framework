@@ -506,7 +506,7 @@ Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL
 
 `addSkill()` 只修改 configured sources。非运行状态下会立即使 Agent 回到未初始化；运行中添加只标记 dirty，当前 run 继续使用旧 snapshot。两种情况都必须在下一次运行前重新 `init()`，新 Skill 才会生效。父 Agent 的 Skill 和 runtime 配置不会自动传播给动态子代理。
 
-## Subagent v2 contracts（C2）
+## Subagent v2 contracts 与持久状态域（C2–C3）
 
 当前 workspace 版本为 `2.0.0`，包根已导出下列协议无关 contracts，供后续 Runtime 和独立 Executor 包实现：
 
@@ -516,10 +516,14 @@ Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL
 - task/result/error/approval/budget contracts，以及 exactly-once `ResultReceipt` / `CompletionReceipt`。
 - `AgentRuntimeStateStore`、run/task 独立 revision、lease/fencing、稳定 provenance checkpoint、Chat/Responses codec 和 migrator SPI。
 - `SubAgentChildRunner`、`ToolRuntimeContext`、`AgentRunOutcome`、安全 telemetry sink 与 `SubAgentRuntime` contract。
+- `ContextStore.exportCheckpoint()` / `ContextStore.restoreCheckpoint()`：使用稳定 raw/span/entry ID 保存并恢复 raw history、active projection、rolling summary 和 open loop，不依赖进程内对象引用。
+- 纯任务状态机：终态不可逆、首个合法 revision/fencing CAS 胜出、JCS result receipt、持久 completion receipt、严格 approval 过期边界、树级 budget 与安全事件序列。
+- `commitRuntimeStateMutation()`：用声明式 plan 在同一 StateStore transaction 中提交 root run、child task 与事件；事务 callback 不向调用者开放，内部只等待 transaction-local Store 操作。
+- `createStoredTaskIdempotently()`：在最终写入点执行 transaction-local 幂等 lookup/create，关闭并发 create 竞态。
 
 `ModelSubAgentRequest` 的公开字段精确为 `{ subAgent, executor, input }`。task/session/binding/retry/approval 等 host metadata 不属于模型 wire。`ArtifactReference` 也只包含版本、opaque ID、media type、大小和 SHA-256，不含路径、URL 或凭据。
 
-这一批只冻结并发布 contracts：`createSubAgentRuntime()`、持久状态机、Catalog/Router 和官方 Local Executor 还在后续批次实现。在 C6 原子切换前，下方现有 `AgentOptions.subAgents` 说明仍对应当前可运行的迁移前 Agent loop，不是 v2 兼容层承诺。
+当前仍未实现 `createSubAgentRuntime()`、Catalog/Router、官方 Local Executor 与 v2 Agent loop 接线。C3 的状态函数和控制器已经可单独使用并由离线测试覆盖，但还不是完整的子代理执行入口。在 C6 原子切换前，下方现有 `AgentOptions.subAgents` 说明仍对应当前可运行的迁移前 Agent loop，不是 v2 兼容层承诺。
 
 ## 子代理（迁移前 Agent loop）
 
