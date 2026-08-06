@@ -1,10 +1,12 @@
 import { isDeepStrictEqual } from 'node:util';
 
 import type { ApprovalDecision, ApprovalDirective, ApprovalRequestInput } from './approval';
+import type { ArtifactStore, SubAgentArtifactClient } from './artifact';
 import {
   BUILTIN_AGENT_PROTOCOL_CHECKPOINT_CODECS,
   type AgentCheckpointMigrator,
   type AgentProtocolCheckpointCodec,
+  type SubAgentChildCheckpoint,
 } from './checkpoint';
 import type { ExecutorCatalogSnapshot, SubAgentCatalogEntry } from './catalog';
 import type {
@@ -28,7 +30,12 @@ import type {
   SubAgentExecutorOperation,
 } from './executor';
 import { SubAgentExecutorRegistry, type SubAgentExecutionTarget } from './executor-registry';
-import { assertJsonValue, canonicalJsonSha256, type JsonValue } from './json';
+import {
+  assertJsonValue,
+  canonicalJsonSha256,
+  measureCanonicalJsonBytes,
+  type JsonValue,
+} from './json';
 import {
   DEFAULT_SUBAGENT_IO_LIMITS,
   resolveSubAgentLimits,
@@ -37,6 +44,7 @@ import {
 import type { SubAgentExecutionOutcome, SubAgentProgress, SubAgentUsageDelta } from './result';
 import {
   assertRuntimeReady,
+  acquireRenewingRuntimeLease,
   assertRuntimeSession,
   cloneJsonValue,
   createOperationSignal,
@@ -50,6 +58,7 @@ import {
   throwIfOperationAborted,
   waitForRuntimeRetry,
   withRuntimeLease,
+  type RenewingRuntimeLease,
 } from './runtime-support';
 import type {
   ChildDelegationRequest,
@@ -70,7 +79,14 @@ import {
   submitSubAgentResult,
   transitionSubAgentTask,
 } from './state-machine';
-import type { AgentRuntimeStateStore, StateLease, StoredAgentRun, StoredTask } from './state-store';
+import type {
+  AgentRuntimeStateStore,
+  StateLease,
+  StoredAgentRun,
+  StoredTask,
+  StoredTaskControlOperation,
+  StoredTaskControlOperationKind,
+} from './state-store';
 import type { SubAgentSessionSnapshot, SubAgentTaskSnapshot } from './identity';
 import {
   NOOP_AGENT_TELEMETRY_SINK,
@@ -97,6 +113,7 @@ interface ActiveExecution {
   readonly promise: Promise<SubAgentExecutionOutcome>;
   readonly controller: AbortController;
   rawHandle?: ExecutorTaskHandle;
+  ownership?: ExecutionOwnership;
 }
 
 interface StartResult {
@@ -104,6 +121,28 @@ interface StartResult {
   readonly run: StoredAgentRun;
   readonly outcome?: SubAgentExecutionOutcome;
 }
+
+interface ExecutionOwnership {
+  readonly attempt: number;
+  readonly executionEpoch: string;
+  readonly executionFencingToken: string;
+}
+
+type PendingRecoveryOperation =
+  | {
+      readonly type: 'resume';
+      readonly reason: 'approval';
+      readonly binding: SubAgentExecutorBinding;
+      readonly checkpoint: SubAgentChildCheckpoint;
+      readonly approvals: readonly ApprovalDecision[];
+    }
+  | {
+      readonly type: 'resume';
+      readonly reason: 'checkpoint';
+      readonly binding: SubAgentExecutorBinding;
+      readonly checkpoint: SubAgentChildCheckpoint;
+    }
+  | { readonly type: 'reconnect'; readonly binding: SubAgentExecutorBinding };
 
 const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'cancelled', 'failed']);
 
@@ -119,6 +158,8 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   readonly #executors: SubAgentExecutorRegistry;
   readonly #limits: Readonly<ResolvedSubAgentLimits>;
   readonly #telemetry: AgentTelemetrySink;
+  readonly #artifactStore: ArtifactStore | undefined;
+  readonly #executionLeaseTtlMs: number;
   readonly #checkpointCodecs: readonly AgentProtocolCheckpointCodec[];
   readonly #migrators: readonly AgentCheckpointMigrator[];
   readonly #active = new Map<string, ActiveExecution>();
@@ -140,6 +181,11 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     this.stateStore = options.stateStore;
     this.#limits = resolveSubAgentLimits(options.limits);
     this.#telemetry = options.telemetrySink ?? NOOP_AGENT_TELEMETRY_SINK;
+    this.#artifactStore = options.artifactStore;
+    this.#executionLeaseTtlMs = options.executionLeaseTtlMs ?? 30_000;
+    if (!Number.isSafeInteger(this.#executionLeaseTtlMs) || this.#executionLeaseTtlMs < 30) {
+      throw new RangeError('executionLeaseTtlMs must be a safe integer of at least 30ms.');
+    }
     this.#checkpointCodecs = Object.freeze([
       ...BUILTIN_AGENT_PROTOCOL_CHECKPOINT_CODECS,
       ...(options.protocolCheckpointCodecs ?? []),
@@ -197,18 +243,29 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     request: ModelSubAgentRequest,
     context: SubAgentDispatchContext,
   ): Promise<SubAgentExecutionOutcome> {
+    return (await this.submitTool(request, context)).wait();
+  }
+
+  async submitTool(
+    request: ModelSubAgentRequest,
+    context: SubAgentDispatchContext,
+  ): Promise<SubAgentTaskHandle> {
     assertRuntimeSession(context.ownerSessionId, this.sessionId);
-    return this.execute({
-      ...request,
-      runId: context.runId,
-      requestId: context.requestId,
-      ...(context.parentTaskId === undefined ? {} : { parentTaskId: context.parentTaskId }),
-      parentContext: context.parentContext,
-      parentRawHistory: context.parentRawHistory,
-      ...(context.stream === undefined ? {} : { stream: context.stream }),
-      signal: context.signal,
-      ...(context.deadlineAt === undefined ? {} : { deadlineAt: context.deadlineAt }),
-    });
+    const dispatched = await this.#createAndDispatch(
+      {
+        ...request,
+        runId: context.runId,
+        requestId: context.requestId,
+        ...(context.parentTaskId === undefined ? {} : { parentTaskId: context.parentTaskId }),
+        parentContext: context.parentContext,
+        parentRawHistory: context.parentRawHistory,
+        ...(context.stream === undefined ? {} : { stream: context.stream }),
+        signal: context.signal,
+        ...(context.deadlineAt === undefined ? {} : { deadlineAt: context.deadlineAt }),
+      },
+      'execute',
+    );
+    return this.#createHandle(dispatched.task.taskId);
   }
 
   async execute(request: SubAgentExecuteRequest): Promise<SubAgentExecutionOutcome> {
@@ -576,6 +633,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
               : { retryOf: prepared.request.retryOf }),
             approvals: Object.freeze([]),
             approvalDecisions: Object.freeze([]),
+            controlOperations: Object.freeze([]),
             recoveryRequired: false,
             activeElapsedMs: 0,
             remainingMs,
@@ -651,7 +709,13 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     });
     const promise = this.#runCreatedTask(task, target, mode, signal, controller)
       .catch(async (error: unknown) =>
-        this.#finalizeExecutionError(task.taskId, task.attempt, error),
+        this.#finalizeExecutionError(
+          task.taskId,
+          task.attempt,
+          error,
+          false,
+          this.#active.get(task.taskId)?.ownership,
+        ),
       )
       .finally(() => {
         this.#active.delete(task.taskId);
@@ -672,9 +736,22 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       (task.activeStartedAt ?? Date.now()) + task.remainingMs,
     );
     const signal = createOperationSignal({ signal: parentSignal, deadlineAt, controller });
-    const promise = this.#executeCreateOperation(task, target, mode, signal, deadlineAt)
+    const promise = this.#runWithExecutionOwnership(
+      task,
+      target,
+      'create',
+      mode,
+      signal,
+      deadlineAt,
+    )
       .catch(async (error: unknown) =>
-        this.#finalizeExecutionError(task.taskId, task.attempt, error, true),
+        this.#finalizeExecutionError(
+          task.taskId,
+          task.attempt,
+          error,
+          true,
+          this.#active.get(task.taskId)?.ownership,
+        ),
       )
       .finally(() => this.#active.delete(task.taskId));
     this.#active.set(task.taskId, { promise, controller });
@@ -692,7 +769,104 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     const task = started.task;
     const deadlineAt = (task.activeStartedAt ?? Date.now()) + task.remainingMs;
     const operationSignal = createOperationSignal({ signal, deadlineAt, controller });
-    return this.#executeCreateOperation(task, target, mode, operationSignal, deadlineAt);
+    return this.#runWithExecutionOwnership(
+      task,
+      target,
+      'create',
+      mode,
+      operationSignal,
+      deadlineAt,
+    );
+  }
+
+  async #runWithExecutionOwnership(
+    task: StoredTask,
+    target: SubAgentExecutionTarget,
+    operationType: 'create' | 'resume_approval' | 'resume_checkpoint' | 'reconnect',
+    mode: 'execute' | 'spawn',
+    parentSignal: AbortSignal,
+    deadlineAt: number,
+    recoveryOperation?: PendingRecoveryOperation,
+  ): Promise<SubAgentExecutionOutcome> {
+    const lease = await acquireRenewingRuntimeLease(
+      this.stateStore,
+      `subagent-task:${this.sessionId}:${task.taskId}`,
+      parentSignal,
+      deadlineAt,
+      this.#executionLeaseTtlMs,
+    );
+    try {
+      const owned = await this.#claimExecutionOwnership(
+        task.taskId,
+        task.attempt,
+        operationType,
+        lease,
+        deadlineAt,
+      );
+      const active = this.#active.get(task.taskId);
+      if (active !== undefined) active.ownership = executionOwnership(owned);
+      const signal = createOperationSignal({ signal: lease.signal, deadlineAt });
+      if (operationType === 'create') {
+        return this.#executeCreateOperation(owned, target, mode, signal, deadlineAt);
+      }
+      if (recoveryOperation === undefined) {
+        throw createSubAgentError('INTERNAL_ERROR', 'A recovery operation is required.');
+      }
+      const operation = Object.freeze({
+        ...recoveryOperation,
+        operationId: owned.executorOperation!.operationId,
+      }) as SubAgentExecutorOperation;
+      return this.#runRecoveredTask(owned, target, operation, mode, signal, deadlineAt);
+    } finally {
+      await lease.stop();
+    }
+  }
+
+  async #claimExecutionOwnership(
+    taskId: string,
+    expectedAttempt: number,
+    operationType: 'create' | 'resume_approval' | 'resume_checkpoint' | 'reconnect',
+    lease: RenewingRuntimeLease,
+    deadlineAt: number,
+  ): Promise<StoredTask> {
+    throwIfOperationAborted(lease.signal, deadlineAt);
+    const task = await this.#loadTask(taskId);
+    if (task.attempt !== expectedAttempt) {
+      throw createSubAgentError(
+        'RECOVERY_TARGET_LOST',
+        'The task attempt changed before execution ownership was acquired.',
+      );
+    }
+    if (task.state !== 'running' && task.state !== 'result_submitted') {
+      throw createSubAgentError(
+        'INVALID_STATE_TRANSITION',
+        'Execution ownership requires an active task.',
+      );
+    }
+    const now = Date.now();
+    const executionEpoch = createRuntimeId('epoch');
+    const next = Object.freeze({
+      ...task,
+      revision: task.revision + 1,
+      fencingToken: lease.lease.fencingToken,
+      executionEpoch,
+      executionFencingToken: lease.lease.fencingToken,
+      executorOperation: Object.freeze({
+        version: '1' as const,
+        operationId: createRuntimeId('operation'),
+        type: operationType,
+        attempt: task.attempt,
+        executionEpoch,
+        status: 'dispatched' as const,
+        createdAt: now,
+        updatedAt: now,
+      }),
+      updatedAt: now,
+    }) as StoredTask;
+    await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
+      tasks: [{ previous: task, next }],
+    });
+    return next;
   }
 
   async #executeCreateOperation(
@@ -705,6 +879,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     const control = this.#createExecutionControl(task, target, operationSignal, deadlineAt);
     const request = this.#buildExecutionRequest(task, target, operationSignal, deadlineAt, {
       type: 'create',
+      operationId: task.executorOperation!.operationId,
       idempotencyKey: task.idempotencyKey,
     });
 
@@ -723,7 +898,15 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     this.#assertRawHandle(task, rawHandle);
     const active = this.#active.get(task.taskId);
     if (active !== undefined) active.rawHandle = rawHandle;
-    await this.#commitBinding(task.taskId, target, rawHandle.binding, task.attempt);
+    await this.#commitBinding(
+      task.taskId,
+      target,
+      rawHandle.binding,
+      executionOwnership(task),
+      `${task.executorOperation!.operationId}:binding`,
+      operationSignal,
+      deadlineAt,
+    );
     const wait = Promise.resolve(rawHandle.wait());
     wait.catch(() => undefined);
     const outcome = await raceWithOperationSignal(wait, operationSignal, deadlineAt);
@@ -903,6 +1086,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     deadlineAt: number,
     operation: SubAgentExecutorOperation,
   ): SubAgentExecutionRequest {
+    const ownership = executionOwnership(task);
     return Object.freeze({
       operation,
       ownerSessionId: this.sessionId,
@@ -912,13 +1096,45 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       subagentSessionId: task.subagentSessionId,
       path: task.path,
       attempt: task.attempt,
+      executionEpoch: ownership.executionEpoch,
+      executionFencingToken: ownership.executionFencingToken,
       ...(task.retryOf === undefined ? {} : { retryOf: task.retryOf }),
       definition: task.definition,
       input: task.input,
       projectedContext: normalizeProjectedContext(task.projectedContext),
+      delegation: this.#createDelegationSnapshot(task),
       limits: Object.freeze({ ...this.#limits, timeoutMs: task.remainingMs }),
       signal,
       deadlineAt,
+    });
+  }
+
+  #createDelegationSnapshot(parent: StoredTask) {
+    const entries = this.#delegatedCatalogEntries(parent);
+    const catalog = this.getCatalog();
+    const snapshot = {
+      version: '1' as const,
+      ownerSessionId: this.sessionId,
+      runId: parent.runId,
+      parentTaskId: parent.taskId,
+      path: [...parent.path],
+      depth: parent.depth,
+      catalogRevision: catalog.revision,
+      definitions: entries.map(({ definition, executors }) => ({
+        name: definition.name,
+        version: definition.version,
+        executors: executors.map(({ name }) => name),
+      })),
+    };
+    assertJsonValue(snapshot);
+    return Object.freeze({
+      ...snapshot,
+      path: Object.freeze(snapshot.path),
+      definitions: Object.freeze(
+        snapshot.definitions.map((entry) =>
+          Object.freeze({ ...entry, executors: Object.freeze([...entry.executors]) }),
+        ),
+      ),
     });
   }
 
@@ -942,56 +1158,101 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     signal: AbortSignal,
     deadlineAt: number,
   ): SubAgentExecutionControl {
+    const ownership = executionOwnership(task);
+    const artifacts = this.#createArtifactClient(task, signal);
     return Object.freeze({
       signal,
       deadlineAt,
       delegation: this.#createDelegationClient(task, signal, deadlineAt),
+      ...(artifacts === undefined ? {} : { artifacts }),
       completion: Object.freeze({
         submitResult: (callId: string, candidate: JsonValue) =>
-          this.#submitResult(
-            task.taskId,
-            target,
-            task.attempt,
-            callId,
-            candidate,
-            signal,
-            deadlineAt,
-          ),
+          this.#submitResult(task.taskId, target, ownership, callId, candidate, signal, deadlineAt),
         complete: (callId: string, proof: { readonly isStandalone: boolean }) =>
           this.#completeTask(
             task.taskId,
             target,
-            task.attempt,
+            ownership,
             callId,
             proof.isStandalone,
             signal,
             deadlineAt,
           ),
       }),
-      commitBinding: (binding: SubAgentExecutorBinding) =>
-        this.#commitBinding(task.taskId, target, binding, task.attempt, signal, deadlineAt),
-      authorizeTool: (request: ApprovalRequestInput) =>
-        this.#authorizeTool(task.taskId, target, task.attempt, request, signal, deadlineAt),
-      reportProgress: (update: SubAgentProgress) =>
-        this.#reportProgress(task.taskId, target, task.attempt, update, signal, deadlineAt),
-      consumeBudget: (delta: SubAgentUsageDelta) =>
-        this.#consumeBudget(task.taskId, target, task.attempt, delta, signal, deadlineAt),
-      emit: (event: ExecutorEventInput) =>
-        this.#emitTaskEvent(task.taskId, target, task.attempt, event, signal, deadlineAt),
+      commitBinding: (operationId: string, binding: SubAgentExecutorBinding) =>
+        this.#commitBinding(
+          task.taskId,
+          target,
+          binding,
+          ownership,
+          operationId,
+          signal,
+          deadlineAt,
+        ),
+      commitCheckpoint: (operationId: string, checkpoint: SubAgentChildCheckpoint) =>
+        this.#commitCheckpoint(
+          task.taskId,
+          target,
+          checkpoint,
+          ownership,
+          operationId,
+          signal,
+          deadlineAt,
+        ),
+      authorizeTool: (operationId: string, request: ApprovalRequestInput) =>
+        this.#authorizeTool(
+          task.taskId,
+          target,
+          ownership,
+          operationId,
+          request,
+          signal,
+          deadlineAt,
+        ),
+      reportProgress: (operationId: string, update: SubAgentProgress) =>
+        this.#reportProgress(
+          task.taskId,
+          target,
+          ownership,
+          operationId,
+          update,
+          signal,
+          deadlineAt,
+        ),
+      consumeBudget: (operationId: string, delta: SubAgentUsageDelta) =>
+        this.#consumeBudget(task.taskId, target, ownership, operationId, delta, signal, deadlineAt),
+      emit: (operationId: string, event: ExecutorEventInput) =>
+        this.#emitTaskEvent(task.taskId, target, ownership, operationId, event, signal, deadlineAt),
+    });
+  }
+
+  #createArtifactClient(task: StoredTask, signal: AbortSignal): SubAgentArtifactClient | undefined {
+    const store = this.#artifactStore;
+    if (store === undefined) return undefined;
+    const scope = Object.freeze({ ownerSessionId: this.sessionId, taskId: task.taskId });
+    return Object.freeze({
+      put: (request: Parameters<SubAgentArtifactClient['put']>[0]) =>
+        store.put({ ...request, scope, signal: request.signal ?? signal }),
+      get: (
+        reference: Parameters<SubAgentArtifactClient['get']>[0],
+        options?: Parameters<SubAgentArtifactClient['get']>[1],
+      ) => store.get(scope, reference, { signal: options?.signal ?? signal }),
+      delete: (reference: Parameters<SubAgentArtifactClient['delete']>[0]) =>
+        store.delete(scope, reference),
     });
   }
 
   async #submitResult(
     taskId: string,
     target: SubAgentExecutionTarget,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
     callId: string,
     candidate: JsonValue,
     signal: AbortSignal,
     deadlineAt: number,
   ) {
     assertNonEmpty(callId, 'result callId');
-    await this.#preflightOperationOwner(taskId, target, expectedAttempt);
+    await this.#preflightOperationOwner(taskId, target, ownership);
     const parsed = target.definition.outputSchema.safeParse(candidate);
     if (!parsed.success) {
       throw createSubAgentError('INVALID_OUTPUT', 'The subagent result failed schema validation.');
@@ -1011,7 +1272,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
 
     return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
       const task = await this.#loadTask(taskId);
-      this.#assertOperationOwner(task, target, expectedAttempt);
+      this.#assertOperationOwner(task, target, ownership);
       const submitted = submitSubAgentResult(task, {
         callId,
         receiptId: createRuntimeId('receipt'),
@@ -1043,17 +1304,17 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   async #completeTask(
     taskId: string,
     target: SubAgentExecutionTarget,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
     callId: string,
     isStandalone: boolean,
     signal: AbortSignal,
     deadlineAt: number,
   ) {
     assertNonEmpty(callId, 'completion callId');
-    await this.#preflightOperationOwner(taskId, target, expectedAttempt);
+    await this.#preflightOperationOwner(taskId, target, ownership);
     return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
       const task = await this.#loadTask(taskId);
-      this.#assertOperationOwner(task, target, expectedAttempt);
+      this.#assertOperationOwner(task, target, ownership);
       const outputDecodable =
         task.output !== undefined && target.definition.outputSchema.safeParse(task.output).success;
       const completed = completeSubAgentTask(task, {
@@ -1064,8 +1325,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         outputDecodable,
       });
       if (completed.replayed) return completed.receipt;
+      const settledTask = settleExecutorOperation(completed.task as StoredTask, Date.now());
       const withEvent = appendSafeTaskEvents(
-        { ...completed.task, fencingToken: lease.fencingToken } as StoredTask,
+        { ...settledTask, fencingToken: lease.fencingToken } as StoredTask,
         [{ type: 'task.succeeded', data: { status: 'succeeded', callId } }],
         {
           eventIds: [createRuntimeId('event')],
@@ -1094,14 +1356,25 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     taskId: string,
     target: SubAgentExecutionTarget,
     binding: SubAgentExecutorBinding,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
+    operationId: string,
     signal?: AbortSignal,
     deadlineAt?: number,
   ): Promise<void> {
-    await this.#preflightOperationOwner(taskId, target, expectedAttempt);
+    assertNonEmpty(operationId, 'binding operationId');
+    await this.#preflightOperationOwner(taskId, target, ownership);
     const effectiveDeadline = deadlineAt ?? Date.now() + this.#limits.timeoutMs;
     const effectiveSignal = signal ?? createOperationSignal({ deadlineAt: effectiveDeadline });
     validateBinding(binding, taskId, this.sessionId, target);
+    if (
+      measureCanonicalJsonBytes(binding as unknown as JsonValue) > target.descriptor.maxBindingBytes
+    ) {
+      throw createSubAgentError(
+        'BINDING_INVALID',
+        'The Executor binding exceeds its declared limit.',
+      );
+    }
+    const operationPayload = cloneJsonValue(binding as unknown as JsonValue);
     await withRuntimeLease(
       this.stateStore,
       this.sessionId,
@@ -1109,7 +1382,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       effectiveDeadline,
       async (lease) => {
         const task = await this.#loadTask(taskId);
-        this.#assertOperationOwner(task, target, expectedAttempt);
+        this.#assertOperationOwner(task, target, ownership);
+        const replay = controlOperationReplay(task, operationId, 'binding', operationPayload);
+        if (replay !== undefined) return;
         if (binding.subagentSessionId !== task.subagentSessionId) {
           throw createSubAgentError(
             'BINDING_INVALID',
@@ -1117,10 +1392,23 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           );
         }
         if (task.binding !== undefined) {
-          if (isDeepStrictEqual(task.binding, binding)) return;
-          throw createSubAgentError('BINDING_INVALID', 'The task binding is already committed.');
+          if (!isDeepStrictEqual(task.binding, binding)) {
+            throw createSubAgentError('BINDING_INVALID', 'The task binding is already committed.');
+          }
+          const replayNext = appendControlOperation(task, {
+            operationId,
+            kind: 'binding',
+            payload: operationPayload,
+            result: null,
+            completedAt: Date.now(),
+            fencingToken: lease.fencingToken,
+          });
+          await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
+            tasks: [{ previous: task, next: replayNext }],
+          });
+          return;
         }
-        const next = Object.freeze({
+        const changed = Object.freeze({
           ...task,
           binding: Object.freeze({
             ...binding,
@@ -1130,6 +1418,15 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           fencingToken: lease.fencingToken,
           updatedAt: Date.now(),
         }) as StoredTask;
+        const next = appendControlOperation(changed, {
+          operationId,
+          kind: 'binding',
+          payload: operationPayload,
+          result: null,
+          completedAt: Date.now(),
+          fencingToken: lease.fencingToken,
+          revisionMode: 'preserve',
+        });
         await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
           tasks: [{ previous: task, next }],
         });
@@ -1137,15 +1434,180 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     );
   }
 
+  async #commitCheckpoint(
+    taskId: string,
+    target: SubAgentExecutionTarget,
+    candidate: SubAgentChildCheckpoint,
+    ownership: ExecutionOwnership,
+    operationId: string,
+    signal: AbortSignal,
+    deadlineAt: number,
+  ): Promise<void> {
+    assertNonEmpty(operationId, 'checkpoint operationId');
+    await this.#preflightOperationOwner(taskId, target, ownership);
+    const before = await this.#loadTask(taskId);
+    this.#assertOperationOwner(before, target, ownership);
+    if (before.binding === undefined) {
+      throw createSubAgentError(
+        'BINDING_INVALID',
+        'A child checkpoint requires a committed Executor binding.',
+      );
+    }
+    validateBinding(before.binding, taskId, this.sessionId, target);
+    const checkpoint = await this.#normalizeChildCheckpoint(candidate, signal, deadlineAt, {
+      runnerId: before.binding.runnerId,
+      runnerVersion: before.binding.runnerVersion,
+    });
+    if (!target.descriptor.childCheckpointVersions.includes(checkpoint.version)) {
+      throw createSubAgentError(
+        'CHECKPOINT_VERSION_MISMATCH',
+        'The Executor does not accept this child checkpoint version.',
+      );
+    }
+    if (
+      checkpoint.runnerId !== before.binding.runnerId ||
+      checkpoint.runnerVersion !== before.binding.runnerVersion ||
+      !target.descriptor.runnerCompatibility.some(
+        (runner) =>
+          runner.runnerId === checkpoint.runnerId &&
+          runner.runnerVersion === checkpoint.runnerVersion &&
+          runner.childCheckpointVersions.includes(checkpoint.version),
+      )
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_VERSION_MISMATCH',
+        'The child checkpoint runner identity is incompatible with the binding.',
+      );
+    }
+    const payload = cloneJsonValue(checkpoint as unknown as JsonValue);
+    await withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
+      const task = await this.#loadTask(taskId);
+      this.#assertOperationOwner(task, target, ownership);
+      if (!isDeepStrictEqual(task.binding, before.binding)) {
+        throw createSubAgentError(
+          'RECOVERY_TARGET_LOST',
+          'The Executor binding changed while preparing the child checkpoint.',
+        );
+      }
+      if (controlOperationReplay(task, operationId, 'checkpoint', payload) !== undefined) return;
+      if (task.state !== 'running' && task.state !== 'result_submitted') {
+        throw createSubAgentError(
+          'INVALID_STATE_TRANSITION',
+          'A child checkpoint can be committed only by an active task.',
+        );
+      }
+      const changed = Object.freeze({
+        ...task,
+        childCheckpoint: checkpoint,
+        revision: task.revision + 1,
+        fencingToken: lease.fencingToken,
+        updatedAt: Date.now(),
+      }) as StoredTask;
+      const next = appendControlOperation(changed, {
+        operationId,
+        kind: 'checkpoint',
+        payload,
+        result: null,
+        completedAt: Date.now(),
+        fencingToken: lease.fencingToken,
+        revisionMode: 'preserve',
+      });
+      await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
+        tasks: [{ previous: task, next }],
+      });
+    });
+  }
+
+  async #normalizeChildCheckpoint(
+    candidate: unknown,
+    signal: AbortSignal,
+    deadlineAt: number,
+    targetRunner: { readonly runnerId: string; readonly runnerVersion: string },
+  ): Promise<SubAgentChildCheckpoint> {
+    let value: JsonValue;
+    try {
+      assertJsonValue(candidate);
+      value = cloneJsonValue(candidate as JsonValue);
+    } catch {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'The child checkpoint is not JSON-safe.',
+      );
+    }
+    let version = checkpointVersion(value);
+    let runner = checkpointRunner(value);
+    const visited = new Set<string>();
+    while (
+      version !== '1' ||
+      runner.runnerId !== targetRunner.runnerId ||
+      runner.runnerVersion !== targetRunner.runnerVersion
+    ) {
+      throwIfOperationAborted(signal, deadlineAt);
+      const migrationIdentity = `${version}\u0000${runner.runnerId}\u0000${runner.runnerVersion}`;
+      if (visited.has(migrationIdentity)) {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The child checkpoint migration path contains a cycle.',
+        );
+      }
+      visited.add(migrationIdentity);
+      const migrator = this.#migrators.find(
+        (entry) =>
+          entry.recordKind === 'child-checkpoint' &&
+          entry.fromVersion === version &&
+          entry.runnerId === runner.runnerId &&
+          entry.fromRunnerVersion === runner.runnerVersion,
+      ) as Extract<AgentCheckpointMigrator, { recordKind: 'child-checkpoint' }> | undefined;
+      if (migrator === undefined) {
+        throw createSubAgentError(
+          'CHECKPOINT_VERSION_MISMATCH',
+          'No child checkpoint migration path is registered.',
+        );
+      }
+      try {
+        value = await raceWithOperationSignal(
+          Promise.resolve(migrator.migrate(cloneJsonValue(value))),
+          signal,
+          deadlineAt,
+        );
+        assertJsonValue(value);
+        value = cloneJsonValue(value);
+      } catch (error) {
+        if (error instanceof SubAgentRuntimeError) throw error;
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The child checkpoint migrator failed.',
+        );
+      }
+      const nextVersion = checkpointVersion(value);
+      const nextRunner = checkpointRunner(value);
+      if (
+        nextVersion !== migrator.toVersion ||
+        nextRunner.runnerId !== migrator.runnerId ||
+        nextRunner.runnerVersion !== migrator.toRunnerVersion
+      ) {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The child checkpoint migrator returned the wrong version.',
+        );
+      }
+      version = nextVersion;
+      runner = nextRunner;
+    }
+    return validateChildCheckpointV1(value, this.#checkpointCodecs);
+  }
+
   async #authorizeTool(
     taskId: string,
     target: SubAgentExecutionTarget,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
+    operationId: string,
     input: ApprovalRequestInput,
     signal: AbortSignal,
     deadlineAt: number,
   ): Promise<ApprovalDirective> {
-    await this.#preflightOperationOwner(taskId, target, expectedAttempt);
+    assertNonEmpty(operationId, 'approval operationId');
+    await this.#preflightOperationOwner(taskId, target, ownership);
     if (!target.descriptor.capabilities.approval) {
       throw createSubAgentError(
         'UNSUPPORTED_CAPABILITY',
@@ -1161,7 +1623,15 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       deadlineAt,
       async (lease): Promise<ApprovalDirective> => {
         const task = await this.#loadTask(taskId);
-        this.#assertOperationOwner(task, target, expectedAttempt);
+        this.#assertOperationOwner(task, target, ownership);
+        const payload = cloneJsonValue({
+          callId: input.callId,
+          toolName: input.toolName,
+          summary: input.summary,
+          ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+        });
+        const replay = controlOperationReplay(task, operationId, 'approval', payload);
+        if (replay !== undefined) return replay.result as unknown as ApprovalDirective;
         if (task.state !== 'running') {
           throw createSubAgentError(
             'INVALID_STATE_TRANSITION',
@@ -1171,7 +1641,19 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         const decided = task.approvalDecisions.find(({ callId }) => callId === input.callId);
         if (decided !== undefined) {
           if (decided.decision === 'approved') {
-            return { type: 'approved', approvalId: decided.approvalId };
+            const directive = { type: 'approved' as const, approvalId: decided.approvalId };
+            const next = appendControlOperation(task, {
+              operationId,
+              kind: 'approval',
+              payload,
+              result: directive,
+              completedAt: Date.now(),
+              fencingToken: lease.fencingToken,
+            });
+            await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
+              tasks: [{ previous: task, next }],
+            });
+            return directive;
           }
           throw createSubAgentError(
             decided.decision === 'expired' ? 'APPROVAL_EXPIRED' : 'APPROVAL_REJECTED',
@@ -1200,8 +1682,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           now,
           approvals: [...task.approvals, approval],
         });
+        const settledPaused = settleExecutorOperation(paused as StoredTask, now);
         const withEvents = appendSafeTaskEvents(
-          { ...paused, fencingToken: lease.fencingToken } as StoredTask,
+          { ...settledPaused, fencingToken: lease.fencingToken } as StoredTask,
           [
             {
               type: 'approval.requested',
@@ -1219,17 +1702,27 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
             revisionMode: 'preserve',
           },
         );
+        const directive = {
+          type: 'suspend' as const,
+          request: approval,
+          checkpointRevision: withEvents.task.revision,
+        };
+        const taskWithReceipt = appendControlOperation(withEvents.task as StoredTask, {
+          operationId,
+          kind: 'approval',
+          payload,
+          result: directive as unknown as JsonValue,
+          completedAt: now,
+          fencingToken: lease.fencingToken,
+          revisionMode: 'preserve',
+        });
         const run = await this.#loadRun(task.runId);
         const nextRun = this.#releaseActiveExecution(run, lease, now);
         await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
           run: { previous: run, next: nextRun },
-          tasks: [{ previous: task, next: withEvents.task, events: withEvents.events }],
+          tasks: [{ previous: task, next: taskWithReceipt, events: withEvents.events }],
         });
-        return {
-          type: 'suspend',
-          request: approval,
-          checkpointRevision: withEvents.task.revision,
-        };
+        return directive;
       },
     );
     if (directive.type === 'suspend') {
@@ -1247,12 +1740,14 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   async #reportProgress(
     taskId: string,
     target: SubAgentExecutionTarget,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
+    operationId: string,
     update: SubAgentProgress,
     signal: AbortSignal,
     deadlineAt: number,
   ): Promise<void> {
-    await this.#preflightOperationOwner(taskId, target, expectedAttempt);
+    assertNonEmpty(operationId, 'progress operationId');
+    await this.#preflightOperationOwner(taskId, target, ownership);
     if (typeof update.message !== 'string' || update.message.length === 0) {
       throw new TypeError('Subagent progress message must be non-empty.');
     }
@@ -1266,7 +1761,8 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     await this.#appendExecutorEvent(
       taskId,
       target,
-      expectedAttempt,
+      ownership,
+      operationId,
       {
         type: 'progress.reported',
         data: { length: new TextEncoder().encode(update.message).byteLength },
@@ -1279,12 +1775,14 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   async #emitTaskEvent(
     taskId: string,
     target: SubAgentExecutionTarget,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
+    operationId: string,
     event: ExecutorEventInput,
     signal: AbortSignal,
     deadlineAt: number,
   ): Promise<void> {
-    await this.#preflightOperationOwner(taskId, target, expectedAttempt);
+    assertNonEmpty(operationId, 'event operationId');
+    await this.#preflightOperationOwner(taskId, target, ownership);
     const allowed = new Set<ExecutorEventInput['type']>([
       'progress.reported',
       'recovery.started',
@@ -1297,20 +1795,31 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         'Executor emit() cannot publish authoritative task, approval, usage or budget events.',
       );
     }
-    await this.#appendExecutorEvent(taskId, target, expectedAttempt, event, signal, deadlineAt);
+    await this.#appendExecutorEvent(
+      taskId,
+      target,
+      ownership,
+      operationId,
+      event,
+      signal,
+      deadlineAt,
+    );
   }
 
   async #appendExecutorEvent(
     taskId: string,
     target: SubAgentExecutionTarget,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
+    operationId: string,
     event: ExecutorEventInput,
     signal: AbortSignal,
     deadlineAt: number,
   ): Promise<void> {
     await withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
       const task = await this.#loadTask(taskId);
-      this.#assertOperationOwner(task, target, expectedAttempt);
+      this.#assertOperationOwner(task, target, ownership);
+      const payload = cloneJsonValue(event as unknown as JsonValue);
+      if (controlOperationReplay(task, operationId, 'event', payload) !== undefined) return;
       if (taskOutcome(task) !== undefined) {
         throw createSubAgentError(
           'INVALID_STATE_TRANSITION',
@@ -1321,10 +1830,19 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         eventIds: [createRuntimeId('event')],
         defaultTimestamp: Date.now(),
       });
-      const next = Object.freeze({
+      const changed = Object.freeze({
         ...withEvent.task,
         fencingToken: lease.fencingToken,
       }) as StoredTask;
+      const next = appendControlOperation(changed, {
+        operationId,
+        kind: 'event',
+        payload,
+        result: null,
+        completedAt: Date.now(),
+        fencingToken: lease.fencingToken,
+        revisionMode: 'preserve',
+      });
       await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
         tasks: [{ previous: task, next, events: withEvent.events }],
       });
@@ -1334,16 +1852,20 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   async #consumeBudget(
     taskId: string,
     target: SubAgentExecutionTarget,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
+    operationId: string,
     delta: SubAgentUsageDelta,
     signal: AbortSignal,
     deadlineAt: number,
   ): Promise<void> {
-    await this.#preflightOperationOwner(taskId, target, expectedAttempt);
+    assertNonEmpty(operationId, 'budget operationId');
+    await this.#preflightOperationOwner(taskId, target, ownership);
     validateUsageDelta(delta);
     await withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
       const task = await this.#loadTask(taskId);
-      this.#assertOperationOwner(task, target, expectedAttempt);
+      this.#assertOperationOwner(task, target, ownership);
+      const payload = cloneJsonValue(delta as unknown as JsonValue);
+      if (controlOperationReplay(task, operationId, 'budget', payload) !== undefined) return;
       if (task.state !== 'running' && task.state !== 'result_submitted') {
         throw createSubAgentError(
           'INVALID_STATE_TRANSITION',
@@ -1388,6 +1910,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           now,
           error: budgetFailure.descriptor,
         });
+        const settledTerminal = settleExecutorOperation(terminal as StoredTask, now);
         const eventInputs: ExecutorEventInput[] = [
           {
             type: 'budget.rejected',
@@ -1399,7 +1922,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           },
         ];
         const withEvents = appendSafeTaskEvents(
-          { ...terminal, fencingToken: lease.fencingToken } as StoredTask,
+          { ...settledTerminal, fencingToken: lease.fencingToken } as StoredTask,
           eventInputs,
           {
             eventIds: eventInputs.map(() => createRuntimeId('event')),
@@ -1430,6 +1953,15 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           revisionMode: 'preserve',
         },
       );
+      const taskWithReceipt = appendControlOperation(withEvent.task as StoredTask, {
+        operationId,
+        kind: 'budget',
+        payload,
+        result: null,
+        completedAt: now,
+        fencingToken: lease.fencingToken,
+        revisionMode: 'preserve',
+      });
       const nextRun: StoredAgentRun = Object.freeze({
         ...run,
         budget,
@@ -1439,7 +1971,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       });
       await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
         run: { previous: run, next: nextRun },
-        tasks: [{ previous: task, next: withEvent.task, events: withEvent.events }],
+        tasks: [{ previous: task, next: taskWithReceipt, events: withEvent.events }],
       });
     });
   }
@@ -1473,10 +2005,35 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         deadlineAt,
       });
     };
+    const submit = async (
+      request: ModelSubAgentRequest,
+      context: SubAgentDispatchContext,
+    ): Promise<SubAgentTaskHandle> => {
+      assertRuntimeSession(context.ownerSessionId, this.sessionId);
+      if (context.runId !== parent.runId || context.parentTaskId !== parent.taskId) {
+        throw createResourceNotFoundError();
+      }
+      await this.#assertDelegationOwner(parent);
+      const dispatched = await this.#createAndDispatch(
+        {
+          ...request,
+          runId: parent.runId,
+          requestId: context.requestId,
+          parentTaskId: parent.taskId,
+          parentContext: [],
+          parentRawHistory: [],
+          signal,
+          deadlineAt,
+        },
+        'execute',
+      );
+      return this.#createHandle(dispatched.task.taskId);
+    };
 
     return Object.freeze({
       getCatalog: () => this.#delegatedCatalog(parent),
       getCatalogEntries: () => this.#delegatedCatalogEntries(parent),
+      submitTool: submit,
       dispatchTool: (request: ModelSubAgentRequest, context: SubAgentDispatchContext) => {
         assertRuntimeSession(context.ownerSessionId, this.sessionId);
         if (context.runId !== parent.runId || context.parentTaskId !== parent.taskId) {
@@ -1506,7 +2063,25 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
 
   async #assertDelegationOwner(parent: StoredTask): Promise<void> {
     const current = await this.#loadTask(parent.taskId);
-    if (current.attempt !== parent.attempt || current.state !== 'running') {
+    const ownership = executionOwnership(parent);
+    const ownsCurrentAttempt =
+      current.attempt === ownership.attempt &&
+      current.executionEpoch === ownership.executionEpoch &&
+      current.executionFencingToken === ownership.executionFencingToken &&
+      current.executorOperation?.executionEpoch === ownership.executionEpoch;
+    if (!ownsCurrentAttempt) {
+      throw createSubAgentError(
+        'RECOVERY_TARGET_LOST',
+        'The parent delegation client belongs to an obsolete task attempt.',
+      );
+    }
+    if (current.state === 'result_submitted') {
+      throw createSubAgentError(
+        'RESULT_PHASE_CLOSED',
+        'A subagent cannot delegate another task after submitting its result.',
+      );
+    }
+    if (current.state !== 'running') {
       throw createSubAgentError(
         'RECOVERY_TARGET_LOST',
         'The parent delegation client belongs to an obsolete task attempt.',
@@ -1555,10 +2130,17 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     expectedAttempt: number,
     error: unknown,
     recovery = false,
+    ownership?: ExecutionOwnership,
   ): Promise<SubAgentExecutionOutcome> {
     const existing = await this.stateStore.loadTask(this.sessionId, taskId);
     if (existing === undefined) throw createResourceNotFoundError();
-    if (existing.attempt !== expectedAttempt) {
+    if (
+      existing.attempt !== expectedAttempt ||
+      (ownership !== undefined &&
+        (existing.executionEpoch !== ownership.executionEpoch ||
+          existing.executionFencingToken !== ownership.executionFencingToken ||
+          existing.executorOperation?.executionEpoch !== ownership.executionEpoch))
+    ) {
       throw createSubAgentError(
         'RECOVERY_TARGET_LOST',
         'An obsolete Executor attempt cannot finalize the current task.',
@@ -1583,7 +2165,13 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       Date.now() + this.#limits.timeoutMs,
       async (lease) => {
         const task = await this.#loadTask(taskId);
-        if (task.attempt !== expectedAttempt) {
+        if (
+          task.attempt !== expectedAttempt ||
+          (ownership !== undefined &&
+            (task.executionEpoch !== ownership.executionEpoch ||
+              task.executionFencingToken !== ownership.executionFencingToken ||
+              task.executorOperation?.executionEpoch !== ownership.executionEpoch))
+        ) {
           throw createSubAgentError(
             'RECOVERY_TARGET_LOST',
             'An obsolete Executor attempt cannot finalize the current task.',
@@ -1596,6 +2184,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           now,
           error: descriptor,
         });
+        const settledTerminal = settleExecutorOperation(terminal as StoredTask, now);
         const eventType =
           state === 'cancelled'
             ? 'task.cancelled'
@@ -1627,7 +2216,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           },
         ];
         const withEvent = appendSafeTaskEvents(
-          { ...terminal, fencingToken: lease.fencingToken } as StoredTask,
+          { ...settledTerminal, fencingToken: lease.fencingToken } as StoredTask,
           eventInputs,
           {
             eventIds: eventInputs.map(() => createRuntimeId('event')),
@@ -1685,18 +2274,32 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         'The task no longer matches the selected exact execution target.',
       );
     }
+    if (
+      target.descriptor.runtimeProtocolVersion !== '1' ||
+      !target.descriptor.taskRecordVersions.includes(task.recordVersion)
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_VERSION_MISMATCH',
+        'The Executor is incompatible with the persisted Core task record.',
+      );
+    }
   }
 
   #assertOperationOwner(
     task: StoredTask,
     target: SubAgentExecutionTarget,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
   ): void {
     this.#assertExecutionTarget(task, target);
-    if (task.attempt !== expectedAttempt) {
+    if (
+      task.attempt !== ownership.attempt ||
+      task.executionEpoch !== ownership.executionEpoch ||
+      task.executionFencingToken !== ownership.executionFencingToken ||
+      task.executorOperation?.executionEpoch !== ownership.executionEpoch
+    ) {
       throw createSubAgentError(
         'RECOVERY_TARGET_LOST',
-        'The Executor operation belongs to an obsolete task attempt.',
+        'The Executor operation belongs to an obsolete execution epoch.',
       );
     }
   }
@@ -1704,9 +2307,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   async #preflightOperationOwner(
     taskId: string,
     target: SubAgentExecutionTarget,
-    expectedAttempt: number,
+    ownership: ExecutionOwnership,
   ): Promise<void> {
-    this.#assertOperationOwner(await this.#loadTask(taskId), target, expectedAttempt);
+    this.#assertOperationOwner(await this.#loadTask(taskId), target, ownership);
   }
 
   #createHandle(taskId: string): SubAgentTaskHandle {
@@ -1715,7 +2318,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       snapshot: () => this.getTask(this.sessionId, taskId),
       wait: () => this.wait(this.sessionId, taskId),
       cancel: (reason?: string) => this.cancel(this.sessionId, taskId, reason),
-      events: (options?: { readonly afterSequence?: number }) =>
+      events: (options: Parameters<SubAgentTaskHandle['events']>[0]) =>
         this.events(this.sessionId, taskId, options),
     });
   }
@@ -1762,7 +2365,12 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     return active.promise;
   }
 
-  async cancel(sessionId: string, taskId: string, reason?: string): Promise<SubAgentTaskSnapshot> {
+  async cancel(
+    sessionId: string,
+    taskId: string,
+    reason?: string,
+    options?: { readonly operationId?: string },
+  ): Promise<SubAgentTaskSnapshot> {
     assertRuntimeSession(sessionId, this.sessionId);
     const before = await this.#loadTask(taskId);
     if (taskOutcome(before) !== undefined) return taskSnapshot(before);
@@ -1784,10 +2392,26 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     );
     const deadlineAt = Date.now() + this.#limits.timeoutMs;
     const signal = createOperationSignal({ deadlineAt });
-    if (active?.rawHandle !== undefined) {
+    const operationId =
+      options?.operationId ?? `cancel-${canonicalJsonSha256({ taskId, reason: reason ?? null })}`;
+    assertNonEmpty(operationId, 'cancel operationId');
+    if (
+      before.binding !== undefined &&
+      executor !== undefined &&
+      (before.state === 'running' || before.state === 'result_submitted')
+    ) {
+      const target = this.#executors.selectRecovery(before.definition, before.executor);
+      validateBinding(before.binding, before.taskId, this.sessionId, target);
       try {
         await raceWithOperationSignal(
-          Promise.resolve(active.rawHandle.cancel(reason)),
+          Promise.resolve(
+            executor.cancel(before.binding, {
+              operationId,
+              ...(reason === undefined ? {} : { reason }),
+              signal,
+              deadlineAt,
+            }),
+          ),
           signal,
           deadlineAt,
         );
@@ -1799,6 +2423,10 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
       const task = await this.#loadTask(taskId);
       if (taskOutcome(task) !== undefined) return taskSnapshot(task);
+      const payload = cloneJsonValue({ reason: reason ?? null });
+      if (controlOperationReplay(task, operationId, 'cancel', payload) !== undefined) {
+        return taskSnapshot(task);
+      }
       const now = Date.now();
       const descriptor: SubAgentErrorDescriptor = Object.freeze({
         code: 'CANCELLED',
@@ -1811,8 +2439,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         now,
         error: descriptor,
       });
+      const settledCancelled = settleExecutorOperation(cancelled as StoredTask, now);
       const withEvent = appendSafeTaskEvents(
-        { ...cancelled, fencingToken: lease.fencingToken } as StoredTask,
+        { ...settledCancelled, fencingToken: lease.fencingToken } as StoredTask,
         [{ type: 'task.cancelled', timestamp: now, data: { status: 'cancelled' } }],
         {
           eventIds: [createRuntimeId('event')],
@@ -1820,14 +2449,23 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           revisionMode: 'preserve',
         },
       );
+      const taskWithReceipt = appendControlOperation(withEvent.task as StoredTask, {
+        operationId,
+        kind: 'cancel',
+        payload,
+        result: null,
+        completedAt: now,
+        fencingToken: lease.fencingToken,
+        revisionMode: 'preserve',
+      });
       const run = await this.#loadRun(task.runId);
       const wasActive = task.activeStartedAt !== undefined;
       const nextRun = wasActive ? this.#releaseActiveExecution(run, lease, now) : run;
       await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
         ...(wasActive ? { run: { previous: run, next: nextRun } } : {}),
-        tasks: [{ previous: task, next: withEvent.task, events: withEvent.events }],
+        tasks: [{ previous: task, next: taskWithReceipt, events: withEvent.events }],
       });
-      return taskSnapshot(withEvent.task);
+      return taskSnapshot(taskWithReceipt);
     });
   }
 
@@ -1860,9 +2498,12 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     }
 
     let target: SubAgentExecutionTarget;
-    let operation: SubAgentExecutorOperation;
+    let operation: PendingRecoveryOperation;
     if (task.state === 'waiting_approval') {
-      target = this.#resolveRecoveryTarget(task, 'approval');
+      const recovery = await this.#resolveRecoveryTarget(task, 'approval');
+      task = recovery.task;
+      target = recovery.target;
+      task = await this.#prepareRecoveryCheckpoint(task, target);
       const decisions = Object.freeze([...(options.decisions ?? [])]);
       validateApprovalDecisionSet(task, decisions);
       task = await this.#commitApprovalDecisions(taskId, decisions);
@@ -1872,10 +2513,14 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         type: 'resume',
         reason: 'approval',
         binding: task.binding as SubAgentExecutorBinding,
+        checkpoint: task.childCheckpoint as SubAgentChildCheckpoint,
         approvals: decisions,
       };
     } else {
-      target = this.#resolveRecoveryTarget(task, 'checkpoint');
+      const recovery = await this.#resolveRecoveryTarget(task, 'checkpoint');
+      task = recovery.task;
+      target = recovery.target;
+      task = await this.#prepareRecoveryCheckpoint(task, target);
       if (!task.recoveryRequired || task.state !== 'running') {
         throw createSubAgentError(
           'RECOVERY_UNSUPPORTED',
@@ -1889,6 +2534,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         type: 'resume',
         reason: 'checkpoint',
         binding: task.binding as SubAgentExecutorBinding,
+        checkpoint: task.childCheckpoint as SubAgentChildCheckpoint,
       };
     }
 
@@ -1914,7 +2560,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       );
     }
     if (this.#active.has(taskId)) return this.#createHandle(taskId);
-    const target = this.#resolveRecoveryTarget(task, 'reconnect');
+    const { target } = await this.#resolveRecoveryTarget(task, 'reconnect');
     if (target.descriptor.capabilities.recovery.reconnect !== 'external_binding') {
       throw createSubAgentError(
         'RECOVERY_UNSUPPORTED',
@@ -1935,29 +2581,55 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   async *events(
     sessionId: string,
     taskId: string,
-    options?: { readonly afterSequence?: number },
+    options?: {
+      readonly afterSequence?: number;
+      readonly limit?: number;
+      readonly signal?: AbortSignal;
+    },
   ): AsyncIterable<SubAgentTaskEvent> {
     assertRuntimeSession(sessionId, this.sessionId);
     let cursor = options?.afterSequence ?? 0;
     if (!Number.isSafeInteger(cursor) || cursor < 0) {
       throw new RangeError('Event cursor must be a non-negative safe integer.');
     }
+    const limit = options?.limit ?? 128;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) {
+      throw new RangeError('Event page limit must be a safe integer between 1 and 10000.');
+    }
+    const signal = options?.signal;
     for (;;) {
+      if (signal?.aborted) {
+        throw createSubAgentError('CANCELLED', 'The event stream was cancelled.');
+      }
       const task = await this.#loadTask(taskId);
-      const events = await this.stateStore.readEvents(this.sessionId, taskId, cursor);
-      for (const event of events) {
+      const events = await this.stateStore.readEvents(this.sessionId, taskId, cursor, {
+        limit,
+        ...(signal === undefined ? {} : { signal }),
+      });
+      for (const event of events.slice(0, limit)) {
+        if (signal?.aborted) {
+          throw createSubAgentError('CANCELLED', 'The event stream was cancelled.');
+        }
         cursor = event.sequence;
         yield event;
       }
       if (taskOutcome(task)?.type === 'terminal' && cursor >= task.eventSequence) return;
-      await new Promise<void>((resolve) => setTimeout(resolve, DEFAULT_RUNTIME_EVENT_POLL_MS));
+      if (signal === undefined) {
+        await new Promise<void>((resolve) => setTimeout(resolve, DEFAULT_RUNTIME_EVENT_POLL_MS));
+      } else {
+        await waitForRuntimeRetry(
+          signal,
+          Date.now() + this.#limits.timeoutMs,
+          DEFAULT_RUNTIME_EVENT_POLL_MS,
+        );
+      }
     }
   }
 
-  #resolveRecoveryTarget(
+  async #resolveRecoveryTarget(
     task: StoredTask,
     kind: 'approval' | 'checkpoint' | 'reconnect',
-  ): SubAgentExecutionTarget {
+  ): Promise<{ readonly task: StoredTask; readonly target: SubAgentExecutionTarget }> {
     const target = this.#executors.selectRecovery(task.definition, task.executor);
     this.#assertExecutionTarget(task, target);
     if (task.binding === undefined) {
@@ -1966,8 +2638,18 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         'Recovery requires a committed Executor binding.',
       );
     }
-    validateBinding(task.binding, task.taskId, this.sessionId, target);
-    if (task.binding.subagentSessionId !== task.subagentSessionId) {
+    task = await this.#prepareRecoveryBinding(task, target);
+    const binding = task.binding;
+    if (binding === undefined) {
+      throw createSubAgentError('BINDING_INVALID', 'The migrated Executor binding is missing.');
+    }
+    validateBinding(binding, task.taskId, this.sessionId, target);
+    if (
+      measureCanonicalJsonBytes(binding as unknown as JsonValue) > target.descriptor.maxBindingBytes
+    ) {
+      throw createSubAgentError('BINDING_INVALID', 'The persisted Executor binding is oversized.');
+    }
+    if (binding.subagentSessionId !== task.subagentSessionId) {
       throw createSubAgentError(
         'BINDING_INVALID',
         'The persisted Executor binding child session identity is invalid.',
@@ -1983,7 +2665,171 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         'The persisted Executor does not support resume.',
       );
     }
-    return target;
+    return { task, target };
+  }
+
+  async #prepareRecoveryBinding(
+    task: StoredTask,
+    target: SubAgentExecutionTarget,
+  ): Promise<StoredTask> {
+    if (task.binding === undefined) {
+      throw createSubAgentError('BINDING_INVALID', 'Recovery requires an Executor binding.');
+    }
+    const deadlineAt = Date.now() + this.#limits.timeoutMs;
+    const signal = createOperationSignal({ deadlineAt });
+    const migrated = await this.#normalizeExecutorBinding(task.binding, target, signal, deadlineAt);
+    if (isDeepStrictEqual(migrated, task.binding)) return task;
+
+    return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
+      const current = await this.#loadTask(task.taskId);
+      if (current.revision !== task.revision || !isDeepStrictEqual(current.binding, task.binding)) {
+        throw stateCasConflict();
+      }
+      const next = Object.freeze({
+        ...current,
+        binding: migrated,
+        revision: current.revision + 1,
+        fencingToken: lease.fencingToken,
+        updatedAt: Date.now(),
+      }) as StoredTask;
+      await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
+        tasks: [{ previous: current, next }],
+      });
+      return next;
+    });
+  }
+
+  async #normalizeExecutorBinding(
+    candidate: SubAgentExecutorBinding,
+    target: SubAgentExecutionTarget,
+    signal: AbortSignal,
+    deadlineAt: number,
+  ): Promise<SubAgentExecutorBinding> {
+    let value: JsonValue;
+    try {
+      assertJsonValue(candidate);
+      value = cloneJsonValue(candidate as unknown as JsonValue);
+    } catch {
+      throw createSubAgentError('BINDING_INVALID', 'The Executor binding is not JSON-safe.');
+    }
+    const original = candidate;
+    let binding = value as unknown as SubAgentExecutorBinding;
+    const visited = new Set<string>();
+    while (
+      binding.version !== '1' ||
+      binding.executorName !== target.descriptor.name ||
+      binding.adapterStateVersion !== target.descriptor.adapterStateVersion
+    ) {
+      throwIfOperationAborted(signal, deadlineAt);
+      const identity = `${String(binding.version)}\u0000${String(binding.executorName)}\u0000${String(binding.adapterStateVersion)}`;
+      if (visited.has(identity)) {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The Executor binding migration path contains a cycle.',
+        );
+      }
+      visited.add(identity);
+      const migrator = this.#migrators.find(
+        (entry) =>
+          entry.recordKind === 'executor-binding' &&
+          entry.fromVersion === binding.version &&
+          entry.executorName === binding.executorName &&
+          entry.fromAdapterStateVersion === binding.adapterStateVersion,
+      ) as Extract<AgentCheckpointMigrator, { recordKind: 'executor-binding' }> | undefined;
+      if (migrator === undefined) {
+        throw createSubAgentError(
+          'ADAPTER_STATE_VERSION_MISMATCH',
+          'No Executor binding migration path is registered.',
+        );
+      }
+      try {
+        value = await raceWithOperationSignal(
+          Promise.resolve(migrator.migrate(cloneJsonValue(value))),
+          signal,
+          deadlineAt,
+        );
+        assertJsonValue(value);
+        value = cloneJsonValue(value);
+      } catch (error) {
+        if (error instanceof SubAgentRuntimeError) throw error;
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The Executor binding migrator failed.',
+        );
+      }
+      binding = value as unknown as SubAgentExecutorBinding;
+      if (
+        binding.version !== migrator.toVersion ||
+        binding.executorName !== migrator.executorName ||
+        binding.adapterStateVersion !== migrator.toAdapterStateVersion
+      ) {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The Executor binding migrator returned the wrong version.',
+        );
+      }
+      assertBindingMigrationIdentity(original, binding);
+    }
+    assertBindingMigrationIdentity(original, binding);
+    validateBinding(binding, original.taskId, original.ownerSessionId, target);
+    return Object.freeze(binding);
+  }
+
+  async #prepareRecoveryCheckpoint(
+    task: StoredTask,
+    target: SubAgentExecutionTarget,
+  ): Promise<StoredTask> {
+    if (task.binding === undefined || task.childCheckpoint === undefined) {
+      throw createSubAgentError(
+        'CHECKPOINT_VERSION_MISMATCH',
+        'Resume requires a complete child checkpoint and binding.',
+      );
+    }
+    const deadlineAt = Date.now() + this.#limits.timeoutMs;
+    const signal = createOperationSignal({ deadlineAt });
+    const migrated = await this.#normalizeChildCheckpoint(
+      task.childCheckpoint,
+      signal,
+      deadlineAt,
+      { runnerId: task.binding.runnerId, runnerVersion: task.binding.runnerVersion },
+    );
+    if (
+      !target.descriptor.childCheckpointVersions.includes(migrated.version) ||
+      !target.descriptor.runnerCompatibility.some(
+        (runner) =>
+          runner.runnerId === migrated.runnerId &&
+          runner.runnerVersion === migrated.runnerVersion &&
+          runner.childCheckpointVersions.includes(migrated.version),
+      )
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_VERSION_MISMATCH',
+        'The migrated child checkpoint is incompatible with the Executor.',
+      );
+    }
+    if (isDeepStrictEqual(migrated, task.childCheckpoint)) return task;
+
+    return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
+      const current = await this.#loadTask(task.taskId);
+      if (
+        current.revision !== task.revision ||
+        !isDeepStrictEqual(current.binding, task.binding) ||
+        !isDeepStrictEqual(current.childCheckpoint, task.childCheckpoint)
+      ) {
+        throw stateCasConflict();
+      }
+      const next = Object.freeze({
+        ...current,
+        childCheckpoint: migrated,
+        revision: current.revision + 1,
+        fencingToken: lease.fencingToken,
+        updatedAt: Date.now(),
+      }) as StoredTask;
+      await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
+        tasks: [{ previous: current, next }],
+      });
+      return next;
+    });
   }
 
   async #commitApprovalDecisions(
@@ -2188,15 +3034,35 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   #startRecoveredExecution(
     task: StoredTask,
     target: SubAgentExecutionTarget,
-    operation: SubAgentExecutorOperation,
+    operation: PendingRecoveryOperation,
     mode: 'execute' | 'spawn',
   ): void {
     const controller = new AbortController();
     const deadlineAt = Date.now() + task.remainingMs;
     const signal = createOperationSignal({ deadlineAt, controller });
-    const promise = this.#runRecoveredTask(task, target, operation, mode, signal, deadlineAt)
+    const operationType =
+      operation.type === 'reconnect'
+        ? 'reconnect'
+        : operation.reason === 'approval'
+          ? 'resume_approval'
+          : 'resume_checkpoint';
+    const promise = this.#runWithExecutionOwnership(
+      task,
+      target,
+      operationType,
+      mode,
+      signal,
+      deadlineAt,
+      operation,
+    )
       .catch(async (error: unknown) =>
-        this.#finalizeExecutionError(task.taskId, task.attempt, error, true),
+        this.#finalizeExecutionError(
+          task.taskId,
+          task.attempt,
+          error,
+          true,
+          this.#active.get(task.taskId)?.ownership,
+        ),
       )
       .finally(() => this.#active.delete(task.taskId));
     this.#active.set(task.taskId, { promise, controller });
@@ -2245,7 +3111,8 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     await this.#appendExecutorEvent(
       task.taskId,
       target,
-      task.attempt,
+      executionOwnership(task),
+      `${operation.operationId}:reconnected-event`,
       { type: 'recovery.reconnected', data: { status: task.state } },
       signal,
       deadlineAt,
@@ -2311,6 +3178,7 @@ function validateBinding(
   const valid =
     typeof binding === 'object' &&
     binding !== null &&
+    binding.version === '1' &&
     binding.taskId === taskId &&
     binding.ownerSessionId === ownerSessionId &&
     binding.executorName === target.descriptor.name &&
@@ -2329,11 +3197,45 @@ function validateBinding(
     );
   }
   assertNonEmpty(binding.subagentSessionId, 'binding subagentSessionId');
+  assertNonEmpty(binding.runnerId, 'binding runnerId');
+  assertNonEmpty(binding.runnerVersion, 'binding runnerVersion');
+  if (
+    !target.descriptor.runnerCompatibility.some(
+      (runner) =>
+        runner.runnerId === binding.runnerId && runner.runnerVersion === binding.runnerVersion,
+    )
+  ) {
+    throw createSubAgentError(
+      'CHECKPOINT_VERSION_MISMATCH',
+      'The Executor binding runner identity is unavailable.',
+    );
+  }
   assertJsonValue(binding.recoveryData);
   try {
     target.executor.bindingCodec.decode(binding.recoveryData);
   } catch {
     throw createSubAgentError('BINDING_INVALID', 'The Executor binding payload is invalid.');
+  }
+}
+
+function assertBindingMigrationIdentity(
+  original: SubAgentExecutorBinding,
+  migrated: SubAgentExecutorBinding,
+): void {
+  const identityPreserved =
+    migrated.executorName === original.executorName &&
+    migrated.ownerSessionId === original.ownerSessionId &&
+    migrated.taskId === original.taskId &&
+    migrated.subagentSessionId === original.subagentSessionId &&
+    migrated.definitionName === original.definitionName &&
+    migrated.definitionVersion === original.definitionVersion &&
+    migrated.runnerId === original.runnerId &&
+    migrated.runnerVersion === original.runnerVersion;
+  if (!identityPreserved) {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'An Executor binding migrator changed immutable binding identity.',
+    );
   }
 }
 
@@ -2402,13 +3304,313 @@ function validateCheckpointConfiguration(
   for (const migrator of migrators) {
     assertNonEmpty(migrator.fromVersion, 'checkpoint migrator fromVersion');
     assertNonEmpty(migrator.toVersion, 'checkpoint migrator toVersion');
-    if (migrator.fromVersion === migrator.toVersion || typeof migrator.migrate !== 'function') {
-      throw new TypeError('Checkpoint migrators require distinct versions and migrate().');
+    if (typeof migrator.migrate !== 'function') {
+      throw new TypeError('Checkpoint migrators require migrate().');
     }
-    const key = `${migrator.recordKind}\u0000${migrator.fromVersion}\u0000${migrator.toVersion}`;
+    let scope: string;
+    switch (migrator.recordKind) {
+      case 'agent-run':
+      case 'context':
+        assertNonEmpty(migrator.protocol, 'checkpoint migrator protocol');
+        assertNonEmpty(migrator.fromCodecVersion, 'checkpoint migrator fromCodecVersion');
+        assertNonEmpty(migrator.toCodecVersion, 'checkpoint migrator toCodecVersion');
+        scope = `${migrator.protocol}\u0000${migrator.fromCodecVersion}\u0000${migrator.toCodecVersion}`;
+        break;
+      case 'executor-binding':
+        assertNonEmpty(migrator.executorName, 'checkpoint migrator executorName');
+        assertNonEmpty(
+          migrator.fromAdapterStateVersion,
+          'checkpoint migrator fromAdapterStateVersion',
+        );
+        assertNonEmpty(migrator.toAdapterStateVersion, 'checkpoint migrator toAdapterStateVersion');
+        scope = `${migrator.executorName}\u0000${migrator.fromAdapterStateVersion}\u0000${migrator.toAdapterStateVersion}`;
+        break;
+      case 'child-checkpoint':
+        assertNonEmpty(migrator.runnerId, 'checkpoint migrator runnerId');
+        assertNonEmpty(migrator.fromRunnerVersion, 'checkpoint migrator fromRunnerVersion');
+        assertNonEmpty(migrator.toRunnerVersion, 'checkpoint migrator toRunnerVersion');
+        scope = `${migrator.runnerId}\u0000${migrator.fromRunnerVersion}\u0000${migrator.toRunnerVersion}`;
+        break;
+      case 'task':
+        if (migrator.fromVersion === migrator.toVersion) {
+          throw new TypeError('Core task migrators require distinct record versions.');
+        }
+        scope = 'core-task';
+        break;
+    }
+    const implementationChanges =
+      migrator.recordKind === 'agent-run' || migrator.recordKind === 'context'
+        ? migrator.fromCodecVersion !== migrator.toCodecVersion
+        : migrator.recordKind === 'executor-binding'
+          ? migrator.fromAdapterStateVersion !== migrator.toAdapterStateVersion
+          : migrator.recordKind === 'child-checkpoint'
+            ? migrator.fromRunnerVersion !== migrator.toRunnerVersion
+            : false;
+    if (migrator.fromVersion === migrator.toVersion && !implementationChanges) {
+      throw new TypeError('Checkpoint migrators must change a record or implementation version.');
+    }
+    const key = `${migrator.recordKind}\u0000${scope}\u0000${migrator.fromVersion}\u0000${migrator.toVersion}`;
     if (migratorKeys.has(key)) throw new TypeError(`Duplicate checkpoint migrator ${key}.`);
     migratorKeys.add(key);
   }
+}
+
+function executionOwnership(task: StoredTask): ExecutionOwnership {
+  if (
+    typeof task.executionEpoch !== 'string' ||
+    task.executionEpoch.length === 0 ||
+    typeof task.executionFencingToken !== 'string' ||
+    task.executionFencingToken.length === 0 ||
+    task.executorOperation?.executionEpoch !== task.executionEpoch ||
+    task.executorOperation.attempt !== task.attempt
+  ) {
+    throw createSubAgentError(
+      'RECOVERY_TARGET_LOST',
+      'The task has no valid execution epoch ownership.',
+    );
+  }
+  return Object.freeze({
+    attempt: task.attempt,
+    executionEpoch: task.executionEpoch,
+    executionFencingToken: task.executionFencingToken,
+  });
+}
+
+function controlOperationReplay(
+  task: StoredTask,
+  operationId: string,
+  kind: StoredTaskControlOperationKind,
+  payload: JsonValue,
+): StoredTaskControlOperation | undefined {
+  const existing = task.controlOperations.find(
+    (operation) => operation.operationId === operationId,
+  );
+  if (existing === undefined) return undefined;
+  if (existing.kind !== kind || existing.payloadHash !== canonicalJsonSha256(payload)) {
+    throw createSubAgentError(
+      'IDEMPOTENCY_CONFLICT',
+      'The control operation ID is already bound to a different payload.',
+    );
+  }
+  return existing;
+}
+
+function appendControlOperation(
+  task: StoredTask,
+  input: {
+    readonly operationId: string;
+    readonly kind: StoredTaskControlOperationKind;
+    readonly payload: JsonValue;
+    readonly result?: JsonValue;
+    readonly completedAt: number;
+    readonly fencingToken: string;
+    readonly revisionMode?: 'advance' | 'preserve';
+  },
+): StoredTask {
+  if (task.controlOperations.length >= 4_096) {
+    throw createSubAgentError(
+      'LIMIT_EXCEEDED',
+      'The task has too many persisted control operation receipts.',
+    );
+  }
+  const receipt: StoredTaskControlOperation = Object.freeze({
+    operationId: input.operationId,
+    kind: input.kind,
+    payloadHash: canonicalJsonSha256(input.payload),
+    ...(input.result === undefined ? {} : { result: cloneJsonValue(input.result) }),
+    completedAt: input.completedAt,
+  });
+  return Object.freeze({
+    ...task,
+    controlOperations: Object.freeze([...task.controlOperations, receipt]),
+    revision: input.revisionMode === 'preserve' ? task.revision : task.revision + 1,
+    fencingToken: input.fencingToken,
+    updatedAt: input.completedAt,
+  });
+}
+
+function settleExecutorOperation(task: StoredTask, now: number): StoredTask {
+  if (task.executorOperation === undefined || task.executorOperation.status === 'settled') {
+    return task;
+  }
+  return Object.freeze({
+    ...task,
+    executorOperation: Object.freeze({
+      ...task.executorOperation,
+      status: 'settled' as const,
+      updatedAt: now,
+    }),
+  });
+}
+
+function checkpointVersion(value: JsonValue): string {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value) ||
+    typeof (value as Record<string, JsonValue>).version !== 'string' ||
+    ((value as Record<string, JsonValue>).version as string).length === 0
+  ) {
+    throw createSubAgentError(
+      'CHECKPOINT_VERSION_MISMATCH',
+      'The child checkpoint has no valid version.',
+    );
+  }
+  return (value as Record<string, JsonValue>).version as string;
+}
+
+function checkpointRunner(value: JsonValue): {
+  readonly runnerId: string;
+  readonly runnerVersion: string;
+} {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw createSubAgentError('CHECKPOINT_VERSION_MISMATCH', 'The child checkpoint is invalid.');
+  }
+  const record = value as Record<string, JsonValue>;
+  const runnerId = record.runnerId;
+  const runnerVersion = record.runnerVersion;
+  if (
+    typeof runnerId !== 'string' ||
+    runnerId.length === 0 ||
+    typeof runnerVersion !== 'string' ||
+    runnerVersion.length === 0
+  ) {
+    throw createSubAgentError(
+      'CHECKPOINT_VERSION_MISMATCH',
+      'The child checkpoint has no exact runner identity.',
+    );
+  }
+  return Object.freeze({ runnerId, runnerVersion });
+}
+
+function validateChildCheckpointV1(
+  value: JsonValue,
+  codecs: readonly AgentProtocolCheckpointCodec[],
+): SubAgentChildCheckpoint {
+  if (checkpointVersion(value) !== '1' || Array.isArray(value) || value === null) {
+    throw createSubAgentError(
+      'CHECKPOINT_VERSION_MISMATCH',
+      'The child checkpoint version is unsupported.',
+    );
+  }
+  const checkpoint = value as unknown as SubAgentChildCheckpoint;
+  checkpointRunner(value);
+  const protocol = checkpoint.protocolContext;
+  const context = checkpoint.contextStore;
+  if (
+    typeof protocol !== 'object' ||
+    protocol === null ||
+    typeof protocol.protocol !== 'string' ||
+    typeof protocol.codecVersion !== 'string' ||
+    typeof context !== 'object' ||
+    context === null ||
+    context.version !== '1' ||
+    context.protocol !== protocol.protocol ||
+    context.codecVersion !== protocol.codecVersion
+  ) {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The child checkpoint protocol and context identities are inconsistent.',
+    );
+  }
+  const codec = codecs.find(
+    (entry) => entry.protocol === protocol.protocol && entry.version === protocol.codecVersion,
+  );
+  if (codec === undefined) {
+    throw createSubAgentError(
+      'CHECKPOINT_VERSION_MISMATCH',
+      'No exact protocol checkpoint codec is registered for the child checkpoint.',
+    );
+  }
+  try {
+    codec.decode(protocol.value);
+  } catch {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The child protocol checkpoint cannot be decoded.',
+    );
+  }
+  if (
+    !Number.isSafeInteger(checkpoint.modelIteration) ||
+    checkpoint.modelIteration < 0 ||
+    (checkpoint.maxIterations !== null &&
+      (!Number.isSafeInteger(checkpoint.maxIterations) || checkpoint.maxIterations < 1)) ||
+    (checkpoint.maxIterations !== null && checkpoint.modelIteration > checkpoint.maxIterations)
+  ) {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The child checkpoint iteration counters are invalid.',
+    );
+  }
+  const pending = checkpoint.pendingBatch;
+  if (pending !== undefined) {
+    if (
+      pending.version !== '1' ||
+      typeof pending.batchId !== 'string' ||
+      pending.batchId.length === 0 ||
+      !Array.isArray(pending.calls) ||
+      typeof pending.endRequested !== 'boolean' ||
+      !Number.isFinite(pending.createdAt) ||
+      pending.assistantMessage.protocol !== protocol.protocol ||
+      pending.assistantMessage.codecVersion !== protocol.codecVersion
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'The child pending batch checkpoint is invalid.',
+      );
+    }
+    const callIds = new Set<string>();
+    for (let index = 0; index < pending.calls.length; index += 1) {
+      const call = pending.calls[index]!;
+      if (
+        call.version !== '1' ||
+        call.order !== index ||
+        typeof call.operationId !== 'string' ||
+        call.operationId.length === 0 ||
+        !['tool', 'agent', 'end-agent'].includes(call.kind) ||
+        typeof call.callId !== 'string' ||
+        call.callId.length === 0 ||
+        callIds.has(call.callId) ||
+        typeof call.name !== 'string' ||
+        call.name.length === 0 ||
+        call.inputHash !== canonicalJsonSha256(call.input) ||
+        ![
+          'prepared',
+          'in_flight',
+          'waiting_approval',
+          'result_ready',
+          'result_submitted',
+          'applied',
+        ].includes(call.status) ||
+        (call.kind === 'end-agent' && !pending.endRequested)
+      ) {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The child pending batch contains an invalid call.',
+        );
+      }
+      callIds.add(call.callId);
+    }
+  }
+  const compact = checkpoint.compactTransaction;
+  if (
+    compact !== undefined &&
+    (compact.schemaVersion !== '1' ||
+      typeof compact.transactionId !== 'string' ||
+      compact.transactionId.length === 0 ||
+      !['summary', 'tool_payload'].includes(compact.kind) ||
+      !Number.isSafeInteger(compact.contextRevision) ||
+      compact.contextRevision < 0 ||
+      !['prepared', 'in_flight', 'result_ready', 'applied'].includes(compact.phase) ||
+      !Number.isFinite(compact.preparedAt) ||
+      !Number.isFinite(compact.updatedAt))
+  ) {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The child compact transaction checkpoint is invalid.',
+    );
+  }
+  return Object.freeze(cloneJsonValue(value) as unknown as SubAgentChildCheckpoint);
 }
 
 function taskSnapshot(task: StoredTask): SubAgentTaskSnapshot {

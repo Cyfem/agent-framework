@@ -373,6 +373,50 @@ function validateAndCloneDescriptor(executor: SubAgentExecutor): SubAgentExecuto
     throw new TypeError('Subagent Executor descriptor must be an object.');
   }
   assertIdentity('Executor name', descriptor.name, NAME_PATTERN);
+  if (descriptor.runtimeProtocolVersion !== '1') {
+    throw new TypeError('Subagent Executor runtimeProtocolVersion must be "1".');
+  }
+  const taskRecordVersions = validateVersions(
+    'Executor taskRecordVersions',
+    descriptor.taskRecordVersions,
+  );
+  if (!taskRecordVersions.includes('1')) {
+    throw new TypeError('Subagent Executor must support task record version "1".');
+  }
+  const childCheckpointVersions = validateVersions(
+    'Executor childCheckpointVersions',
+    descriptor.childCheckpointVersions,
+  );
+  if (!Array.isArray(descriptor.runnerCompatibility)) {
+    throw new TypeError('Executor runnerCompatibility must be an array.');
+  }
+  const runnerKeys = new Set<string>();
+  const runnerCompatibility = Object.freeze(
+    descriptor.runnerCompatibility.map((runner) => {
+      if (typeof runner !== 'object' || runner === null) {
+        throw new TypeError('Executor runnerCompatibility entries must be objects.');
+      }
+      assertIdentity('Executor runnerId', runner.runnerId, NAME_PATTERN);
+      assertIdentity('Executor runnerVersion', runner.runnerVersion, VERSION_PATTERN);
+      const versions = validateVersions(
+        'Executor runner childCheckpointVersions',
+        runner.childCheckpointVersions,
+      );
+      if (versions.some((version) => !childCheckpointVersions.includes(version))) {
+        throw new TypeError('Runner checkpoint versions must be declared by the Executor.');
+      }
+      const key = `${runner.runnerId}\u0000${runner.runnerVersion}`;
+      if (runnerKeys.has(key)) {
+        throw new TypeError('Executor runnerCompatibility must not contain duplicates.');
+      }
+      runnerKeys.add(key);
+      return Object.freeze({
+        runnerId: runner.runnerId,
+        runnerVersion: runner.runnerVersion,
+        childCheckpointVersions: versions,
+      });
+    }),
+  );
   assertIdentity('Executor adapterStateVersion', descriptor.adapterStateVersion, VERSION_PATTERN);
   assertBoundedText('Executor description', descriptor.description, MAX_DESCRIPTION_BYTES);
   if (!Array.isArray(descriptor.useCases) || descriptor.useCases.length === 0) {
@@ -406,6 +450,29 @@ function validateAndCloneDescriptor(executor: SubAgentExecutor): SubAgentExecuto
   ) {
     throw new TypeError('Subagent Executor recovery capabilities are invalid.');
   }
+  if (
+    !Number.isSafeInteger(descriptor.maxBindingBytes) ||
+    descriptor.maxBindingBytes < 1 ||
+    descriptor.maxBindingBytes > 64 * 1024
+  ) {
+    throw new RangeError('Subagent Executor maxBindingBytes is invalid.');
+  }
+  if (
+    !Number.isSafeInteger(descriptor.maxEventPageSize) ||
+    descriptor.maxEventPageSize < 1 ||
+    descriptor.maxEventPageSize > 10_000
+  ) {
+    throw new RangeError('Subagent Executor maxEventPageSize is invalid.');
+  }
+  if (capabilities.recovery.resume === 'checkpoint' && !childCheckpointVersions.includes('1')) {
+    throw new TypeError('Checkpoint recovery requires child checkpoint version "1" support.');
+  }
+  if (capabilities.recovery.resume === 'checkpoint' && runnerCompatibility.length === 0) {
+    throw new TypeError('Checkpoint recovery requires at least one compatible runner identity.');
+  }
+  if (typeof executor.cancel !== 'function') {
+    throw new TypeError('Subagent Executor requires binding-addressed cancel().');
+  }
   if (!capabilities.spawn && (capabilities.cancel || capabilities.events)) {
     throw new TypeError('Subagent Executor cancel/events capabilities require spawn support.');
   }
@@ -427,6 +494,10 @@ function validateAndCloneDescriptor(executor: SubAgentExecutor): SubAgentExecuto
   }
 
   return Object.freeze({
+    runtimeProtocolVersion: '1',
+    taskRecordVersions,
+    childCheckpointVersions,
+    runnerCompatibility,
     name: descriptor.name,
     description: descriptor.description.trim(),
     useCases: Object.freeze(useCases),
@@ -440,7 +511,23 @@ function validateAndCloneDescriptor(executor: SubAgentExecutor): SubAgentExecuto
       recovery: Object.freeze({ ...capabilities.recovery }),
     }),
     adapterStateVersion: descriptor.adapterStateVersion,
+    maxBindingBytes: descriptor.maxBindingBytes,
+    maxEventPageSize: descriptor.maxEventPageSize,
   });
+}
+
+function validateVersions(label: string, versions: readonly string[]): readonly string[] {
+  if (!Array.isArray(versions) || versions.length === 0) {
+    throw new TypeError(`${label} must contain at least one version.`);
+  }
+  const cloned = versions.map((version) => {
+    assertIdentity(label, version, VERSION_PATTERN);
+    return version;
+  });
+  if (new Set(cloned).size !== cloned.length) {
+    throw new TypeError(`${label} must not contain duplicates.`);
+  }
+  return Object.freeze(cloned);
 }
 
 function validateAndCloneAvailability(

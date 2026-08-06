@@ -20,6 +20,7 @@ import type {
   ModelErrorDescriptor,
   ToolPayloadReplacements,
 } from '../../agent/types';
+import { OPENAI_RESPONSES_CHECKPOINT_CODEC } from '../../subagent/checkpoint';
 import { createAbortScope, throwIfAborted } from '../base/abort';
 import { Model, type ModelGenerateRequest, type ModelGenerateResult } from '../base';
 import { classifyOpenAICompatibleError } from '../openai-error';
@@ -50,6 +51,8 @@ export type * from './types';
  * 本地工具调用。
  */
 export class OpenAIResponsesModel extends Model<OpenAIResponsesProtocol> {
+  override readonly checkpointCodec = OPENAI_RESPONSES_CHECKPOINT_CODEC;
+
   #openai: OpenAI;
   #model: string;
   #defaultParams: OpenAIResponsesModelOptions['defaultParams'];

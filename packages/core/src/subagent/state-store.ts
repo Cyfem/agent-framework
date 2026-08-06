@@ -1,5 +1,10 @@
 import type { ApprovalDecisionRecord, ApprovalRequest } from './approval';
-import type { ContextStoreCheckpointV1, EncodedAgentProtocolCheckpoint } from './checkpoint';
+import type {
+  ContextStoreCheckpointV1,
+  DurableContextCompactTransactionV1,
+  EncodedAgentProtocolCheckpoint,
+  SubAgentChildCheckpoint,
+} from './checkpoint';
 import type { SubAgentContextItem, SubAgentDefinitionRef } from './definition';
 import type { SubAgentErrorDescriptor } from './errors';
 import type { SubAgentExecutorBinding } from './executor';
@@ -22,7 +27,7 @@ export type StoredAgentRunStatus =
   | 'failed';
 
 export type StoredPendingToolCallKind = 'tool' | 'agent' | 'end-agent';
-export type StoredPendingToolCallStatus = 'pending' | 'running' | 'paused' | 'settled';
+export type StoredPendingToolCallStatus = 'pending' | 'running' | 'paused' | 'settled' | 'applied';
 
 export interface StoredPendingToolCall {
   readonly callId: string;
@@ -56,11 +61,41 @@ export interface StoredAgentRun {
   readonly protocolContext: EncodedAgentProtocolCheckpoint;
   readonly contextStore: ContextStoreCheckpointV1;
   readonly modelIteration: number;
-  readonly maxIterations: number;
+  readonly maxIterations: number | null;
   readonly pendingBatch?: StoredPendingToolBatch;
+  readonly compactTransaction?: DurableContextCompactTransactionV1;
   readonly budget: TreeBudgetSnapshot;
   readonly pendingApprovals: readonly ApprovalRequest[];
   readonly endRequested: boolean;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export type StoredTaskControlOperationKind =
+  | 'binding'
+  | 'checkpoint'
+  | 'approval'
+  | 'progress'
+  | 'budget'
+  | 'event'
+  | 'cancel';
+
+/** Durable replay receipt for control-plane operations that can cross a transport boundary. */
+export interface StoredTaskControlOperation {
+  readonly operationId: string;
+  readonly kind: StoredTaskControlOperationKind;
+  readonly payloadHash: string;
+  readonly result?: JsonValue;
+  readonly completedAt: number;
+}
+
+export interface StoredExecutorOperationV1 {
+  readonly version: '1';
+  readonly operationId: string;
+  readonly type: 'create' | 'resume_approval' | 'resume_checkpoint' | 'reconnect';
+  readonly attempt: number;
+  readonly executionEpoch: string;
+  readonly status: 'prepared' | 'dispatched' | 'settled';
   readonly createdAt: number;
   readonly updatedAt: number;
 }
@@ -86,8 +121,13 @@ export interface StoredTask {
   readonly path: readonly string[];
   readonly depth: number;
   readonly attempt: number;
+  readonly executionEpoch?: string;
+  readonly executionFencingToken?: string;
+  readonly executorOperation?: StoredExecutorOperationV1;
   readonly retryOf?: string;
   readonly binding?: SubAgentExecutorBinding;
+  readonly childCheckpoint?: SubAgentChildCheckpoint;
+  readonly controlOperations: readonly StoredTaskControlOperation[];
   readonly resultReceipt?: ResultReceipt;
   readonly completionReceipt?: CompletionReceipt;
   readonly result?: SubAgentTaskResult;
@@ -176,6 +216,7 @@ export interface AgentRuntimeStateStore {
     ownerSessionId: string,
     taskId: string,
     afterSequence?: number,
+    options?: { readonly limit?: number; readonly signal?: AbortSignal },
   ): Promise<readonly SubAgentTaskEvent[]>;
   acquireLease(key: string, ttlMs: number): Promise<StateLease>;
 }

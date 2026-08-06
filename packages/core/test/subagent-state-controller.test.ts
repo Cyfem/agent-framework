@@ -69,6 +69,7 @@ function createTask(fencingToken: string, overrides: Partial<StoredTask> = {}): 
     attempt: 1,
     approvals: [],
     approvalDecisions: [],
+    controlOperations: [],
     recoveryRequired: false,
     activeElapsedMs: 0,
     remainingMs: 120_000,
@@ -312,12 +313,15 @@ describe('runtime state controller validation', () => {
         lease,
         createTask(lease.fencingToken, {
           binding: {
+            version: '1',
             executorName: 'local',
             ownerSessionId: 'owner-1',
             taskId: 'task-1',
             subagentSessionId: 'child-session-1',
             definitionName: 'researcher',
             definitionVersion: '2',
+            runnerId: 'test-runner',
+            runnerVersion: '1',
             adapterStateVersion: '1',
             recoveryData: {},
           },

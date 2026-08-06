@@ -4,6 +4,7 @@ import { acceptanceIt } from '../../../testkit';
 import {
   BUILTIN_AGENT_PROTOCOL_CHECKPOINT_CODECS,
   DEFAULT_ARTIFACT_LIMITS,
+  DEFAULT_EXECUTOR_MAX_BINDING_BYTES,
   DEFAULT_SUBAGENT_IO_LIMITS,
   DEFAULT_SUBAGENT_LIMITS,
   DEFAULT_SUBAGENT_PROJECTION_LIMITS,
@@ -13,6 +14,7 @@ import {
   type ArtifactReference,
   type ExecutorTaskHandle,
   type ModelSubAgentRequest,
+  type StoredAgentRun,
   type SubAgentExecutionOutcome,
   type SubAgentExecutorOperation,
   type SubAgentRuntime,
@@ -49,6 +51,7 @@ type _RawHandleHasBinding = Assert<
 type _ArtifactKeys = Assert<
   Equal<keyof ArtifactReference, 'version' | 'id' | 'mediaType' | 'size' | 'sha256'>
 >;
+type _RunMaxIterations = Assert<Equal<StoredAgentRun['maxIterations'], number | null>>;
 type ContractAssertions = [
   _ModelWireKeys,
   _StateLookupScope,
@@ -57,24 +60,29 @@ type ContractAssertions = [
   _HostHandleHidesBinding,
   _RawHandleHasBinding,
   _ArtifactKeys,
+  _RunMaxIterations,
 ];
 
 void (undefined as ContractAssertions | undefined);
 
 const operations = [
-  { type: 'create', idempotencyKey: 'request-1' },
+  { type: 'create', operationId: 'operation-create', idempotencyKey: 'request-1' },
   {
     type: 'resume',
+    operationId: 'operation-approval',
     reason: 'approval',
     binding: undefined as never,
+    checkpoint: undefined as never,
     approvals: [],
   },
   {
     type: 'resume',
+    operationId: 'operation-checkpoint',
     reason: 'checkpoint',
     binding: undefined as never,
+    checkpoint: undefined as never,
   },
-  { type: 'reconnect', binding: undefined as never },
+  { type: 'reconnect', operationId: 'operation-reconnect', binding: undefined as never },
 ] satisfies readonly SubAgentExecutorOperation[];
 
 function terminalOutput(result: SubAgentTaskResult): unknown {
@@ -168,5 +176,6 @@ describe('Subagent v2 contract surface', () => {
 acceptanceIt('CON-01.l1.runtime-contracts', 'contracts', () => {
   expect(operations).toHaveLength(4);
   expect(DEFAULT_SUBAGENT_IO_LIMITS.maxInputBytes).toBe(256 * 1024);
+  expect(DEFAULT_EXECUTOR_MAX_BINDING_BYTES).toBe(64 * 1024);
   expect(BUILTIN_AGENT_PROTOCOL_CHECKPOINT_CODECS).toHaveLength(2);
 });

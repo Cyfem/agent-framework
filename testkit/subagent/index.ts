@@ -3,6 +3,7 @@ export * from './acceptance-reporter';
 export * from './barrier';
 export * from './deferred';
 export * from './deterministic-id-factory';
+export * from './executor-conformance';
 export * from './fault-injector';
 export * from './manual-clock';
 export * from './network-deny-guard';

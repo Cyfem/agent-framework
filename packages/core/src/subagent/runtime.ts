@@ -60,6 +60,11 @@ export interface ChildDelegationRequest<
 export interface SubAgentDispatcher {
   getCatalog(): ExecutorCatalogSnapshot;
   getCatalogEntries(): readonly SubAgentCatalogEntry[];
+  /** Submit a model Tool call and expose its durable task identity before waiting. */
+  submitTool(
+    request: ModelSubAgentRequest,
+    context: SubAgentDispatchContext,
+  ): Promise<SubAgentTaskHandle>;
   dispatchTool(
     request: ModelSubAgentRequest,
     context: SubAgentDispatchContext,
@@ -78,7 +83,13 @@ export interface SubAgentTaskHandle {
   snapshot(): Promise<SubAgentTaskSnapshot>;
   wait(): Promise<SubAgentExecutionOutcome>;
   cancel(reason?: string): Promise<SubAgentTaskSnapshot>;
-  events(options?: { readonly afterSequence?: number }): AsyncIterable<SubAgentTaskEvent>;
+  events(options?: SubAgentEventStreamOptions): AsyncIterable<SubAgentTaskEvent>;
+}
+
+export interface SubAgentEventStreamOptions {
+  readonly afterSequence?: number;
+  readonly limit?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface SubAgentRuntimeOptions {
@@ -93,6 +104,8 @@ export interface SubAgentRuntimeOptions {
   readonly catalogPolicy?: ExecutorCatalogPolicy;
   readonly protocolCheckpointCodecs?: readonly AgentProtocolCheckpointCodec[];
   readonly checkpointMigrators?: readonly AgentCheckpointMigrator[];
+  /** Lease held for one Executor execution epoch and renewed until settle. */
+  readonly executionLeaseTtlMs?: number;
 }
 
 /** Session-bound Core runtime. `init()` is the only asynchronous configuration phase. */
@@ -110,7 +123,12 @@ export interface SubAgentRuntime extends SubAgentDispatcher {
     subagentSessionId: string,
   ): Promise<SubAgentSessionSnapshot>;
   wait(sessionId: string, taskId: string): Promise<SubAgentExecutionOutcome>;
-  cancel(sessionId: string, taskId: string, reason?: string): Promise<SubAgentTaskSnapshot>;
+  cancel(
+    sessionId: string,
+    taskId: string,
+    reason?: string,
+    options?: { readonly operationId?: string },
+  ): Promise<SubAgentTaskSnapshot>;
   resume(
     sessionId: string,
     taskId: string,
@@ -120,6 +138,6 @@ export interface SubAgentRuntime extends SubAgentDispatcher {
   events(
     sessionId: string,
     taskId: string,
-    options?: { readonly afterSequence?: number },
+    options?: SubAgentEventStreamOptions,
   ): AsyncIterable<SubAgentTaskEvent>;
 }

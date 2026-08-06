@@ -84,12 +84,13 @@ console.log(context);
 
 ## 仓库结构
 
-| 路径                   | 说明                                                                   |
-| ---------------------- | ---------------------------------------------------------------------- |
-| `packages/core`        | 唯一发布到 npm 的核心库，输出 ESM、CJS 和 TypeScript 声明。            |
-| `demo/src`             | CLI 示例、离线回归、真实方舟调用、金融新闻和 Windows 工具。            |
-| `demo/electron-weixin` | Windows Electron 微信消息示例。                                        |
-| `plans`                | Subagent v2 的目标架构与验收方案；已实现范围以源码和各包 README 为准。 |
+| 路径                      | 说明                                                                   |
+| ------------------------- | ---------------------------------------------------------------------- |
+| `packages/core`           | 发布到 npm 的核心库，输出 ESM、CJS 和 TypeScript 声明。                |
+| `packages/executor-local` | 官方本地 Executor 与 Memory/Atomic File StateStore，独立发布。         |
+| `demo/src`                | CLI 示例、离线回归、真实方舟调用、金融新闻和 Windows 工具。            |
+| `demo/electron-weixin`    | Windows Electron 微信消息示例。                                        |
+| `plans`                   | Subagent v2 的目标架构与验收方案；已实现范围以源码和各包 README 为准。 |
 
 核心包没有 `bin` CLI；下文命令都是本仓库的 pnpm workspace scripts。demo 源码中的 `@manee/agent-framework` 是 pnpm workspace alias，实际指向发布包 `@ruixutong.manee/maneeagent-framework`；它只是 demo 的本地 import 名，不是另一个 npm 包。
 
@@ -109,7 +110,7 @@ pnpm demo
 
 正式验收证据使用固定的 Node.js 22 和 `pnpm@11.1.3`。Windows 上可运行 `pnpm toolchain:node22`，脚本会把便携工具链安装到被忽略的 `.tools/` 目录，并在解压前核对 Node.js 官方 SHA-256；日常开发可继续使用满足版本要求的本机工具链。
 
-Subagent v2 实施期间可运行 `pnpm validate:subagent:v2:manifest`、`pnpm validate:subagent:v2:legacy` 和 `pnpm validate:subagent:v2:pack` 校验需求追踪、旧 wire 基线与发布包内容；`validate:subagent:v2:evidence` 还需通过 `--evidence=<repo-relative.json>` 显式指定本次证据 shard。这些是仓库验收命令，不是 npm 包 CLI。
+Subagent v2 实施期间可运行 `pnpm validate:subagent:v2:manifest`、`pnpm validate:subagent:v2:legacy` 和 `pnpm validate:subagent:v2:pack` 校验需求追踪、旧 wire 基线与 Core/Local 两个发布包的内容；`validate:subagent:v2:evidence` 还需通过 `--evidence=<repo-relative.json>` 显式指定本次证据 shard。这些是仓库验收命令，不是 npm 包 CLI。
 
 ## Skills
 
@@ -186,7 +187,7 @@ pnpm lint
 pnpm format:check
 ```
 
-`pnpm test` 通过 Vitest 运行核心包单元测试，不需要模型凭据或网络访问；`pnpm demo`、`pnpm demo:chat` 和 `pnpm demo:finance-news:smoke` 是额外的离线回归入口。
+`pnpm test` 显式组合 Core 与 Local Executor 的 Vitest 测试，不需要模型凭据或网络访问，也不会递归触发真实模型命令；`pnpm demo`、`pnpm demo:chat` 和 `pnpm demo:finance-news:smoke` 是额外的离线回归入口。
 
 ## 当前限制
 
@@ -235,4 +236,4 @@ const agent = new Agent({
 
 核心 API、事件、上下文、Skills、子代理、Responses/Chat 适配和自定义 Model 的完整说明见 [`packages/core/README.md`](./packages/core/README.md)。
 
-Subagent v2 正按上述计划分批实施。当前 Core workspace 已进入 `2.0.0` 开发线：C2 已冻结公共 contracts；C3 已实现稳定 ID checkpoint、状态机与事务状态控制器；C4 已实现显式 Catalog 刷新、保守能力交集、动态根 `object + oneOf` 模型 schema、无 fallback Router，以及可执行的 `createSubAgentRuntime()`（幂等 create、审批暂停/恢复、Host retry、取消、事件和精确恢复目标）。官方 Local Executor、父 Agent batch checkpoint 与 `Agent` loop 的 v2 原子切换仍属于后续批次；当前可执行 Runtime 需要调用方自行提供 `AgentRuntimeStateStore` 和 `SubAgentExecutor`。实际边界见 [`packages/core/README.md`](./packages/core/README.md)。
+Subagent v2 正按上述计划分批实施。当前公开包已进入 `2.0.0` 开发线：C2–C4 已完成 contracts、持久状态域、Catalog/Router 和可执行的 `createSubAgentRuntime()`；C5 已加入固定 fencing 的父 run checkpoint controller、可恢复 Tool batch 基础，以及独立发布的官方 Local Executor、Memory Store 和单机 Atomic File Store。`Agent` 公共 loop 仍使用迁移前路径，必须等 C6 在同一提交中原子切换，不能把 C5 的内部 controller 当成已接线的 Agent API。实际能力和文件存储边界见 [`packages/core/README.md`](./packages/core/README.md) 与 [`packages/executor-local/README.md`](./packages/executor-local/README.md)。

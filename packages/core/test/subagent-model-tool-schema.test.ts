@@ -12,6 +12,12 @@ import type { JsonValue } from '../src/subagent/json';
 
 const executor = (name: string, status: 'available' | 'degraded' = 'available') =>
   ({
+    runtimeProtocolVersion: '1',
+    taskRecordVersions: ['1'],
+    childCheckpointVersions: ['1'],
+    runnerCompatibility: [
+      { runnerId: 'test-runner', runnerVersion: '1', childCheckpointVersions: ['1'] },
+    ],
     name,
     description: `${name} placement.`,
     useCases: [`Use ${name}.`],
@@ -25,6 +31,8 @@ const executor = (name: string, status: 'available' | 'degraded' = 'available') 
       recovery: { resume: 'checkpoint', reconnect: 'external_binding' },
     },
     adapterStateVersion: '1',
+    maxBindingBytes: 64 * 1024,
+    maxEventPageSize: 256,
     status,
   }) satisfies SubAgentCatalogExecutorEntry;
 

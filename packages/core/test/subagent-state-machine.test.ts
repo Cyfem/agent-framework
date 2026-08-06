@@ -40,6 +40,7 @@ function task(overrides: Partial<StoredTask> = {}): StoredTask {
     attempt: 1,
     approvals: [],
     approvalDecisions: [],
+    controlOperations: [],
     recoveryRequired: false,
     activeElapsedMs: 10,
     activeStartedAt: 100,

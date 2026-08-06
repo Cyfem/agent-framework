@@ -3,7 +3,12 @@ import type { OpenAIChatProtocol } from '../llm/chat/types';
 import type { OpenAIResponsesProtocol } from '../llm/responses/types';
 import { assertJsonValue, canonicalizeJson, parseJsonValue, type JsonValue } from './json';
 
-export type CheckpointRecordKind = 'agent-run' | 'task' | 'context' | 'executor-binding';
+export type CheckpointRecordKind =
+  | 'agent-run'
+  | 'task'
+  | 'context'
+  | 'executor-binding'
+  | 'child-checkpoint';
 
 /** Self-describing protocol context stored inside a durable run checkpoint. */
 export interface EncodedAgentProtocolCheckpoint {
@@ -20,13 +25,96 @@ export interface AgentProtocolCheckpointCodec<P extends AgentProtocol = AgentPro
   decode(value: JsonValue): readonly ContextOf<P>[];
 }
 
-/** Copy-on-write migration between two exact persisted schema versions. */
-export interface AgentCheckpointMigrator {
-  readonly recordKind: CheckpointRecordKind;
+interface BaseAgentCheckpointMigrator {
   readonly fromVersion: string;
   readonly toVersion: string;
   migrate(value: JsonValue): JsonValue | Promise<JsonValue>;
 }
+
+/** Copy-on-write migration between two exact persisted schema and implementation identities. */
+export type AgentCheckpointMigrator =
+  | (BaseAgentCheckpointMigrator & { readonly recordKind: 'task' })
+  | (BaseAgentCheckpointMigrator & {
+      readonly recordKind: 'agent-run' | 'context';
+      readonly protocol: string;
+      readonly fromCodecVersion: string;
+      readonly toCodecVersion: string;
+    })
+  | (BaseAgentCheckpointMigrator & {
+      readonly recordKind: 'executor-binding';
+      readonly executorName: string;
+      readonly fromAdapterStateVersion: string;
+      readonly toAdapterStateVersion: string;
+    })
+  | (BaseAgentCheckpointMigrator & {
+      readonly recordKind: 'child-checkpoint';
+      readonly runnerId: string;
+      readonly fromRunnerVersion: string;
+      readonly toRunnerVersion: string;
+    });
+
+export type SubAgentChildOperationKind = 'tool' | 'agent' | 'end-agent';
+export type SubAgentChildOperationStatus =
+  | 'prepared'
+  | 'in_flight'
+  | 'waiting_approval'
+  | 'result_ready'
+  | 'result_submitted'
+  | 'applied';
+
+/** Complete durable description of a child operation that may be replayed after suspension. */
+export interface SubAgentChildOperationCheckpointV1 {
+  readonly version: '1';
+  readonly operationId: string;
+  readonly kind: SubAgentChildOperationKind;
+  readonly callId: string;
+  readonly name: string;
+  readonly input: JsonValue;
+  readonly inputHash: string;
+  readonly status: SubAgentChildOperationStatus;
+  readonly order: number;
+  readonly taskId?: string;
+  readonly approvals?: readonly string[];
+  readonly result?: JsonValue;
+}
+
+export interface SubAgentChildPendingBatchV1 {
+  readonly version: '1';
+  readonly batchId: string;
+  readonly assistantMessage: EncodedAgentProtocolCheckpoint;
+  readonly calls: readonly SubAgentChildOperationCheckpointV1[];
+  readonly endRequested: boolean;
+  readonly createdAt: number;
+}
+
+export interface DurableContextCompactTransactionV1 {
+  readonly schemaVersion: '1';
+  readonly transactionId: string;
+  readonly kind: 'summary' | 'tool_payload';
+  readonly contextRevision: number;
+  readonly phase: 'prepared' | 'in_flight' | 'result_ready' | 'applied';
+  readonly preparedAt: number;
+  readonly updatedAt: number;
+  readonly result?: JsonValue;
+  readonly outcomeUnknown?: boolean;
+}
+
+export type SubAgentChildCompactTransactionV1 = DurableContextCompactTransactionV1;
+
+/** Complete child loop checkpoint. A binding alone is never treated as a resumable checkpoint. */
+export interface SubAgentChildCheckpointV1 {
+  readonly version: '1';
+  readonly runnerId: string;
+  readonly runnerVersion: string;
+  readonly protocolContext: EncodedAgentProtocolCheckpoint;
+  readonly contextStore: ContextStoreCheckpointV1;
+  readonly modelIteration: number;
+  readonly maxIterations: number | null;
+  readonly pendingBatch?: SubAgentChildPendingBatchV1;
+  readonly compactTransaction?: SubAgentChildCompactTransactionV1;
+}
+
+export type SubAgentChildCheckpoint = SubAgentChildCheckpointV1;
 
 export type ContextCheckpointEntryKind =
   | 'seed'

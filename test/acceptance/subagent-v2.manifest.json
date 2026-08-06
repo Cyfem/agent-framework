@@ -322,6 +322,130 @@
       ]
     },
     {
+      "requirementId": "C5-RUN",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["approval-checkpoint", "parent-child-cas"],
+      "cases": [
+        {
+          "caseId": "RUN-01.l1.approval-checkpoint",
+          "variant": "approval-checkpoint",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-run-controller.test.ts",
+            "testName": "[acceptance:RUN-01.l1.approval-checkpoint][variant:approval-checkpoint]"
+          }
+        },
+        {
+          "caseId": "RUN-02.l1.parent-child-cas",
+          "variant": "parent-child-cas",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-run-controller.test.ts",
+            "testName": "[acceptance:RUN-02.l1.parent-child-cas][variant:parent-child-cas]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C5-BATCH",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["two-phase-approval", "ordered-resume"],
+      "cases": [
+        {
+          "caseId": "BATCH-01.l1.two-phase-approval",
+          "variant": "two-phase-approval",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/tool-batch.test.ts",
+            "testName": "[acceptance:BATCH-01.l1.two-phase-approval][variant:two-phase-approval]"
+          }
+        },
+        {
+          "caseId": "BATCH-02.l1.ordered-resume",
+          "variant": "ordered-resume",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/tool-batch.test.ts",
+            "testName": "[acceptance:BATCH-02.l1.ordered-resume][variant:ordered-resume]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C5-EXECUTOR-CONFORMANCE",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L2"],
+      "requiredVariants": ["memory-local"],
+      "cases": [
+        {
+          "caseId": "EXE-LOCAL-01.l2.conformance",
+          "variant": "memory-local",
+          "phase": "phase-1",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/memory-executor.test.ts",
+            "testName": "[acceptance:EXE-LOCAL-01.l2.conformance][variant:memory-local]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C5-LOCAL-STORE",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L2"],
+      "requiredVariants": ["atomic-recovery", "lock-race", "filesystem-boundary"],
+      "cases": [
+        {
+          "caseId": "STORE-LOCAL-01.l2.atomic-recovery",
+          "variant": "atomic-recovery",
+          "phase": "phase-1",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/atomic-file-store.test.ts",
+            "testName": "[acceptance:STORE-LOCAL-01.l2.atomic-recovery][variant:atomic-recovery]"
+          }
+        },
+        {
+          "caseId": "STORE-LOCAL-02.l2.lock-race",
+          "variant": "lock-race",
+          "phase": "phase-1",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/atomic-file-store-lock-race.test.ts",
+            "testName": "[acceptance:STORE-LOCAL-02.l2.lock-race][variant:lock-race]"
+          }
+        },
+        {
+          "caseId": "STORE-LOCAL-03.l2.filesystem-boundary",
+          "variant": "filesystem-boundary",
+          "phase": "phase-1",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/atomic-file-store.test.ts",
+            "testName": "[acceptance:STORE-LOCAL-03.l2.filesystem-boundary][variant:filesystem-boundary]"
+          }
+        }
+      ]
+    },
+    {
       "requirementId": "PHASE-1",
       "status": "planned",
       "phase": "phase-1",

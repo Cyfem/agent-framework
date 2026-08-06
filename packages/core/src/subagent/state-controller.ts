@@ -346,6 +346,11 @@ function assertInitialTaskRecord(
     record.usage !== undefined ||
     record.approvals.length > 0 ||
     record.approvalDecisions.length > 0 ||
+    record.controlOperations.length > 0 ||
+    record.executionEpoch !== undefined ||
+    record.executionFencingToken !== undefined ||
+    record.executorOperation !== undefined ||
+    record.childCheckpoint !== undefined ||
     record.attempt !== 1 ||
     record.terminalAt !== undefined ||
     record.activeStartedAt !== undefined ||

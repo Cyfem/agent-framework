@@ -508,7 +508,7 @@ Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL
 
 `addSkill()` 只修改 configured sources。非运行状态下会立即使 Agent 回到未初始化；运行中添加只标记 dirty，当前 run 继续使用旧 snapshot。两种情况都必须在下一次运行前重新 `init()`，新 Skill 才会生效。父 Agent 的 Skill 和 runtime 配置不会自动传播给动态子代理。
 
-## Subagent v2 Core Runtime（C2–C4）
+## Subagent v2 Core Runtime（C2–C5）
 
 当前 workspace 版本为 `2.0.0`，包根已导出下列协议无关 contracts，供后续 Runtime 和独立 Executor 包实现：
 
@@ -525,10 +525,13 @@ Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL
 - `SubAgentDefinitionRegistry` 与 `SubAgentExecutorRegistry`：区分 active/recovery-only definition，`init()` 冻结 `supports()`，仅 `refreshCatalog()` 更新 availability revision；allowlist、capability 与 availability 取保守交集。
 - `createModelSubAgentToolDefinition()`：只在非空目录时生成模型工具，wire 精确为 `{ subAgent, executor, input }`，JSON schema 使用根 object 与 `oneOf`，空目录时返回 `null`。
 - `createSubAgentRuntime()`：同步构造、异步 `init()`，支持无 fallback 的显式 placement、run-scope 幂等 create、树级 limits/budget、typed result、standalone completion、后台 handle、session guard、审批 open-loop resume、Host-only retry、取消、事件 cursor 与精确版本恢复。
+- Executor control plane 使用 operation ID + payload hash 保存可重放 receipt；task execution epoch 持有固定 fencing token 的续租 lease，失租会中止本次执行。binding、child checkpoint、审批、进度、预算、事件和取消都在 durable CAS 边界内提交。
+- 完整 child checkpoint 保存 runner identity、协议 context、稳定 provenance `ContextStore`、模型迭代、整批待处理 calls 和 compact transaction；runner checkpoint 在 resume、Executor binding 在 resume/reconnect 的真实恢复路径执行 copy-on-write 迁移，失败不会覆盖原记录。
+- 内部 `AgentRunCheckpointController` 与 durable Tool batch planner 已实现根 run 长 lease、父 checkpoint + child task 原子 CAS、审批 open-loop 恢复、普通 Tool 串行 settle、同批 agent call 两阶段并发提交和 provider 顺序回填。这些是 C6 接入公开 `Agent` loop 的基础，不是一个单独的 npm API 入口。
 
 `ModelSubAgentRequest` 的公开字段精确为 `{ subAgent, executor, input }`。task/session/binding/retry/approval 等 host metadata 不属于模型 wire。`ArtifactReference` 也只包含版本、opaque ID、media type、大小和 SHA-256，不含路径、URL 或凭据。
 
-当前仍未实现官方 Local Executor、父 Agent batch checkpoint/恢复与 v2 Agent loop 接线。C4 Runtime 已可由自定义 StateStore/Executor 独立使用，但还不会替换下方迁移前 `AgentOptions.subAgents` 路径。在 C6 原子切换前，下方说明仍对应当前可运行的迁移前 Agent loop，不是 v2 兼容层承诺。
+官方 [`@ruixutong.manee/maneeagent-executor-local`](../executor-local/README.md) 已提供本地 Executor、Memory StateStore 与单机 Atomic File StateStore。Core 仍未把上述 controller 接入公开 `Agent` loop，也尚未删除 `AgentOptions.subAgents`；这两件事必须在 C6 原子切换。在此之前，下方说明仍对应当前可运行的迁移前 Agent loop，不是 v2 兼容层承诺。
 
 ## 子代理（迁移前 Agent loop）
 

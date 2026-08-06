@@ -7,9 +7,10 @@
 - 修改代码前先阅读 [README.md](./README.md)，了解仓库定位、workspace 结构、运行命令与安全边界。
 - 根据改动范围继续阅读相关项目文档：
   - 核心库、公共 API、Skills 和上下文压缩：[packages/core/README.md](./packages/core/README.md)
+  - 官方本地 Executor、Memory/Atomic File Store 与文件系统边界：[packages/executor-local/README.md](./packages/executor-local/README.md)
   - 可运行示例、真实模型配置和费用边界：[demo/README.md](./demo/README.md)
   - 分批实施中的 Subagent v2 生产运行时设计与验收：[PLAN.md](./plans/subagent-v2-production-runtime/PLAN.md)、[TECHNICAL_CHANGES.md](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md) 与 [TEST_ACCEPTANCE_PLAN.md](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)
-  - 当前实现已完成 C4 Core Runtime、Catalog/Router 与全链路取消；官方 Executor 和 Agent v2 接线仍以源码和 README 的后续批次状态为准。
+  - 当前实现已完成 C5 Core durable controller 与官方 Local 包；公开 `Agent` v2 loop 的原子切换仍以 C6 源码和 README 状态为准。
 
 ## Working Rules
 

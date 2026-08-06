@@ -97,6 +97,15 @@ importers:
         specifier: ^3.25.2
         version: 3.25.2(zod@4.4.3)
 
+  packages/executor-local:
+    devDependencies:
+      '@ruixutong.manee/maneeagent-framework':
+        specifier: workspace:^
+        version: link:../core
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+
 packages:
 
   '@babel/code-frame@7.29.0':

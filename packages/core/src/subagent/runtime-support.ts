@@ -29,7 +29,31 @@ export const DEFAULT_RUNTIME_LEASE_TTL_MS = 30_000;
 export const DEFAULT_RUNTIME_LEASE_RETRY_MS = 25;
 export const DEFAULT_RUNTIME_EVENT_POLL_MS = 25;
 
-export type RuntimeIdKind = 'task' | 'session' | 'event' | 'receipt' | 'approval' | 'batch';
+export interface RenewingRuntimeLease {
+  readonly lease: StateLease;
+  readonly signal: AbortSignal;
+  stop(): Promise<void>;
+}
+
+export interface RuntimeLeaseScheduler {
+  readonly set: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  readonly clear: (timer: ReturnType<typeof setTimeout>) => void;
+}
+
+const DEFAULT_RUNTIME_LEASE_SCHEDULER: RuntimeLeaseScheduler = Object.freeze({
+  set: (callback: () => void, delayMs: number) => setTimeout(callback, delayMs),
+  clear: (timer: ReturnType<typeof setTimeout>) => clearTimeout(timer),
+});
+
+export type RuntimeIdKind =
+  | 'task'
+  | 'session'
+  | 'event'
+  | 'receipt'
+  | 'approval'
+  | 'batch'
+  | 'operation'
+  | 'epoch';
 
 export function createRuntimeId(kind: RuntimeIdKind): string {
   return `${kind}-${randomUUID()}`;
@@ -159,6 +183,75 @@ export async function withRuntimeLease<T>(
   }
 }
 
+/**
+ * Acquire one task execution lease and keep its fencing token fixed for the whole epoch. Renewal
+ * failure aborts the operation before another owner can legally publish control-plane mutations.
+ */
+export async function acquireRenewingRuntimeLease(
+  store: AgentRuntimeStateStore,
+  key: string,
+  parentSignal: AbortSignal,
+  deadlineAt: number,
+  ttlMs = DEFAULT_RUNTIME_LEASE_TTL_MS,
+  scheduler: RuntimeLeaseScheduler = DEFAULT_RUNTIME_LEASE_SCHEDULER,
+): Promise<RenewingRuntimeLease> {
+  if (!Number.isSafeInteger(ttlMs) || ttlMs < 30) {
+    throw new RangeError('Execution lease TTL must be a safe integer of at least 30ms.');
+  }
+  let current = await acquireRuntimeLease(store, key, parentSignal, deadlineAt, ttlMs);
+  const fixedFencingToken = current.fencingToken;
+  const lost = new AbortController();
+  const signal = AbortSignal.any([parentSignal, lost.signal]);
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const schedule = (): void => {
+    if (stopped || signal.aborted) return;
+    timer = scheduler.set(
+      () => {
+        void renew();
+      },
+      Math.max(10, Math.floor(ttlMs / 3)),
+    );
+  };
+  const renew = async (): Promise<void> => {
+    if (stopped || signal.aborted) return;
+    try {
+      const renewed = await current.renew(ttlMs);
+      if (renewed.fencingToken !== fixedFencingToken) {
+        throw new Error('Execution lease renewal changed its fencing token.');
+      }
+      current = renewed;
+      schedule();
+    } catch {
+      lost.abort(
+        createSubAgentError('RECOVERY_TARGET_LOST', 'The subagent execution lease was lost.', {
+          retryable: true,
+          causeCode: 'EXECUTION_LEASE_LOST',
+        }),
+      );
+    }
+  };
+  schedule();
+
+  return Object.freeze({
+    get lease(): StateLease {
+      return current;
+    },
+    signal,
+    async stop(): Promise<void> {
+      if (stopped) return;
+      stopped = true;
+      if (timer !== undefined) scheduler.clear(timer);
+      try {
+        await current.release();
+      } catch {
+        // A lost lease is already fenced. Cleanup cannot restore ownership.
+      }
+    },
+  });
+}
+
 export function normalizeProjectedContext(
   candidate: readonly SubAgentContextItem[],
   limits: SubAgentProjectionLimits = DEFAULT_SUBAGENT_PROJECTION_LIMITS,
@@ -272,11 +365,19 @@ export function raceWithOperationSignal<T>(
 ): Promise<T> {
   if (signal.aborted) return Promise.reject(abortError(signal, deadlineAt));
 
+  // Executors commonly reject their own work in response to the same signal. If that rejection
+  // wins Promise.race by a microtask, preserve the control-plane cancellation/lease-loss reason
+  // instead of misclassifying the opaque Executor rejection as EXECUTOR_FAILED.
+  const guardedOperation = operation.catch((error: unknown) => {
+    if (signal.aborted) throw abortError(signal, deadlineAt);
+    throw error;
+  });
+
   let cleanup = (): void => {};
   const aborted = new Promise<never>((_resolve, reject) => {
     const onAbort = (): void => reject(abortError(signal, deadlineAt));
     signal.addEventListener('abort', onAbort, { once: true });
     cleanup = () => signal.removeEventListener('abort', onAbort);
   });
-  return Promise.race([operation, aborted]).finally(cleanup);
+  return Promise.race([guardedOperation, aborted]).finally(cleanup);
 }

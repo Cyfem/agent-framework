@@ -114,12 +114,15 @@ function bindingForRequest(
   overrides: Partial<SubAgentExecutorBinding> = {},
 ): SubAgentExecutorBinding {
   return {
+    version: '1',
     executorName: 'local',
     ownerSessionId: execution.ownerSessionId,
     taskId: execution.taskId,
     subagentSessionId: execution.subagentSessionId,
     definitionName: execution.definition.name,
     definitionVersion: execution.definition.version,
+    runnerId: 'test-runner',
+    runnerVersion: '1',
     adapterStateVersion: '1',
     recoveryData: { placement: 'local' },
     ...overrides,
@@ -131,12 +134,15 @@ function bindingForTask(
   overrides: Partial<SubAgentExecutorBinding> = {},
 ): SubAgentExecutorBinding {
   return {
+    version: '1',
     executorName: 'local',
     ownerSessionId: SESSION_ID,
     taskId: task.taskId,
     subagentSessionId: task.subagentSessionId,
     definitionName: task.definition.name,
     definitionVersion: task.definition.version,
+    runnerId: 'test-runner',
+    runnerVersion: '1',
     adapterStateVersion: '1',
     recoveryData: { placement: 'local' },
     ...overrides,
@@ -158,11 +164,33 @@ function candidateOutcome(
   };
 }
 
+function childCheckpoint() {
+  return {
+    version: '1' as const,
+    runnerId: 'test-runner',
+    runnerVersion: '1',
+    protocolContext: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+    contextStore: {
+      version: '1' as const,
+      protocol: 'openai-chat',
+      codecVersion: '1',
+      revision: 0,
+      rawHistory: [],
+      activeSpans: [],
+      nextRawItemId: 1,
+      nextSpanId: 1,
+      nextEntryId: 1,
+    },
+    modelIteration: 1,
+    maxIterations: 10,
+  };
+}
+
 async function successfulExecution(
   execution: SubAgentExecutionRequest,
   control: SubAgentExecutionControl,
 ): Promise<SubAgentExecutionOutcome> {
-  await control.commitBinding(bindingForRequest(execution));
+  await control.commitBinding('success-binding', bindingForRequest(execution));
   const output = { answer: 'proof' };
   await control.completion.submitResult('result-call', output);
   await control.completion.complete('end-call', { isStandalone: true });
@@ -191,11 +219,19 @@ class AdversarialExecutor implements SubAgentExecutor {
     capabilities: SubAgentExecutorDescriptor['capabilities'] = CAPABILITIES,
   ) {
     this.descriptor = {
+      runtimeProtocolVersion: '1',
+      taskRecordVersions: ['1'],
+      childCheckpointVersions: ['1'],
+      runnerCompatibility: [
+        { runnerId: 'test-runner', runnerVersion: '1', childCheckpointVersions: ['1'] },
+      ],
       name: 'local',
       description: 'Adversarial Runtime test placement.',
       useCases: ['Exercise deterministic hostile execution timing.'],
       capabilities,
       adapterStateVersion: '1',
+      maxBindingBytes: 64 * 1024,
+      maxEventPageSize: 256,
     };
   }
 
@@ -222,6 +258,8 @@ class AdversarialExecutor implements SubAgentExecutor {
     this.spawnCalls.push(execution);
     return this.spawnHandler(execution, control);
   }
+
+  async cancel(): Promise<void> {}
 }
 
 async function createFixture(
@@ -268,8 +306,9 @@ async function createPausedFixture() {
     if (execution.operation.type !== 'create') {
       throw new Error('An incomplete approval decision must not reach the Executor.');
     }
-    await control.commitBinding(bindingForRequest(execution));
-    const directive = await control.authorizeTool({
+    await control.commitBinding('paused-binding', bindingForRequest(execution));
+    await control.commitCheckpoint('paused-checkpoint', childCheckpoint());
+    const directive = await control.authorizeTool('paused-approval', {
       callId: 'approval-call-1',
       toolName: 'dangerous-tool',
       summary: 'Approve the first guarded operation.',
@@ -358,6 +397,7 @@ async function seedCrashWindowTask(
         attempt: 1,
         approvals: [],
         approvalDecisions: [],
+        controlOperations: [],
         recoveryRequired: false,
         activeElapsedMs: 0,
         remainingMs: 120_000,
@@ -447,8 +487,9 @@ describe('SubAgentRuntime adversarial Oracles', () => {
     const executor = new AdversarialExecutor(async (execution, control) => {
       if (execution.operation.type === 'create') {
         oldControl = control;
-        await control.commitBinding(bindingForRequest(execution));
-        const directive = await control.authorizeTool({
+        await control.commitBinding('fencing-binding', bindingForRequest(execution));
+        await control.commitCheckpoint('fencing-checkpoint', childCheckpoint());
+        const directive = await control.authorizeTool('fencing-approval', {
           callId: 'guarded-call',
           toolName: 'guarded-tool',
           summary: 'Pause before the guarded operation.',

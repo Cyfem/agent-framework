@@ -2,6 +2,13 @@ import type { Model } from '../llm/base';
 import { awaitWithAbort, throwIfAborted } from '../llm/base/abort';
 import type { ModelGenerateRequest, ModelGenerateResult } from '../llm/base/types';
 import {
+  assertJsonValue,
+  canonicalizeJson,
+  parseJsonValue,
+  type JsonValue,
+} from '../subagent/json';
+import type { DurableContextCompactTransactionV1 } from '../subagent/checkpoint';
+import {
   ContextStore,
   type ContextStoreSummarySnapshot,
   type OpenLoopSnapshot,
@@ -13,6 +20,7 @@ import type {
   ContextCompactCause,
   ContextCompactOptions,
   ContextOf,
+  MaybePromise,
   SummaryCompactPolicy,
   SummaryCompactSnapshot,
   SummaryContextSelection,
@@ -23,6 +31,157 @@ import type {
   ToolPayloadKind,
   ToolPayloadReplacements,
 } from './types';
+
+export type DurableCompactTransactionKind = 'summary' | 'tool_payload';
+export type DurableCompactTransactionPhase = 'prepared' | 'in_flight' | 'result_ready' | 'applied';
+
+/** Durable phase marker used to avoid replaying summary/compactor side effects after a crash. */
+export type DurableCompactTransaction = DurableContextCompactTransactionV1;
+export type PreparedCompactTransaction = DurableCompactTransaction & {
+  readonly phase: 'prepared';
+};
+export type InFlightCompactTransaction = DurableCompactTransaction & {
+  readonly phase: 'in_flight';
+};
+export type ResultReadyCompactTransaction = DurableCompactTransaction & {
+  readonly phase: 'result_ready';
+  readonly result: JsonValue;
+};
+export type AppliedCompactTransaction = DurableCompactTransaction & {
+  readonly phase: 'applied';
+  readonly result: JsonValue;
+};
+
+export type CompactTransactionRecoveryAction =
+  | 'execute'
+  | 'fail_outcome_unknown'
+  | 'apply'
+  | 'none';
+
+/** Recovery reached an external compact operation whose result was never durably acknowledged. */
+export class CompactTransactionOutcomeUnknownError extends Error {
+  readonly code = 'COMPACT_OUTCOME_UNKNOWN';
+  readonly outcomeUnknown = true;
+
+  constructor(readonly transaction: InFlightCompactTransaction) {
+    super('The compact operation outcome could not be confirmed and will not be replayed.');
+    this.name = 'CompactTransactionOutcomeUnknownError';
+  }
+}
+
+export function createCompactTransactionCheckpoint(input: {
+  readonly transactionId: string;
+  readonly kind: DurableCompactTransactionKind;
+  readonly contextRevision: number;
+  readonly preparedAt: number;
+}): PreparedCompactTransaction {
+  assertCompactIdentity(input.transactionId);
+  assertCompactTimestamp(input.preparedAt, 'preparedAt');
+  if (!Number.isSafeInteger(input.contextRevision) || input.contextRevision < 0) {
+    throw new RangeError('Compact contextRevision must be a non-negative safe integer.');
+  }
+
+  return Object.freeze({
+    schemaVersion: '1' as const,
+    transactionId: input.transactionId,
+    kind: input.kind,
+    contextRevision: input.contextRevision,
+    phase: 'prepared' as const,
+    preparedAt: input.preparedAt,
+    updatedAt: input.preparedAt,
+  });
+}
+
+/** Persist this phase before invoking a Model summary request or custom compactor. */
+export function beginCompactTransactionCheckpoint(
+  transaction: PreparedCompactTransaction,
+  startedAt: number,
+): InFlightCompactTransaction {
+  assertCompactTransactionCheckpoint(transaction);
+  assertCompactTimestamp(startedAt, 'startedAt');
+  if (startedAt < transaction.updatedAt) {
+    throw new RangeError('Compact startedAt cannot precede preparedAt.');
+  }
+
+  return Object.freeze({
+    ...transaction,
+    phase: 'in_flight' as const,
+    updatedAt: startedAt,
+  });
+}
+
+/** Persist the detached operation result before mutating ContextStore. */
+export function completeCompactTransactionCheckpoint(
+  transaction: InFlightCompactTransaction,
+  result: JsonValue,
+  resultReadyAt: number,
+): ResultReadyCompactTransaction {
+  assertCompactTransactionCheckpoint(transaction);
+  assertCompactTimestamp(resultReadyAt, 'resultReadyAt');
+  if (resultReadyAt < transaction.updatedAt) {
+    throw new RangeError('Compact resultReadyAt cannot precede startedAt.');
+  }
+  assertJsonValue(result);
+
+  return Object.freeze({
+    ...transaction,
+    phase: 'result_ready' as const,
+    result: cloneCompactJson(result),
+    updatedAt: resultReadyAt,
+  });
+}
+
+export function getCompactTransactionRecoveryAction(
+  transaction: DurableCompactTransaction,
+): CompactTransactionRecoveryAction {
+  assertCompactTransactionCheckpoint(transaction);
+  switch (transaction.phase) {
+    case 'prepared':
+      return 'execute';
+    case 'in_flight':
+      return 'fail_outcome_unknown';
+    case 'result_ready':
+      return 'apply';
+    case 'applied':
+      return 'none';
+  }
+}
+
+/**
+ * Apply only a durably saved result. An in-flight operation is deliberately
+ * failed rather than invoked again; an applied checkpoint is an idempotent no-op.
+ */
+export async function applyCompactTransactionCheckpoint(
+  transaction: DurableCompactTransaction,
+  appliedAt: number,
+  apply: (result: JsonValue) => MaybePromise<void>,
+): Promise<DurableCompactTransaction> {
+  assertCompactTransactionCheckpoint(transaction);
+  assertCompactTimestamp(appliedAt, 'appliedAt');
+
+  if (transaction.phase === 'in_flight') {
+    throw new CompactTransactionOutcomeUnknownError(transaction as InFlightCompactTransaction);
+  }
+  if (transaction.phase === 'prepared') {
+    throw new Error('A prepared compact transaction has no durable result to apply.');
+  }
+  if (transaction.phase === 'applied') {
+    return transaction;
+  }
+  if (appliedAt < transaction.updatedAt) {
+    throw new RangeError('Compact appliedAt cannot precede resultReadyAt.');
+  }
+  if (transaction.result === undefined) {
+    throw new TypeError('A result-ready compact checkpoint requires a durable result.');
+  }
+
+  await Promise.resolve(apply(cloneCompactJson(transaction.result)));
+  return Object.freeze({
+    ...transaction,
+    phase: 'applied' as const,
+    updatedAt: appliedAt,
+  });
+}
 
 /** 摘要请求固定注入的权限与安全边界。 */
 const INTERNAL_SUMMARY_GUARD = [
@@ -474,4 +633,63 @@ function freezeSelection<P extends AgentProtocol>(
     contextToSummarize: Object.freeze([...selection.contextToSummarize]),
     preservedContext: Object.freeze([...selection.preservedContext]),
   });
+}
+
+function assertCompactIdentity(value: string): void {
+  if (typeof value !== 'string' || value.length === 0 || value !== value.trim()) {
+    throw new TypeError('Compact transactionId must be a non-empty trimmed string.');
+  }
+}
+
+function assertCompactTimestamp(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`Compact ${label} must be a non-negative safe integer.`);
+  }
+}
+
+function assertCompactTransactionCheckpoint(transaction: DurableCompactTransaction): void {
+  if (typeof transaction !== 'object' || transaction === null) {
+    throw new TypeError('Compact transaction checkpoint must be an object.');
+  }
+  if (transaction.schemaVersion !== '1') {
+    throw new Error('Unsupported compact transaction checkpoint version.');
+  }
+  assertCompactIdentity(transaction.transactionId);
+  if (transaction.kind !== 'summary' && transaction.kind !== 'tool_payload') {
+    throw new TypeError('Compact transaction kind is invalid.');
+  }
+  if (!Number.isSafeInteger(transaction.contextRevision) || transaction.contextRevision < 0) {
+    throw new RangeError('Compact contextRevision must be a non-negative safe integer.');
+  }
+  assertCompactTimestamp(transaction.preparedAt, 'preparedAt');
+  assertCompactTimestamp(transaction.updatedAt, 'updatedAt');
+  if (transaction.updatedAt < transaction.preparedAt) {
+    throw new RangeError('Compact updatedAt cannot precede preparedAt.');
+  }
+  if (
+    transaction.phase !== 'prepared' &&
+    transaction.phase !== 'in_flight' &&
+    transaction.phase !== 'result_ready' &&
+    transaction.phase !== 'applied'
+  ) {
+    throw new TypeError('Compact transaction phase is invalid.');
+  }
+  if (transaction.phase === 'result_ready' || transaction.phase === 'applied') {
+    if (transaction.result === undefined) {
+      throw new TypeError('A result-ready compact checkpoint requires a durable result.');
+    }
+    assertJsonValue(transaction.result);
+  } else if (transaction.result !== undefined) {
+    throw new TypeError('A compact result is only valid after reaching result_ready.');
+  }
+  if (transaction.outcomeUnknown !== undefined && typeof transaction.outcomeUnknown !== 'boolean') {
+    throw new TypeError('Compact outcomeUnknown must be a boolean when present.');
+  }
+  if (transaction.outcomeUnknown === true && transaction.phase !== 'in_flight') {
+    throw new TypeError('Compact outcomeUnknown is only valid for an in-flight checkpoint.');
+  }
+}
+
+function cloneCompactJson(value: JsonValue): JsonValue {
+  return parseJsonValue(canonicalizeJson(value));
 }

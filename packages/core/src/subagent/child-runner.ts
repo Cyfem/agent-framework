@@ -1,6 +1,6 @@
-import type { EncodedAgentProtocolCheckpoint } from './checkpoint';
-import type { SubAgentDefinitionRef } from './definition';
-import type { SubAgentExecutionControl } from './executor';
+import type { SubAgentChildCheckpoint } from './checkpoint';
+import type { SubAgentContextItem, SubAgentDefinitionRef } from './definition';
+import type { SubAgentDelegationSnapshot, SubAgentExecutionControl } from './executor';
 import type { JsonValue } from './json';
 import type { ResolvedSubAgentLimits } from './limits';
 import type { SubAgentExecutionOutcome } from './result';
@@ -14,11 +14,14 @@ export interface SubAgentChildRunRequest<I extends JsonValue = JsonValue> {
   readonly subagentSessionId: string;
   readonly path: readonly string[];
   readonly attempt: number;
+  readonly executionEpoch: string;
+  readonly executionFencingToken: string;
   readonly definition: SubAgentDefinitionRef;
   readonly input: I;
-  readonly projectedContext: readonly JsonValue[];
+  readonly projectedContext: readonly SubAgentContextItem[];
+  readonly delegation: SubAgentDelegationSnapshot;
   readonly limits: ResolvedSubAgentLimits;
-  readonly checkpoint?: EncodedAgentProtocolCheckpoint;
+  readonly checkpoint?: SubAgentChildCheckpoint;
   readonly signal: AbortSignal;
   readonly deadlineAt: number;
 }

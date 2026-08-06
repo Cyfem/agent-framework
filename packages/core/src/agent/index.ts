@@ -475,7 +475,11 @@ export class Agent<P extends AgentProtocol> {
 
     try {
       throwIfAborted(execution.signal, execution.deadlineAt);
-      record = await this.#executeToolCallWithRecord(callInfo, execution);
+      record = await this.#executeToolCallWithRecord(callInfo, execution, {
+        callIndex: 0,
+        callCount: 1,
+        isStandalone: true,
+      });
     } catch (error) {
       if (standalone) {
         this.#endRequested = false;
@@ -497,6 +501,7 @@ export class Agent<P extends AgentProtocol> {
   async #executeToolCallWithRecord(
     callInfo: AgentToolCall<P>,
     execution: ActiveAgentExecution,
+    batch: ToolRuntimeContext<P>['batch'],
   ): Promise<ToolExecutionRecord<P>> {
     throwIfAborted(execution.signal, execution.deadlineAt);
     const tool = this.tools.find((candidate) => candidate.name === callInfo.name);
@@ -540,6 +545,7 @@ export class Agent<P extends AgentProtocol> {
     const runtimeContext: ToolRuntimeContext<P> = Object.freeze({
       ...execution.runtime,
       call: callInfo,
+      batch: Object.freeze({ ...batch }),
       signal: execution.signal,
       ...(execution.deadlineAt === undefined ? {} : { deadlineAt: execution.deadlineAt }),
     });
@@ -647,8 +653,19 @@ export class Agent<P extends AgentProtocol> {
             this.#contextStore.appendToOpenLoop(message);
           }
 
-          for (const call of this.#llm.parseToolCalls(response.messages)) {
-            records.push(await this.#executeToolCallWithRecord(call, execution));
+          const calls = [...this.#llm.parseToolCalls(response.messages)];
+          for (let callIndex = 0; callIndex < calls.length; callIndex += 1) {
+            records.push(
+              await this.#executeToolCallWithRecord(
+                calls[callIndex] as AgentToolCall<P>,
+                execution,
+                {
+                  callIndex,
+                  callCount: calls.length,
+                  isStandalone: calls.length === 1,
+                },
+              ),
+            );
           }
 
           if (records.length === 0 || !hasToolPayloadCompactor(this.#contextCompact)) {

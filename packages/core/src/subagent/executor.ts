@@ -1,5 +1,7 @@
 import type { ApprovalDecision, ApprovalDirective, ApprovalRequestInput } from './approval';
+import type { SubAgentArtifactClient } from './artifact';
 import type { ExecutorAvailabilityProbe, SubAgentExecutorDescriptor } from './catalog';
+import type { SubAgentChildCheckpoint } from './checkpoint';
 import type { SubAgentContextItem, SubAgentDefinitionRef } from './definition';
 import type { JsonValue } from './json';
 import type { ResolvedSubAgentLimits } from './limits';
@@ -14,14 +16,21 @@ import type {
 import type { SubAgentDelegationClient } from './runtime';
 import type { ExecutorEventInput, SubAgentTaskEvent } from './telemetry';
 
+export const SUBAGENT_RUNTIME_PROTOCOL_VERSION = '1' as const;
+export const DEFAULT_EXECUTOR_MAX_BINDING_BYTES = 64 * 1024;
+export const DEFAULT_EXECUTOR_MAX_EVENT_PAGE_SIZE = 256;
+
 /** Persisted opaque adapter state. It is never model-visible. */
 export interface SubAgentExecutorBinding {
+  readonly version: '1';
   readonly executorName: string;
   readonly ownerSessionId: string;
   readonly taskId: string;
   readonly subagentSessionId: string;
   readonly definitionName: string;
   readonly definitionVersion: string;
+  readonly runnerId: string;
+  readonly runnerVersion: string;
   readonly adapterStateVersion: string;
   readonly recoveryData: JsonValue;
 }
@@ -37,24 +46,46 @@ export interface SubAgentExecutorBindingCodec<TState = unknown> {
 export type SubAgentExecutorOperation =
   | {
       readonly type: 'create';
+      readonly operationId: string;
       readonly idempotencyKey: string;
     }
   | {
       readonly type: 'resume';
+      readonly operationId: string;
       readonly reason: 'approval';
       readonly binding: SubAgentExecutorBinding;
+      readonly checkpoint: SubAgentChildCheckpoint;
       readonly approvals: readonly ApprovalDecision[];
     }
   | {
       readonly type: 'resume';
+      readonly operationId: string;
       readonly reason: 'checkpoint';
       readonly binding: SubAgentExecutorBinding;
+      readonly checkpoint: SubAgentChildCheckpoint;
       readonly approvals?: never;
     }
   | {
       readonly type: 'reconnect';
+      readonly operationId: string;
       readonly binding: SubAgentExecutorBinding;
     };
+
+/** JSON-safe child delegation capability snapshot fixed to one execution epoch. */
+export interface SubAgentDelegationSnapshot {
+  readonly version: '1';
+  readonly ownerSessionId: string;
+  readonly runId: string;
+  readonly parentTaskId: string;
+  readonly path: readonly string[];
+  readonly depth: number;
+  readonly catalogRevision: number;
+  readonly definitions: readonly {
+    readonly name: string;
+    readonly version: string;
+    readonly executors: readonly string[];
+  }[];
+}
 
 /** Protocol-neutral request crossing the Core/Executor boundary. */
 export interface SubAgentExecutionRequest<I extends JsonValue = JsonValue> {
@@ -66,11 +97,14 @@ export interface SubAgentExecutionRequest<I extends JsonValue = JsonValue> {
   readonly subagentSessionId: string;
   readonly path: readonly string[];
   readonly attempt: number;
+  readonly executionEpoch: string;
+  readonly executionFencingToken: string;
   readonly retryOf?: string;
   /** Only the ref crosses this boundary; registries resolve schemas and factories. */
   readonly definition: SubAgentDefinitionRef;
   readonly input: I;
   readonly projectedContext: readonly SubAgentContextItem[];
+  readonly delegation: SubAgentDelegationSnapshot;
   readonly limits: ResolvedSubAgentLimits;
   readonly signal: AbortSignal;
   readonly deadlineAt: number;
@@ -87,12 +121,14 @@ export interface SubAgentExecutionControl {
   readonly signal: AbortSignal;
   readonly deadlineAt: number;
   readonly delegation: SubAgentDelegationClient;
+  readonly artifacts?: SubAgentArtifactClient;
   readonly completion: SubAgentCompletionController;
-  commitBinding(binding: SubAgentExecutorBinding): Promise<void>;
-  authorizeTool(request: ApprovalRequestInput): Promise<ApprovalDirective>;
-  reportProgress(update: SubAgentProgress): Promise<void>;
-  consumeBudget(delta: SubAgentUsageDelta): Promise<void>;
-  emit(event: ExecutorEventInput): Promise<void>;
+  commitBinding(operationId: string, binding: SubAgentExecutorBinding): Promise<void>;
+  commitCheckpoint(operationId: string, checkpoint: SubAgentChildCheckpoint): Promise<void>;
+  authorizeTool(operationId: string, request: ApprovalRequestInput): Promise<ApprovalDirective>;
+  reportProgress(operationId: string, update: SubAgentProgress): Promise<void>;
+  consumeBudget(operationId: string, delta: SubAgentUsageDelta): Promise<void>;
+  emit(operationId: string, event: ExecutorEventInput): Promise<void>;
 }
 
 /** Raw adapter handle. Core wraps it before exposing task control to a host. */
@@ -102,7 +138,11 @@ export interface ExecutorTaskHandle {
   snapshot(): Promise<ExecutorTaskSnapshot>;
   wait(): Promise<SubAgentExecutionOutcome>;
   cancel(reason?: string): Promise<void>;
-  events(options?: { readonly afterSequence?: number }): AsyncIterable<SubAgentTaskEvent>;
+  events(options?: {
+    readonly afterSequence?: number;
+    readonly limit?: number;
+    readonly signal?: AbortSignal;
+  }): AsyncIterable<SubAgentTaskEvent>;
 }
 
 export interface ExecutorTaskSnapshot {
@@ -126,4 +166,14 @@ export interface SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<ExecutorTaskHandle>;
+  /** Binding-addressed cancellation remains available after the originating process loses a raw handle. */
+  cancel(
+    binding: SubAgentExecutorBinding,
+    options: {
+      readonly operationId: string;
+      readonly reason?: string;
+      readonly signal: AbortSignal;
+      readonly deadlineAt: number;
+    },
+  ): Promise<void>;
 }

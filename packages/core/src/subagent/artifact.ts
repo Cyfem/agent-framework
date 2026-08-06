@@ -60,6 +60,16 @@ export interface ArtifactStore {
   deleteTaskArtifacts(scope: ArtifactScope): Promise<void>;
 }
 
+/** Task-scoped artifact facade. Scope cannot be overridden by an Executor or child runner. */
+export interface SubAgentArtifactClient {
+  put(request: Omit<ArtifactWriteRequest, 'scope'>): Promise<ArtifactReference>;
+  get(
+    reference: ArtifactReference,
+    options?: { readonly signal?: AbortSignal },
+  ): Promise<ArtifactReadResult>;
+  delete(reference: ArtifactReference): Promise<void>;
+}
+
 /** Validates the closed, URL-free wire representation of an artifact reference. */
 export function assertArtifactReference(
   value: unknown,

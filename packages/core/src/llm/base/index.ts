@@ -16,6 +16,7 @@ import type {
   ToolOf,
   UserMessageOf,
 } from '../../agent/types';
+import type { AgentProtocolCheckpointCodec } from '../../subagent/checkpoint';
 import type { ModelGenerateRequest, ModelGenerateResult } from './types';
 
 export type {
@@ -32,6 +33,15 @@ export type {
  * `generate()` 负责实际模型请求。
  */
 export abstract class Model<P extends AgentProtocol> {
+  /**
+   * Optional durable-context codec associated with this protocol adapter.
+   *
+   * Built-in Chat and Responses adapters provide their versioned codecs. A
+   * custom Model may leave this undefined when it is used only in memory, or
+   * override it when its Agent loop needs durable/cross-process recovery.
+   */
+  readonly checkpointCodec: AgentProtocolCheckpointCodec<P> | undefined = undefined;
+
   /**
    * 执行一轮非流式模型调用。
    *

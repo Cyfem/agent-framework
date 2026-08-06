@@ -17,6 +17,7 @@ import type {
   ModelErrorDescriptor,
   ToolPayloadReplacements,
 } from '../../agent/types';
+import { OPENAI_CHAT_CHECKPOINT_CODEC } from '../../subagent/checkpoint';
 import { createAbortScope, throwIfAborted } from '../base/abort';
 import { Model, type ModelGenerateRequest, type ModelGenerateResult } from '../base';
 import { classifyOpenAICompatibleError } from '../openai-error';
@@ -46,6 +47,8 @@ export type * from './types';
  * 闭环，不再暴露 deprecated `function_call` / `function` role。
  */
 export class OpenAIChatModel extends Model<OpenAIChatProtocol> {
+  override readonly checkpointCodec = OPENAI_CHAT_CHECKPOINT_CODEC;
+
   #openai: OpenAI;
   #model: string;
   #defaultParams: OpenAIChatModelOptions['defaultParams'];

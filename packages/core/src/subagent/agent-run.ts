@@ -7,6 +7,12 @@ export interface ToolRuntimeContext<P extends AgentProtocol = AgentProtocol> {
   readonly runId?: string;
   readonly taskId?: string;
   readonly call: AgentToolCall<P>;
+  /** Trusted batch position supplied by the Agent loop, never by Tool input. */
+  readonly batch: {
+    readonly callIndex: number;
+    readonly callCount: number;
+    readonly isStandalone: boolean;
+  };
   readonly signal: AbortSignal;
   readonly deadlineAt?: number;
 }

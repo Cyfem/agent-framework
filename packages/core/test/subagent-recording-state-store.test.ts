@@ -67,6 +67,7 @@ function createTask(fencingToken: string, overrides: Partial<StoredTask> = {}): 
     attempt: 1,
     approvals: [],
     approvalDecisions: [],
+    controlOperations: [],
     recoveryRequired: false,
     activeElapsedMs: 0,
     remainingMs: 120_000,

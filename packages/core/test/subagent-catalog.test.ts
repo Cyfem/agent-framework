@@ -52,11 +52,19 @@ class FakeExecutor implements SubAgentExecutor {
     adapterStateVersion = '1',
   ) {
     this.descriptor = {
+      runtimeProtocolVersion: '1',
+      taskRecordVersions: ['1'],
+      childCheckpointVersions: ['1'],
+      runnerCompatibility: [
+        { runnerId: 'test-runner', runnerVersion: '1', childCheckpointVersions: ['1'] },
+      ],
       name,
       description: `${name} execution.`,
       useCases: [`Run on ${name}.`],
       capabilities,
       adapterStateVersion,
+      maxBindingBytes: 64 * 1024,
+      maxEventPageSize: 256,
     };
     this.bindingCodec = {
       adapterStateVersion,
@@ -82,6 +90,8 @@ class FakeExecutor implements SubAgentExecutor {
   async spawn(): Promise<ExecutorTaskHandle> {
     throw new Error('not used');
   }
+
+  async cancel(): Promise<void> {}
 }
 
 describe('SubAgentDefinitionRegistry', () => {

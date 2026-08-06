@@ -5,6 +5,18 @@ import type { SubAgentDefinitionRef } from './identity';
 import type { JsonValue } from './json';
 
 export interface SubAgentExecutorDescriptor {
+  /** Exact Core/Executor control-plane wire version understood by this adapter. */
+  readonly runtimeProtocolVersion: '1';
+  /** Persisted Core task record versions that this adapter can safely execute or recover. */
+  readonly taskRecordVersions: readonly string[];
+  /** Child checkpoint versions accepted by this adapter. */
+  readonly childCheckpointVersions: readonly string[];
+  /** Exact runner/checkpoint identities available from the adapter's trusted registry. */
+  readonly runnerCompatibility: readonly {
+    readonly runnerId: string;
+    readonly runnerVersion: string;
+    readonly childCheckpointVersions: readonly string[];
+  }[];
   readonly name: string;
   readonly description: string;
   readonly useCases: readonly string[];
@@ -21,6 +33,10 @@ export interface SubAgentExecutorDescriptor {
     };
   };
   readonly adapterStateVersion: string;
+  /** Maximum canonical JSON size accepted for the complete persisted binding. */
+  readonly maxBindingBytes: number;
+  /** Maximum events returned by one adapter event page. */
+  readonly maxEventPageSize: number;
 }
 
 export interface ExecutorAvailabilityProbe {
