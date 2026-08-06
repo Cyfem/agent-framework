@@ -87,6 +87,7 @@ export function createStateTransaction(options: {
   return {
     loadRun: async (runId) => cloneOptional(staged.runs.get(runId)),
     loadTask: async (taskId) => cloneOptional(staged.tasks.get(taskId)),
+    listTasksByRun: async (runId) => listTasksByRun(staged, runId),
     findTaskByIdempotencyKey: async (runId, requestId) => {
       const taskId = staged.idempotency.get(idempotencyIndexKey(runId, requestId));
       return cloneOptional(taskId === undefined ? undefined : staged.tasks.get(taskId));
@@ -206,6 +207,18 @@ export function readRun(state: SessionState, runId: string): StoredAgentRun | un
 
 export function readTask(state: SessionState, taskId: string): StoredTask | undefined {
   return cloneOptional(state.tasks.get(taskId));
+}
+
+export function listTasksByRun(state: SessionState, runId: string): readonly StoredTask[] {
+  return clone(
+    [...state.tasks.values()]
+      .filter((task) => task.runId === runId)
+      .sort((left, right) =>
+        left.createdAt === right.createdAt
+          ? left.taskId.localeCompare(right.taskId)
+          : left.createdAt - right.createdAt,
+      ),
+  );
 }
 
 export function findIdempotentTask(

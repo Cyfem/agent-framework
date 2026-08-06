@@ -36,6 +36,18 @@ export interface SubAgentProgress {
   readonly data?: JsonValue;
 }
 
+export type SubAgentFailureStatus = Extract<
+  SubAgentTaskState,
+  'failed' | 'cancelled' | 'timed_out' | 'budget_exceeded'
+>;
+
+/** Trusted runner request for an authoritative non-success terminal transition. */
+export interface SubAgentFailureInput<O extends JsonValue = JsonValue> {
+  readonly status: SubAgentFailureStatus;
+  readonly error: SubAgentErrorDescriptor;
+  readonly partialOutput?: O;
+}
+
 export type SubAgentTaskResult<O extends JsonValue = JsonValue> =
   | {
       readonly status: 'succeeded';

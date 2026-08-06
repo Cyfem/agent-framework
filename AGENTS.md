@@ -10,11 +10,12 @@
   - 官方本地 Executor、Memory/Atomic File Store 与文件系统边界：[packages/executor-local/README.md](./packages/executor-local/README.md)
   - 可运行示例、真实模型配置和费用边界：[demo/README.md](./demo/README.md)
   - 分批实施中的 Subagent v2 生产运行时设计与验收：[PLAN.md](./plans/subagent-v2-production-runtime/PLAN.md)、[TECHNICAL_CHANGES.md](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md) 与 [TEST_ACCEPTANCE_PLAN.md](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)
-  - 当前实现已完成 C5 Core durable controller 与官方 Local 包；公开 `Agent` v2 loop 的原子切换仍以 C6 源码和 README 状态为准。
+  - 当前 checkout 已完成 C6 源码：公开 `Agent` durable loop、v1 原子删除、跨协议 Local placement、审批/嵌套审批恢复和跨进程恢复均已接线；C7–C9 远程与分布式能力仍以源码、测试和 README 状态为准。
+  - Core/Local package manifest 已固定为待发布 `2.0.0`，但 npm Core `latest` 仍是 `1.0.0`、Local 尚未发布；不得把 manifest、pack 成功或计划状态写成 npm 已发布。
 
 ## Working Rules
 
-- 修改前确认改动属于核心库、demo，还是跨项目工作，并理解 demo workspace alias 与发布包名的区别。
+- 修改前确认改动属于核心库、demo，还是跨项目工作，并理解两个 demo workspace alias、真实包名与 npm 实际发布状态的区别。
 - 实现 Subagent v2 前先阅读对应 plans；plans 描述最终目标，各批次已交付能力以源码、测试和相关 README 为准。
 - 如果改动影响目录结构、命令、公共 API、协议、依赖、外部集成或环境变量，必须同步更新根 README 和相关项目 README。
 - 每次完成改动后，复核 `README.md`、相关项目文档、`AGENTS.md` 与 `CLAUDE.md` 是否仍与仓库事实一致。

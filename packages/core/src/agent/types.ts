@@ -1,11 +1,18 @@
+import type { z } from 'zod';
+
 import type { Model } from '../llm/base';
 import type {
   ModelGeneratePurpose,
   ModelGenerateRequest,
   ModelGenerateResult,
-  ModelRuntimeMetadata,
 } from '../llm/base/types';
 import type { ToolRuntimeContext } from '../subagent/agent-run';
+import type { SubAgentCatalogEntry } from '../subagent/catalog';
+import type { SubAgentChildRunRequest } from '../subagent/child-runner';
+import type { SubAgentExecutionControl } from '../subagent/executor';
+import type { JsonValue } from '../subagent/json';
+import type { SubAgentExecutionOutcome } from '../subagent/result';
+import type { SubAgentRuntime } from '../subagent/runtime';
 
 /** 同步或异步扩展点的统一返回类型。 */
 export type MaybePromise<T> = T | Promise<T>;
@@ -506,7 +513,8 @@ export interface AgentSkillSourceDiagnostic {
  */
 export interface ToolDescriptionContext {
   skills: readonly AgentSkillDescriptor[];
-  subAgents: readonly AgentConstructor<AgentProtocol>[];
+  /** Ready, filtered runtime catalog exposed to the current model request. */
+  subAgentCatalog: readonly SubAgentCatalogEntry[];
   context: readonly unknown[];
   history: readonly unknown[];
   systemPrompts: readonly string[];
@@ -527,6 +535,14 @@ export interface ToolDefinition {
   parameters?: ToolParametersSchema;
   /** 可选的协议严格参数标记；框架不设置默认值，也不修改 schema。 */
   strict?: boolean;
+  /**
+   * Child-only host approval policy. The summary is fixed configuration and must
+   * never be derived from model arguments or other untrusted Tool input.
+   */
+  approval?: {
+    readonly summary: string;
+    readonly expiresInMs?: number;
+  };
 }
 
 /** 参数解析和校验成功后执行的运行时工具函数。 */
@@ -541,32 +557,10 @@ export interface ToolRuntimeDefinition<
   handler: ToolHandler<P>;
 }
 
-/** Identity supplied by a host runtime when invoking the current Agent instance. */
-export type AgentRuntimeMetadata = Omit<ModelRuntimeMetadata, 'iteration' | 'requestAttempt'>;
-
-/** Additive execution controls accepted by the pre-v2 Agent loop. */
-export interface AgentExecutionOptions {
-  readonly stream?: boolean;
+/** Execution controls for a standalone parsed Tool call. */
+export interface ToolCallExecutionOptions {
   readonly signal?: AbortSignal;
   readonly deadlineAt?: number;
-  readonly runtime?: Readonly<AgentRuntimeMetadata>;
-}
-
-/** Execution controls for a standalone parsed Tool call. */
-export type ToolCallExecutionOptions = Omit<AgentExecutionOptions, 'stream'>;
-
-/** 子代理实例必须满足的最小契约。 */
-export interface AgentInstance<P extends AgentProtocol> {
-  init(): this;
-  agent(input: string | UserMessageOf<P>, stream?: boolean): Promise<ContextOf<P>[]>;
-}
-
-/** `AgentOptions.subAgents` 接收的同协议子代理构造器契约。 */
-export interface AgentConstructor<P extends AgentProtocol> {
-  new (options: AgentOptions<P>): AgentInstance<P>;
-  readonly name: string;
-  readonly description?: string;
-  readonly toolsDefinition: readonly ToolDefinition[];
 }
 
 /** 创建 Agent 或 Agent 子类实例时使用的选项。 */
@@ -577,8 +571,10 @@ export interface AgentOptions<P extends AgentProtocol> {
   skills?: readonly AgentSkillSource[];
   /** Skill 的文本资源、脚本和 compact 行为配置。 */
   skillRuntime?: SkillRuntimeOptions;
-  /** 可由内置 `agent` 工具调度的同协议子代理类。 */
-  subAgents?: readonly AgentConstructor<P>[];
+  /** Ready v2 runtime used for durable child placement and root-run recovery. */
+  subAgentRuntime?: SubAgentRuntime;
+  /** Stable owner session. Defaults to the runtime session or an ephemeral generated identity. */
+  sessionId?: string;
   /** 用户 system prompt；框架内部提示词会排列在这些提示词之前。 */
   systemPrompts?: readonly string[];
   /** 初始有效上下文；省略时回退到 `initRawContext`。 */
@@ -592,6 +588,21 @@ export interface AgentOptions<P extends AgentProtocol> {
   /** 模型异常的普通重试与 context-length 恢复额度。 */
   modelErrorRecovery?: ModelErrorRecoveryOptions;
 }
+
+/** Trusted bridge used by concrete Executors to run one isolated child Agent. */
+export interface AgentSubAgentRunOptions<P extends AgentProtocol> {
+  readonly request: SubAgentChildRunRequest;
+  readonly control: SubAgentExecutionControl;
+  readonly runnerId: string;
+  readonly runnerVersion: string;
+  readonly executorName: string;
+  readonly checkpointMode: 'same_process' | 'durable';
+  readonly input: string | UserMessageOf<P>;
+  readonly outputSchema: z.ZodType<JsonValue>;
+}
+
+/** Protocol-neutral child execution outcome returned to a concrete Executor. */
+export type AgentSubAgentRunOutcome = SubAgentExecutionOutcome;
 
 /** before/after 工具调用监听器的行为控制选项。 */
 export interface ToolEventOptions {

@@ -151,7 +151,8 @@ function readArguments(context: readonly OpenAIChatContext[], callId: string): s
 }
 
 async function runOneLoop(agent: Agent<OpenAIChatProtocol>): Promise<void> {
-  await expect(agent.agent('start')).rejects.toThrow('Agent exceeded maxIterations: 1.');
+  const outcome = await agent.agent('start');
+  expect(outcome).toMatchObject({ status: 'failed', error: { code: 'LIMIT_EXCEEDED' } });
 }
 
 describe('Skill result context compact eligibility', () => {
@@ -400,7 +401,8 @@ describe('Skill compact transactions and standalone calls', () => {
     });
     agent.init();
 
-    await expect(agent.agent('start')).rejects.toThrow('Skill result compactor failed');
+    const outcome = await agent.agent('start');
+    expect(outcome).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } });
 
     const raw = agent.getHistory();
     const active = agent.getContext();
@@ -432,9 +434,8 @@ describe('Skill compact transactions and standalone calls', () => {
     });
     agent.init();
 
-    await expect(agent.agent('start')).rejects.toThrow(
-      'Context changed after the loop snapshot was captured',
-    );
+    const outcome = await agent.agent('start');
+    expect(outcome).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } });
 
     const raw = agent.getHistory();
     const active = agent.getContext();

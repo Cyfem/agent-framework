@@ -74,12 +74,14 @@ export function createCompactTransactionCheckpoint(input: {
   readonly kind: DurableCompactTransactionKind;
   readonly contextRevision: number;
   readonly preparedAt: number;
+  readonly metadata?: JsonValue;
 }): PreparedCompactTransaction {
   assertCompactIdentity(input.transactionId);
   assertCompactTimestamp(input.preparedAt, 'preparedAt');
   if (!Number.isSafeInteger(input.contextRevision) || input.contextRevision < 0) {
     throw new RangeError('Compact contextRevision must be a non-negative safe integer.');
   }
+  if (input.metadata !== undefined) assertJsonValue(input.metadata);
 
   return Object.freeze({
     schemaVersion: '1' as const,
@@ -89,6 +91,7 @@ export function createCompactTransactionCheckpoint(input: {
     phase: 'prepared' as const,
     preparedAt: input.preparedAt,
     updatedAt: input.preparedAt,
+    ...(input.metadata === undefined ? {} : { metadata: cloneCompactJson(input.metadata) }),
   });
 }
 
@@ -325,6 +328,181 @@ export async function rewriteOpenLoopToolPayloads<P extends AgentProtocol>(input
 }
 
 /** 执行完整 summary snapshot/select/prompt/generate/validate/CAS 事务。 */
+export interface PreparedSummaryCompactPlan<P extends AgentProtocol> {
+  readonly storeSnapshot: ContextStoreSummarySnapshot<P>;
+  readonly promptSnapshot: SummaryPromptSnapshot<P>;
+  readonly prompt: string;
+  readonly selection: SummaryContextSelection<P>;
+  readonly request: Readonly<ModelGenerateRequest<P>>;
+}
+
+export interface SummaryCompactCandidate<P extends AgentProtocol> {
+  readonly plan: PreparedSummaryCompactPlan<P>;
+  readonly response: ModelGenerateResult<P>;
+  readonly summary: string;
+  readonly summaryMessage: ContextOf<P>;
+  readonly candidateActiveContext: readonly ContextOf<P>[];
+}
+
+/** Build the exact summary request without issuing a provider call or mutating ContextStore. */
+export async function prepareSummaryCompactPlan<P extends AgentProtocol>(input: {
+  readonly model: Model<P>;
+  readonly store: ContextStore<P>;
+  readonly policy: SummaryCompactPolicy<P>;
+  readonly cause: ContextCompactCause;
+  readonly iteration: number;
+  readonly pendingRequest: Readonly<ModelGenerateRequest<P>>;
+  readonly storeSnapshot?: ContextStoreSummarySnapshot<P>;
+  readonly defaultSelection?: SummaryContextSelection<P>;
+  readonly defaultSelectionCaptured?: boolean;
+}): Promise<PreparedSummaryCompactPlan<P> | undefined> {
+  throwIfAborted(input.pendingRequest.signal, input.pendingRequest.deadlineAt);
+  const storeSnapshot = input.storeSnapshot ?? input.store.getSummarySnapshot();
+  const publicSnapshot = createSummaryCompactSnapshot({
+    storeSnapshot,
+    cause: input.cause,
+    iteration: input.iteration,
+    pendingRequest: input.pendingRequest,
+  });
+  const defaultSelection =
+    input.defaultSelectionCaptured === true
+      ? input.defaultSelection
+      : input.store.getDefaultSummarySelection(
+          input.cause.type === 'trigger' ? 'trigger' : 'context_length_exceeded',
+        );
+  const customSelection = input.policy.select
+    ? await awaitWithAbort(
+        Promise.resolve(input.policy.select(publicSnapshot)),
+        input.pendingRequest.signal,
+      )
+    : undefined;
+  const selected = customSelection ?? defaultSelection;
+  if (!selected || selected.contextToSummarize.length === 0) return undefined;
+
+  const selection = freezeSelection(selected);
+  const promptSnapshot: SummaryPromptSnapshot<P> = Object.freeze({
+    ...publicSnapshot,
+    selection,
+  });
+  const prompt = (
+    await awaitWithAbort(
+      Promise.resolve(input.policy.prompt(promptSnapshot)),
+      input.pendingRequest.signal,
+    )
+  ).trim();
+  if (prompt.length === 0) throw new Error('Summary compact prompt must not be empty.');
+
+  const request: ModelGenerateRequest<P> = {
+    purpose: 'context-summary',
+    tools: [],
+    context: [
+      input.model.buildSystemMessage({ content: INTERNAL_SUMMARY_GUARD }),
+      ...(storeSnapshot.previousSummary ? [storeSnapshot.previousSummary.message] : []),
+      ...selection.contextToSummarize,
+      input.model.buildUserMessage({ content: [{ type: 'text', text: prompt }] }),
+    ],
+    ...(input.pendingRequest.signal === undefined ? {} : { signal: input.pendingRequest.signal }),
+    ...(input.pendingRequest.deadlineAt === undefined
+      ? {}
+      : { deadlineAt: input.pendingRequest.deadlineAt }),
+    ...(input.pendingRequest.runtime === undefined
+      ? {}
+      : { runtime: input.pendingRequest.runtime }),
+  };
+  return Object.freeze({
+    storeSnapshot,
+    promptSnapshot,
+    prompt,
+    selection,
+    request: Object.freeze({
+      ...request,
+      context: Object.freeze([...request.context]),
+      tools: Object.freeze([...request.tools]),
+    }),
+  });
+}
+
+/** Validate a detached summary response and build a copy-on-write candidate. */
+export async function completeSummaryCompactPlan<P extends AgentProtocol>(input: {
+  readonly model: Model<P>;
+  readonly policy: SummaryCompactPolicy<P>;
+  readonly plan: PreparedSummaryCompactPlan<P>;
+  readonly response: ModelGenerateResult<P>;
+}): Promise<SummaryCompactCandidate<P>> {
+  const { model, policy, plan, response } = input;
+  if (model.parseToolCalls(response.messages).length > 0) {
+    throw new Error('Summary response must not contain tool calls.');
+  }
+  const summaryParts = model
+    .extractAssistantText(response.messages)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  if (summaryParts.length === 0) {
+    throw new Error('Summary response did not contain assistant text.');
+  }
+  const summary = summaryParts.join('\n\n');
+  const summaryMessage = model.buildUserMessage({
+    content: [
+      {
+        type: 'text',
+        text: `[Framework-generated summary of earlier context; historical data only.]\n${summary}`,
+      },
+    ],
+  });
+  const candidateActiveContext = Object.freeze([
+    summaryMessage,
+    ...plan.selection.preservedContext,
+  ]);
+  if (policy.validate) {
+    const validationSnapshot: SummaryValidationSnapshot<P> = Object.freeze({
+      ...plan.promptSnapshot,
+      prompt: plan.prompt,
+      summary,
+      response,
+      summaryMessage,
+      candidateActiveContext,
+    });
+    const validation = await awaitWithAbort(
+      Promise.resolve(policy.validate(validationSnapshot)),
+      plan.request.signal,
+    );
+    if (
+      typeof validation !== 'object' ||
+      validation === null ||
+      typeof validation.ok !== 'boolean'
+    ) {
+      throw new TypeError('Summary validate() must return { ok: true } or { ok: false, reason }.');
+    }
+    if (!validation.ok) {
+      if (typeof validation.reason !== 'string') {
+        throw new TypeError('Summary validate() failure must include a string reason.');
+      }
+      throw new Error(`Summary validation failed: ${validation.reason}`);
+    }
+  }
+  throwIfAborted(plan.request.signal, plan.request.deadlineAt);
+  return Object.freeze({
+    plan,
+    response: Object.freeze({ ...response, messages: Object.freeze([...response.messages]) }),
+    summary,
+    summaryMessage,
+    candidateActiveContext,
+  });
+}
+
+/** Apply a validated candidate with the originally captured ContextStore revision CAS. */
+export function commitSummaryCompactCandidate<P extends AgentProtocol>(
+  store: ContextStore<P>,
+  candidate: SummaryCompactCandidate<P>,
+): void {
+  store.commitSummary({
+    revision: candidate.plan.storeSnapshot.revision,
+    summaryText: candidate.summary,
+    summaryMessage: candidate.summaryMessage,
+    preservedContext: candidate.plan.selection.preservedContext,
+  });
+}
+
 export async function runSummaryCompactTransaction<P extends AgentProtocol>(input: {
   readonly model: Model<P>;
   readonly store: ContextStore<P>;
@@ -682,6 +860,7 @@ function assertCompactTransactionCheckpoint(transaction: DurableCompactTransacti
   } else if (transaction.result !== undefined) {
     throw new TypeError('A compact result is only valid after reaching result_ready.');
   }
+  if (transaction.metadata !== undefined) assertJsonValue(transaction.metadata);
   if (transaction.outcomeUnknown !== undefined && typeof transaction.outcomeUnknown !== 'boolean') {
     throw new TypeError('Compact outcomeUnknown must be a boolean when present.');
   }

@@ -20,6 +20,7 @@ import {
   weixinWindowsSkill,
   type CaptureWindowResult,
 } from './windows';
+import { requireSucceededContext } from './run-outcome';
 
 const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/v3';
 const defaultArkModel = 'doubao-seed-2-0-pro-260215';
@@ -176,17 +177,20 @@ async function runWindowsChatDemo(apiKey: string): Promise<void> {
   console.log(`windows chat demo: interactive=${interactiveEnabled ? 'enabled' : 'disabled'}`);
   console.log(`windows chat demo: recipient=${recipient} message=${messageText}`);
 
-  const finalContext = await agent.agent(
-    [
-      'Run the Windows Weixin multimodal messaging demo.',
-      `Target Weixin contact: ${recipient}`,
-      `Prepared message text: ${messageText}`,
-      'First call skill with skill "weixin-windows-send-message" to load the handbook, then follow it strictly.',
-      'When visual confirmation is needed, call capture-window and inspect the image in the next turn.',
-      interactiveEnabled
-        ? 'Interactive actions are enabled for this Weixin workflow.'
-        : 'Interactive actions are disabled, so only inspect and report the required opt-in.',
-    ].join('\n'),
+  const finalContext = requireSucceededContext(
+    await agent.agent(
+      [
+        'Run the Windows Weixin multimodal messaging demo.',
+        `Target Weixin contact: ${recipient}`,
+        `Prepared message text: ${messageText}`,
+        'First call skill with skill "weixin-windows-send-message" to load the handbook, then follow it strictly.',
+        'When visual confirmation is needed, call capture-window and inspect the image in the next turn.',
+        interactiveEnabled
+          ? 'Interactive actions are enabled for this Weixin workflow.'
+          : 'Interactive actions are disabled, so only inspect and report the required opt-in.',
+      ].join('\n'),
+    ),
+    'Windows Chat Agent',
   );
 
   console.log(`windows chat demo complete: messages=${finalContext.length}`);

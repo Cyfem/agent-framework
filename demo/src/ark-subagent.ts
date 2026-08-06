@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   Agent,
+  defineSubAgent,
   OpenAIChatModel,
   OpenAIResponsesModel,
   Tool,
@@ -21,6 +22,9 @@ import {
   type OpenAIResponsesProtocol,
 } from '@manee/agent-framework';
 import { z } from 'zod';
+
+import { requireSucceededContext } from './run-outcome';
+import { createDemoLocalSubAgentRuntime } from './local-subagent-runtime';
 
 const responsesBaseURL = 'https://ark.cn-beijing.volces.com/api/v3';
 const chatBaseURL = 'https://ark.cn-beijing.volces.com/api/coding/v3';
@@ -36,9 +40,6 @@ const observed = {
 };
 
 class ResponsesVerifierAgent extends Agent<OpenAIResponsesProtocol> {
-  static override name = 'responses-subagent-verifier';
-  static override description = 'Verifies sub-agent dispatch under the Responses protocol.';
-
   constructor(options: AgentOptions<OpenAIResponsesProtocol>) {
     super({
       ...options,
@@ -82,9 +83,6 @@ class ResponsesVerifierAgent extends Agent<OpenAIResponsesProtocol> {
 }
 
 class ChatVerifierAgent extends Agent<OpenAIChatProtocol> {
-  static override name = 'chat-subagent-verifier';
-  static override description = 'Verifies sub-agent dispatch under the Chat protocol.';
-
   constructor(options: AgentOptions<OpenAIChatProtocol>) {
     super({
       ...options,
@@ -130,23 +128,69 @@ class ChatVerifierAgent extends Agent<OpenAIChatProtocol> {
 class ResponsesParentAgent extends Agent<OpenAIResponsesProtocol> {}
 class ChatParentAgent extends Agent<OpenAIChatProtocol> {}
 
+const responsesVerifierDefinition = defineSubAgent({
+  name: 'responses-subagent-verifier',
+  version: '2.0.0',
+  description: 'Build a deterministic Responses proof in an isolated local Agent.',
+  inputSchema: z.object({
+    label: z.string().min(1),
+    numbers: z.array(z.number()).min(1),
+  }),
+  outputSchema: z.string().min(1),
+  executorPolicy: { allowedNames: ['local-responses'] },
+  delegation: { mode: 'none' },
+});
+
+const chatVerifierDefinition = defineSubAgent({
+  name: 'chat-subagent-verifier',
+  version: '2.0.0',
+  description: 'Build a deterministic Chat proof in an isolated local Agent.',
+  inputSchema: z.object({
+    label: z.string().min(1),
+    numbers: z.array(z.number()).min(1),
+  }),
+  outputSchema: z.string().min(1),
+  executorPolicy: { allowedNames: ['local-chat'] },
+  delegation: { mode: 'none' },
+});
+
 async function runResponsesSubAgentSmoke(apiKey: string, model: string): Promise<void> {
   // 父代理只通过内置 agent 工具调度子代理，不直接调用子代理工具。
   const parentResultSnippets: string[] = [];
+  const sessionId = 'ark-responses-subagent-smoke';
+  const { runtime } = await createDemoLocalSubAgentRuntime({
+    sessionId,
+    executorName: 'local-responses',
+    definition: responsesVerifierDefinition,
+    registration: {
+      runnerId: 'responses-verifier-agent',
+      runnerVersion: '2.0.0',
+      createAgent: () =>
+        new ResponsesVerifierAgent({
+          llm: new OpenAIResponsesModel({
+            apiKey,
+            baseURL: responsesBaseURL,
+            model,
+          }),
+        }),
+      buildInput: ({ input }) =>
+        `Call build-subagent-proof with label ${input.label} and numbers ${JSON.stringify(input.numbers)}.`,
+    },
+  });
   const agent = new ResponsesParentAgent({
     llm: new OpenAIResponsesModel({
       apiKey,
       baseURL: responsesBaseURL,
       model,
     }),
-    subAgents: [ResponsesVerifierAgent],
+    subAgentRuntime: runtime,
+    sessionId,
     maxIterations: 6,
     systemPrompts: [
       [
         'You are testing sub-agent dispatch with Ark Responses.',
-        'First call the agent tool with agentName "responses-subagent-verifier".',
-        'Use input: "Call build-subagent-proof with label responses-smoke and numbers [2,3,5], then report the proof string."',
-        'Use outputDescription: "A concise result containing SUBAGENT_PROOF::responses::responses-smoke::10".',
+        'First call agent with subAgent "responses-subagent-verifier" and executor "local-responses".',
+        'Use input {"label":"responses-smoke","numbers":[2,3,5]}.',
         'After the agent tool result is available, call end-agent alone.',
       ].join('\n'),
     ],
@@ -163,7 +207,7 @@ async function runResponsesSubAgentSmoke(apiKey: string, model: string): Promise
   agent.onAfterToolCall(
     'agent',
     (_parameters, _call, result) => {
-      const text = String(result);
+      const text = serializeToolResult(result);
 
       parentResultSnippets.push(text);
       console.log(`[responses] after parent agent tool: ${text.slice(0, 240)}`);
@@ -182,12 +226,15 @@ async function runResponsesSubAgentSmoke(apiKey: string, model: string): Promise
   agent.init();
 
   console.log(`[responses] baseURL=${responsesBaseURL} model=${model}`);
-  await agent.agent(
-    [
-      'Run the Responses sub-agent smoke test.',
-      'Delegate the proof-building work to the configured sub-agent.',
-      'Do not answer directly before the sub-agent result is available.',
-    ].join('\n'),
+  requireSucceededContext(
+    await agent.agent(
+      [
+        'Run the Responses sub-agent smoke test.',
+        'Delegate the proof-building work to the configured sub-agent.',
+        'Do not answer directly before the sub-agent result is available.',
+      ].join('\n'),
+    ),
+    'Ark Responses subagent parent',
   );
 
   assertDemo(
@@ -205,20 +252,40 @@ async function runResponsesSubAgentSmoke(apiKey: string, model: string): Promise
 async function runChatSubAgentSmoke(apiKey: string, model: string): Promise<void> {
   // Chat 父代理走 coding/v3 endpoint，验证同一套子代理协议在 Chat 下可工作。
   const parentResultSnippets: string[] = [];
+  const sessionId = 'ark-chat-subagent-smoke';
+  const { runtime } = await createDemoLocalSubAgentRuntime({
+    sessionId,
+    executorName: 'local-chat',
+    definition: chatVerifierDefinition,
+    registration: {
+      runnerId: 'chat-verifier-agent',
+      runnerVersion: '2.0.0',
+      createAgent: () =>
+        new ChatVerifierAgent({
+          llm: new OpenAIChatModel({
+            apiKey,
+            baseURL: chatBaseURL,
+            model,
+          }),
+        }),
+      buildInput: ({ input }) =>
+        `Call build-subagent-proof with label ${input.label} and numbers ${JSON.stringify(input.numbers)}.`,
+    },
+  });
   const agent = new ChatParentAgent({
     llm: new OpenAIChatModel({
       apiKey,
       baseURL: chatBaseURL,
       model,
     }),
-    subAgents: [ChatVerifierAgent],
+    subAgentRuntime: runtime,
+    sessionId,
     maxIterations: 6,
     systemPrompts: [
       [
         'You are testing sub-agent dispatch with Ark Coding Plan Chat.',
-        'First call the agent tool with agentName "chat-subagent-verifier".',
-        'Use input: "Call build-subagent-proof with label chat-smoke and numbers [4,6], then report the proof string."',
-        'Use outputDescription: "A concise result containing SUBAGENT_PROOF::chat::chat-smoke::10".',
+        'First call agent with subAgent "chat-subagent-verifier" and executor "local-chat".',
+        'Use input {"label":"chat-smoke","numbers":[4,6]}.',
         'After the agent tool result is available, call end-agent alone.',
       ].join('\n'),
     ],
@@ -235,7 +302,7 @@ async function runChatSubAgentSmoke(apiKey: string, model: string): Promise<void
   agent.onAfterToolCall(
     'agent',
     (_parameters, _call, result) => {
-      const text = String(result);
+      const text = serializeToolResult(result);
 
       parentResultSnippets.push(text);
       console.log(`[chat] after parent agent tool: ${text.slice(0, 240)}`);
@@ -254,12 +321,15 @@ async function runChatSubAgentSmoke(apiKey: string, model: string): Promise<void
   agent.init();
 
   console.log(`[chat] baseURL=${chatBaseURL} model=${model}`);
-  await agent.agent(
-    [
-      'Run the Chat sub-agent smoke test.',
-      'Delegate the proof-building work to the configured sub-agent.',
-      'Do not answer directly before the sub-agent result is available.',
-    ].join('\n'),
+  requireSucceededContext(
+    await agent.agent(
+      [
+        'Run the Chat sub-agent smoke test.',
+        'Delegate the proof-building work to the configured sub-agent.',
+        'Do not answer directly before the sub-agent result is available.',
+      ].join('\n'),
+    ),
+    'Ark Chat subagent parent',
   );
 
   assertDemo(observed.chatProofCalls > 0, 'Chat sub-agent should call build-subagent-proof.');
@@ -343,6 +413,15 @@ function assertDemo(condition: unknown, message: string): asserts condition {
 function toErrorMessage(error: unknown): string {
   // SDK 错误和普通异常统一转成短文本。
   return error instanceof Error ? error.message : String(error);
+}
+
+function serializeToolResult(result: unknown): string {
+  if (typeof result === 'string') return result;
+  try {
+    return JSON.stringify(result);
+  } catch {
+    return String(result);
+  }
 }
 
 if (!apiKey) {

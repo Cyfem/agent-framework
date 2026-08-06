@@ -1,6 +1,8 @@
 # Agent Framework Demo
 
-`demo` 是仓库内可运行的示例包，通过 pnpm workspace alias `@manee/agent-framework` 引用 [`packages/core`](../packages/core) 的实际发布包名 `@ruixutong.manee/maneeagent-framework`。该别名只用于本地 demo import；npm 用户应安装后者。
+`demo` 是仓库内可运行的示例包，通过 pnpm workspace alias `@manee/agent-framework` 与 `@manee/agent-executor-local` 分别引用 [`packages/core`](../packages/core) 和 [`packages/executor-local`](../packages/executor-local) 的对应可发布 workspace 包。别名只用于仓库内 import，不是额外的 npm 包。
+
+当前两个 workspace manifest 都是待发布的 `2.0.0`；npm registry 上 Core 的 `latest` 仍为 `1.0.0`，Local Executor 尚未发布。因此本目录的 Subagent v2 demo 必须从当前 workspace 运行；两个 v2 包发布后，外部用户再安装真实包名 `@ruixutong.manee/maneeagent-framework` 与 `@ruixutong.manee/maneeagent-executor-local`。
 
 ## 方舟 Agent Plan 综合验收
 
@@ -27,11 +29,11 @@ Copy-Item demo/.env.example demo/.env
 1. 使用内置 `skill` 工具加载 Skill、读取 reference、读取 asset、运行本地 script。
 2. 调用带 Zod 参数校验的 `@Tool` 装饰器工具。
 3. 调用运行时工具生成约 20K 字符的结果。
-4. 使用内置 `agent` 工具调度同协议子代理。
+4. 使用 v2 `{ subAgent, executor, input }` wire 调度该场景协议的隔离 child Agent。
 5. 子代理调用自身装饰器工具，通过 `agent-result` 汇报 proof，再调用 `end-agent`。
 6. 父代理收到 proof 后单独调用 `end-agent`。
 
-Chat 场景使用 inline Skill，Responses 场景使用 [`fixtures/skills/portable-demo`](./fixtures/skills/portable-demo) 文件 Skill。验收还会检查一次真实 `context-summary` 请求、自定义 tool-input/tool-result 压缩、active context 与 raw history 的差异、Skill 结果默认不压缩、工具事件以及父子代理上下文隔离。
+Chat 场景使用 inline Skill，Responses 场景使用 [`fixtures/skills/portable-demo`](./fixtures/skills/portable-demo) 文件 Skill。两者都通过 typed definition、ready Runtime 和 Local Executor registry 创建 child；child 的 Model、Tools、system prompt 与 `maxIterations` 显式配置，不假定继承父 Agent。验收还会检查一次真实 `context-summary` 请求、自定义 tool-input/tool-result 压缩、active context 与 raw history 的差异、Skill 结果默认不压缩、工具事件以及父子代理上下文隔离。
 
 ## 调用边界与结果
 
@@ -62,4 +64,4 @@ pnpm demo:chat
 pnpm demo:finance-news:smoke
 ```
 
-框架 API、Skills、context compact 和子代理限制见 [`packages/core/README.md`](../packages/core/README.md)。
+框架 API、Skills、context compact、Subagent v2 outcome/resume 与当前 Local placement 边界见 [`packages/core/README.md`](../packages/core/README.md) 和 [`packages/executor-local/README.md`](../packages/executor-local/README.md)。

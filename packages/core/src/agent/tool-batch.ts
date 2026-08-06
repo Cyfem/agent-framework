@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { ApprovalRequest } from '../subagent/approval';
 import type { EncodedAgentProtocolCheckpoint } from '../subagent/checkpoint';
 import { SubAgentRuntimeError, type SubAgentErrorDescriptor } from '../subagent/errors';
@@ -7,6 +9,7 @@ import {
   parseJsonValue,
   type JsonValue,
 } from '../subagent/json';
+import type { RuntimeTaskCreateMutation } from '../subagent/state-controller';
 import {
   StateLeaseUnavailableError,
   type StoredPendingToolBatch,
@@ -63,9 +66,26 @@ export type ToolBatchAgentCallOutcome =
   | {
       readonly status: 'running';
       readonly taskId: string;
+      /** New child identity to commit atomically with this parent call before dispatch. */
+      readonly taskMutation?: RuntimeTaskCreateMutation;
+      /** Invoked only after the parent checkpoint and optional task create commit succeeds. */
+      readonly dispatch?: () => MaybePromise<void>;
+    };
+
+export type ToolBatchToolAuthorizationOutcome =
+  | { readonly status: 'not_required' | 'approved' }
+  | {
+      readonly status: 'paused';
+      readonly approval: ApprovalRequest;
+      readonly checkpointRevision: number;
     };
 
 export interface ToolBatchExecutionCallbacks<P extends AgentProtocol> {
+  /** Child-only authorization gate invoked after the in-flight checkpoint and before the handler. */
+  readonly authorizeTool?: (
+    call: AgentToolCall<P>,
+    checkpoint: StoredPendingToolCall,
+  ) => MaybePromise<ToolBatchToolAuthorizationOutcome>;
   /** Ordinary Tools are invoked serially in provider-relative order. */
   readonly executeTool: (call: AgentToolCall<P>) => MaybePromise<JsonValue>;
   /** All create submissions in the agent sub-batch are started together and should return a handle state promptly. */
@@ -81,6 +101,11 @@ export interface ToolBatchExecutionCallbacks<P extends AgentProtocol> {
     checkpoint: StoredPendingToolCall,
     signal: AbortSignal,
   ) => MaybePromise<ToolBatchAgentCallOutcome>;
+  /** Non-blocking authoritative probe used after one sibling pauses. */
+  readonly reconcileAgent?: (
+    call: AgentToolCall<P>,
+    checkpoint: StoredPendingToolCall,
+  ) => MaybePromise<ToolBatchAgentCallOutcome>;
   /** A valid standalone end-agent call is executed through this callback. */
   readonly executeEndAgent: (call: AgentToolCall<P>) => MaybePromise<JsonValue>;
   /** Apply one settled provider result to active protocol context, strictly in provider order. */
@@ -92,6 +117,7 @@ export interface ToolBatchExecutionCallbacks<P extends AgentProtocol> {
   readonly checkpoint?: (
     batch: StoredPendingToolBatch,
     approvals: readonly ApprovalRequest[],
+    taskCreates: readonly RuntimeTaskCreateMutation[],
   ) => MaybePromise<void>;
 }
 
@@ -154,8 +180,17 @@ export function createToolBatchPlan<P extends AgentProtocol>(input: {
   });
   const standaloneEnd = planned.length === 1 && planned[0]?.kind === 'end-agent';
   const calls = planned.map(({ call, kind, order }): StoredPendingToolCall => {
+    const callInput = decodeStoredCallInput(call.arguments);
+    const operation = {
+      operationId: `call-operation-${createHash('sha256')
+        .update(canonicalizeJson([input.batchId, order, call.id]), 'utf8')
+        .digest('hex')}`,
+      input: callInput,
+      inputHash: createStoredCallInputHash(callInput),
+    };
     if (kind === 'end-agent' && !standaloneEnd) {
       return freezeStoredCall({
+        ...operation,
         callId: call.id,
         name: call.name,
         order,
@@ -166,6 +201,7 @@ export function createToolBatchPlan<P extends AgentProtocol>(input: {
       });
     }
     return freezeStoredCall({
+      ...operation,
       callId: call.id,
       name: call.name,
       order,
@@ -233,17 +269,48 @@ async function runToolBatch<P extends AgentProtocol>(
   const approvals: ApprovalRequest[] = [];
 
   // The prevalidated mixed end-agent errors are durable before any real handler runs.
-  await persist(callbacks, checkpoint, approvals);
+  // A recovered checkpoint is already authoritative; persisting it with an empty
+  // local approval list would create an invalid running/paused parent transition.
+  if (!recovering) await persist(callbacks, checkpoint, approvals);
 
   for (const planned of plan.calls.filter(({ kind }) => kind === 'tool')) {
-    const current = callAt(checkpoint, planned.order);
+    let current = callAt(checkpoint, planned.order);
     if (isResultReadyStatus(current.status)) continue;
-    if (current.status === 'running' || current.status === 'paused') {
+    if (current.status === 'running') {
+      throw new ToolBatchOutcomeUnknownError(current);
+    }
+    if (current.status === 'paused' && callbacks.authorizeTool === undefined) {
       throw new ToolBatchOutcomeUnknownError(current);
     }
 
-    checkpoint = replaceCall(checkpoint, runningCall(current));
-    await persist(callbacks, checkpoint, approvals);
+    if (current.status === 'pending') {
+      checkpoint = replaceCall(checkpoint, runningCall(current));
+      await persist(callbacks, checkpoint, approvals);
+      current = callAt(checkpoint, planned.order);
+    }
+
+    if (callbacks.authorizeTool !== undefined) {
+      const authorization = await Promise.resolve(callbacks.authorizeTool(planned.call, current));
+      if (authorization.status === 'paused') {
+        approvals.push(Object.freeze({ ...authorization.approval }));
+        checkpoint = replaceCall(
+          checkpoint,
+          pausedOrdinaryCall(current, authorization.approval.approvalId),
+        );
+        return buildExecutionResult(checkpoint, approvals);
+      }
+      if (current.status === 'paused') {
+        if (authorization.status !== 'approved') {
+          throw new ToolBatchOutcomeUnknownError(current);
+        }
+        checkpoint = replaceCall(checkpoint, runningCall(current));
+        await persist(callbacks, checkpoint, approvals);
+        current = callAt(checkpoint, planned.order);
+      }
+    } else if (current.status === 'paused') {
+      throw new ToolBatchOutcomeUnknownError(current);
+    }
+
     const settled = await settleOrdinaryCall(planned.call, callbacks.executeTool);
     checkpoint = replaceCall(checkpoint, settledCall(current, settled));
     await persist(callbacks, checkpoint, approvals);
@@ -265,6 +332,8 @@ async function runToolBatch<P extends AgentProtocol>(
     }
 
     const submissions = new Map<number, Promise<PlannedAgentOutcome<P>>>();
+    const stagedTaskCreates: RuntimeTaskCreateMutation[] = [];
+    const stagedDispatches: Array<() => MaybePromise<void>> = [];
     for (const planned of pendingAgents) {
       const durableCall = callAt(startingCheckpoint, planned.order);
       const submission = Promise.resolve()
@@ -295,11 +364,27 @@ async function runToolBatch<P extends AgentProtocol>(
         approvals.push(...outcome.approvals.map((approval) => Object.freeze({ ...approval })));
       }
       checkpoint = replaceCall(checkpoint, agentOutcomeCall(current, outcome));
-      await persist(callbacks, checkpoint, approvals);
+      if (outcome.status === 'running' && outcome.dispatch !== undefined) {
+        stagedDispatches.push(outcome.dispatch);
+      }
+      if (outcome.status === 'running' && outcome.taskMutation !== undefined) {
+        stagedTaskCreates.push(outcome.taskMutation);
+        continue;
+      }
+      if (stagedTaskCreates.length === 0) await persist(callbacks, checkpoint, approvals);
     }
 
+    if (stagedTaskCreates.length > 0) {
+      // Every new identity and the complete provider-ordered parent sub-batch become visible in one
+      // root transaction. No child dispatch starts early enough to race that parent checkpoint.
+      await persist(callbacks, checkpoint, approvals, stagedTaskCreates);
+    }
+    await Promise.all(stagedDispatches.map((dispatch) => Promise.resolve(dispatch())));
+
     const initiallyPaused = checkpoint.calls.some(({ status }) => status === 'paused');
-    if (!initiallyPaused && callbacks.observeAgent !== undefined) {
+    if (initiallyPaused && callbacks.reconcileAgent !== undefined) {
+      checkpoint = await reconcileAgentSubBatch(plan, checkpoint, callbacks, approvals);
+    } else if (!initiallyPaused && callbacks.observeAgent !== undefined) {
       checkpoint = await observeAgentSubBatch(plan, checkpoint, callbacks, approvals);
     }
   }
@@ -387,10 +472,48 @@ async function observeAgentSubBatch<P extends AgentProtocol>(
         new Error('Parent Tool batch paused; reconnect remaining agent tasks after approval.'),
       );
       for (const pending of active.values()) void pending.catch(() => undefined);
+      if (callbacks.reconcileAgent !== undefined) {
+        checkpoint = await reconcileAgentSubBatch(plan, checkpoint, callbacks, approvals);
+      }
       break;
     }
   }
 
+  return checkpoint;
+}
+
+async function reconcileAgentSubBatch<P extends AgentProtocol>(
+  plan: ToolBatchPlan<P>,
+  startingCheckpoint: StoredPendingToolBatch,
+  callbacks: ToolBatchExecutionCallbacks<P>,
+  approvals: ApprovalRequest[],
+): Promise<StoredPendingToolBatch> {
+  if (callbacks.reconcileAgent === undefined) return startingCheckpoint;
+  let checkpoint = startingCheckpoint;
+  const running = plan.calls.filter(
+    ({ kind, order }) => kind === 'agent' && callAt(checkpoint, order).status === 'running',
+  );
+  const probes = await Promise.all(
+    running.map(async (planned) => ({
+      planned,
+      outcome: await Promise.resolve(
+        callbacks.reconcileAgent!(planned.call, callAt(checkpoint, planned.order)),
+      ),
+    })),
+  );
+  for (const { planned, outcome } of probes.sort(
+    (left, right) => left.planned.order - right.planned.order,
+  )) {
+    if (outcome.status === 'running') continue;
+    if (outcome.status === 'paused') {
+      approvals.push(...outcome.approvals.map((approval) => Object.freeze({ ...approval })));
+    }
+    checkpoint = replaceCall(
+      checkpoint,
+      agentOutcomeCall(callAt(checkpoint, planned.order), outcome),
+    );
+    await persist(callbacks, checkpoint, approvals);
+  }
   return checkpoint;
 }
 
@@ -415,17 +538,23 @@ function agentOutcomeCall(
   current: StoredPendingToolCall,
   outcome: ToolBatchAgentCallOutcome,
 ): StoredPendingToolCall {
+  const base = withoutApprovalIds(current);
   if (outcome.status === 'running') {
-    return freezeStoredCall({ ...current, status: 'running', taskId: outcome.taskId });
+    return freezeStoredCall({ ...base, status: 'running', taskId: outcome.taskId });
   }
   if (outcome.status === 'paused') {
     assertNonEmpty(outcome.taskId, 'taskId');
     assertNonNegativeInteger(outcome.checkpointRevision, 'checkpointRevision');
-    return freezeStoredCall({ ...current, status: 'paused', taskId: outcome.taskId });
+    return freezeStoredCall({
+      ...base,
+      status: 'paused',
+      taskId: outcome.taskId,
+      approvalIds: Object.freeze(outcome.approvals.map(({ approvalId }) => approvalId)),
+    });
   }
   return freezeStoredCall({
-    ...current,
-    status: 'settled',
+    ...base,
+    status: base.name === 'agent-result' ? 'result_submitted' : 'settled',
     ...(outcome.taskId === undefined ? {} : { taskId: outcome.taskId }),
     output: cloneJson(outcome.output),
     ...(outcome.error === undefined ? {} : { error: Object.freeze({ ...outcome.error }) }),
@@ -476,23 +605,27 @@ function settledCall(
   current: StoredPendingToolCall,
   settled: { readonly output: JsonValue; readonly error?: SubAgentErrorDescriptor },
 ): StoredPendingToolCall {
+  const base = withoutApprovalIds(current);
   return freezeStoredCall({
-    ...current,
-    status: 'settled',
+    ...base,
+    status: base.name === 'agent-result' ? 'result_submitted' : 'settled',
     output: cloneJson(settled.output),
     ...(settled.error === undefined ? {} : { error: Object.freeze({ ...settled.error }) }),
   });
 }
 
 function appliedCall(current: StoredPendingToolCall): StoredPendingToolCall {
-  if (current.status !== 'settled' || current.output === undefined) {
+  if (
+    (current.status !== 'settled' && current.status !== 'result_submitted') ||
+    current.output === undefined
+  ) {
     throw new Error(`Tool call ${current.callId} cannot transition to applied.`);
   }
   return freezeStoredCall({ ...current, status: 'applied' });
 }
 
 function isResultReadyStatus(status: StoredPendingToolCallStatus): boolean {
-  return status === 'settled' || status === 'applied';
+  return status === 'settled' || status === 'result_submitted' || status === 'applied';
 }
 
 function isStableControlError(error: unknown): boolean {
@@ -509,13 +642,29 @@ function isStableControlError(error: unknown): boolean {
 }
 
 function runningCall(current: StoredPendingToolCall): StoredPendingToolCall {
+  const base = withoutApprovalIds(current);
   return freezeStoredCall({
-    callId: current.callId,
-    name: current.name,
-    order: current.order,
-    kind: current.kind,
+    ...base,
     status: 'running',
-    ...(current.taskId === undefined ? {} : { taskId: current.taskId }),
+  });
+}
+
+function withoutApprovalIds(call: StoredPendingToolCall): StoredPendingToolCall {
+  if (call.approvalIds === undefined) return call;
+  const mutable = { ...call };
+  delete mutable.approvalIds;
+  return mutable;
+}
+
+function pausedOrdinaryCall(
+  current: StoredPendingToolCall,
+  approvalId: string,
+): StoredPendingToolCall {
+  assertNonEmpty(approvalId, 'approvalId');
+  return freezeStoredCall({
+    ...current,
+    status: 'paused',
+    approvalIds: Object.freeze([approvalId]),
   });
 }
 
@@ -541,9 +690,16 @@ async function persist<P extends AgentProtocol>(
   callbacks: ToolBatchExecutionCallbacks<P>,
   checkpoint: StoredPendingToolBatch,
   approvals: readonly ApprovalRequest[],
+  taskCreates: readonly RuntimeTaskCreateMutation[] = [],
 ): Promise<void> {
   if (callbacks.checkpoint !== undefined) {
-    await Promise.resolve(callbacks.checkpoint(checkpoint, Object.freeze([...approvals])));
+    await Promise.resolve(
+      callbacks.checkpoint(
+        checkpoint,
+        Object.freeze([...approvals]),
+        Object.freeze([...taskCreates]),
+      ),
+    );
   }
 }
 
@@ -560,10 +716,14 @@ function assertCheckpointMatchesPlan<P extends AgentProtocol>(
   }
   for (const planned of plan.calls) {
     const stored = callAt(checkpoint, planned.order);
+    const expected = callAt(plan.initialCheckpoint, planned.order);
     if (
       stored.callId !== planned.call.id ||
       stored.name !== planned.call.name ||
-      stored.kind !== planned.kind
+      stored.kind !== planned.kind ||
+      stored.operationId !== expected.operationId ||
+      stored.inputHash !== expected.inputHash ||
+      canonicalizeJson(stored.input) !== canonicalizeJson(expected.input)
     ) {
       throw new Error('The pending Tool call identity or provider order does not match.');
     }
@@ -598,9 +758,26 @@ function freezeBatch(checkpoint: StoredPendingToolBatch): StoredPendingToolBatch
 function freezeStoredCall(call: StoredPendingToolCall): StoredPendingToolCall {
   return Object.freeze({
     ...call,
+    ...(call.approvalIds === undefined
+      ? {}
+      : { approvalIds: Object.freeze([...call.approvalIds]) }),
     ...(call.output === undefined ? {} : { output: cloneJson(call.output) }),
     ...(call.error === undefined ? {} : { error: Object.freeze({ ...call.error }) }),
   });
+}
+
+function decodeStoredCallInput(argumentsText: string): JsonValue {
+  try {
+    const parsed: unknown = argumentsText.trim().length === 0 ? {} : JSON.parse(argumentsText);
+    assertJsonValue(parsed);
+    return parsed;
+  } catch {
+    return argumentsText;
+  }
+}
+
+function createStoredCallInputHash(input: JsonValue): string {
+  return createHash('sha256').update(canonicalizeJson(input), 'utf8').digest('hex');
 }
 
 function cloneEncodedCheckpoint(

@@ -25,6 +25,7 @@ import {
 } from '@manee/agent-framework';
 
 import type { CaptureWindowResult } from '../src/windows';
+import { requireSucceededContext } from '../src/run-outcome';
 import {
   DEFAULT_SCREENSHOT_PUBLIC_BASE_URL,
   type ElectronWeixinRunRequest,
@@ -406,7 +407,10 @@ export async function runElectronWeixinTask({
       : '交互模式未开启，本次只会观察窗口并报告需要授权后才能发送。',
   });
 
-  const finalContext = await agent.agent(buildTaskPrompt(request));
+  const finalContext = requireSucceededContext(
+    await agent.agent(buildTaskPrompt(request)),
+    'Electron Weixin Agent',
+  );
 
   return {
     messageCount: finalContext.length,

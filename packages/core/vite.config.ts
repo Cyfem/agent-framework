@@ -10,6 +10,7 @@ export default defineConfig({
     environment: 'node',
     globals: false,
     clearMocks: true,
+    setupFiles: ['test/network-deny.setup.ts'],
     include: ['test/**/*.test.ts'],
   },
   build: {

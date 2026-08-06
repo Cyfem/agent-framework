@@ -19,7 +19,12 @@ import {
   type AgentProtocolCheckpointCodec,
 } from '../src/subagent/checkpoint';
 import type { JsonValue } from '../src/subagent/json';
-import { createStoredTaskIdempotently } from '../src/subagent/state-controller';
+import { DEFAULT_SUBAGENT_LIMITS, resolveSubAgentLimits } from '../src/subagent/limits';
+import {
+  commitRuntimeStateMutation,
+  createStoredTaskIdempotently,
+} from '../src/subagent/state-controller';
+import { transitionSubAgentTask } from '../src/subagent/state-machine';
 import type {
   StoredAgentRun,
   StoredPendingToolBatch,
@@ -74,7 +79,10 @@ function createPendingBatch(iteration = 0) {
   }).initialCheckpoint;
 }
 
-function createStoredChildTask(fencingToken: string): StoredTask {
+function createStoredChildTask(
+  fencingToken: string,
+  overrides: Partial<StoredTask> = {},
+): StoredTask {
   return {
     recordVersion: '1',
     ownerSessionId: 'owner-1',
@@ -88,6 +96,7 @@ function createStoredChildTask(fencingToken: string): StoredTask {
     input: { query: 'safe' },
     inputHash: 'sha256:input-1',
     projectedContext: [],
+    limits: DEFAULT_SUBAGENT_LIMITS,
     state: 'queued',
     revision: 0,
     fencingToken,
@@ -103,6 +112,7 @@ function createStoredChildTask(fencingToken: string): StoredTask {
     eventSequence: 0,
     createdAt: 1_000,
     updatedAt: 1_000,
+    ...overrides,
   };
 }
 
@@ -131,6 +141,7 @@ function createLegacyStoredRun(): StoredAgentRun {
     },
     modelIteration: 0,
     maxIterations: null,
+    limits: DEFAULT_SUBAGENT_LIMITS,
     budget: {
       descendantsCreated: 0,
       activeExecutions: 0,
@@ -151,6 +162,8 @@ function migrateLegacyRun(value: JsonValue): JsonValue {
   return {
     ...record,
     agentCheckpointVersion: '1',
+    configurationHash: '0'.repeat(64),
+    limits: DEFAULT_SUBAGENT_LIMITS,
     protocolContext: { ...protocolContext, codecVersion: '1' },
   };
 }
@@ -200,7 +213,7 @@ describe('AgentRunCheckpointController', () => {
     const controller = createController(store);
     const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]);
 
-    const active = await controller.beginCreate({ contextStore });
+    const active = await controller.beginCreate({ contextStore, limits: DEFAULT_SUBAGENT_LIMITS });
     const created = active.checkpoint;
     contextStore.appendStandalone({ kind: 'user', content: 'mutated-after-create' }, 'user');
     const restored = await controller.load('run-1', active.lease);
@@ -226,10 +239,13 @@ describe('AgentRunCheckpointController', () => {
     const store = new RecordingRuntimeStateStore();
     const controller = createController(store);
     const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'task' }]);
-    const active = await controller.beginCreate({ contextStore, maxIterations: 8 });
+    const active = await controller.beginCreate({
+      contextStore,
+      limits: DEFAULT_SUBAGENT_LIMITS,
+      maxIterations: 8,
+    });
     contextStore.openLoopSpan();
     contextStore.appendToOpenLoop({ kind: 'assistant', content: 'pending', calls: [] });
-    const pendingBatch = createPendingBatch();
     const pendingApprovals = [
       {
         approvalId: 'approval-1',
@@ -242,6 +258,16 @@ describe('AgentRunCheckpointController', () => {
         revision: 2,
       },
     ];
+    const initialBatch = createPendingBatch();
+    const pendingBatch = {
+      ...initialBatch,
+      calls: initialBatch.calls.map((call) => ({
+        ...call,
+        status: 'paused' as const,
+        taskId: 'task-1',
+        approvalIds: ['approval-1'],
+      })),
+    };
 
     await controller.checkpoint(
       {
@@ -273,7 +299,7 @@ describe('AgentRunCheckpointController', () => {
     const store = new RecordingRuntimeStateStore();
     const controller = createController(store);
     const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'task' }]);
-    const active = await controller.beginCreate({ contextStore });
+    const active = await controller.beginCreate({ contextStore, limits: DEFAULT_SUBAGENT_LIMITS });
     const pendingBatch = createPendingBatch();
     const appliedBatch = {
       ...pendingBatch,
@@ -295,10 +321,13 @@ describe('AgentRunCheckpointController', () => {
     const malformed = {
       ...appliedBatch,
       calls: appliedBatch.calls.map((call) => ({
+        operationId: call.operationId,
         callId: call.callId,
         name: call.name,
         order: call.order,
         kind: call.kind,
+        input: call.input,
+        inputHash: call.inputHash,
         status: call.status,
         ...(call.taskId === undefined ? {} : { taskId: call.taskId }),
         ...(call.error === undefined ? {} : { error: call.error }),
@@ -318,6 +347,7 @@ describe('AgentRunCheckpointController', () => {
     const controller = createController(store);
     const active = await controller.beginCreate({
       contextStore: new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]),
+      limits: DEFAULT_SUBAGENT_LIMITS,
     });
     await active.lease.release();
     const decode = vi.fn(() => [] as readonly TestContext[]);
@@ -399,7 +429,11 @@ describe('AgentRunCheckpointController', () => {
     const store = new RecordingRuntimeStateStore();
     const controller = createController(store);
     const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]);
-    const active = await controller.beginCreate({ contextStore, maxIterations: 4 });
+    const active = await controller.beginCreate({
+      contextStore,
+      limits: DEFAULT_SUBAGENT_LIMITS,
+      maxIterations: 4,
+    });
     const prepared = createCompactTransactionCheckpoint({
       transactionId: 'compact-1',
       kind: 'summary',
@@ -471,11 +505,370 @@ describe('AgentRunCheckpointController', () => {
     await active.lease.release();
   });
 
+  acceptanceIt('RUN-03.l1.model-operation', 'model-operation', async () => {
+    const store = new RecordingRuntimeStateStore();
+    const controller = createController(store);
+    const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]);
+    const active = await controller.beginCreate({
+      contextStore,
+      limits: DEFAULT_SUBAGENT_LIMITS,
+      maxIterations: 4,
+    });
+
+    const prepared = await controller.prepareModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'model-operation-1',
+        iteration: 0,
+        purpose: 'agent',
+        requestHash: 'a'.repeat(64),
+      },
+      active.lease,
+    );
+    expect(prepared.recovery).toMatchObject({
+      action: 'execute_model',
+      operation: { phase: 'prepared', purpose: 'agent' },
+    });
+    await expect(
+      controller.checkpoint({ runId: 'run-1', contextStore, modelIteration: 1 }, active.lease),
+    ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
+
+    await controller.markModelOperationInFlight('run-1', 'model-operation-1', active.lease);
+    const ready = await controller.commitModelOperationResult(
+      {
+        runId: 'run-1',
+        operationId: 'model-operation-1',
+        messages: [{ kind: 'assistant', content: 'durable result', calls: [] }],
+      },
+      active.lease,
+    );
+    expect(ready.recovery).toMatchObject({
+      action: 'apply_model',
+      operation: { phase: 'result_ready' },
+      messages: [{ kind: 'assistant', content: 'durable result', calls: [] }],
+    });
+
+    contextStore.appendStandalone(
+      { kind: 'assistant', content: 'durable result', calls: [] },
+      'external',
+    );
+    const applied = await controller.applyModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'model-operation-1',
+        contextStore,
+        modelIteration: 1,
+      },
+      active.lease,
+    );
+    expect(applied.record.modelOperation).toBeUndefined();
+    expect(applied.record.modelIteration).toBe(1);
+    expect(applied.recovery).toEqual({ action: 'continue' });
+    expect(applied.protocolContext).toContainEqual({
+      kind: 'assistant',
+      content: 'durable result',
+      calls: [],
+    });
+    await expect(
+      controller.applyModelOperation(
+        {
+          runId: 'run-1',
+          operationId: 'model-operation-1',
+          contextStore,
+        },
+        active.lease,
+      ),
+    ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
+    await active.lease.release();
+  });
+
+  it('atomically reserves the persisted root provider budget before dispatch and never reserves it twice', async () => {
+    const store = new RecordingRuntimeStateStore();
+    const controller = createController(store);
+    const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]);
+    const limits = resolveSubAgentLimits({ maxProviderCalls: 2 });
+    const active = await controller.beginCreate({ contextStore, limits, maxIterations: 4 });
+
+    await controller.prepareModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'provider-1',
+        iteration: 0,
+        purpose: 'agent',
+        requestHash: '1'.repeat(64),
+      },
+      active.lease,
+    );
+    const firstInFlight = await controller.markModelOperationInFlight(
+      'run-1',
+      'provider-1',
+      active.lease,
+    );
+    expect(firstInFlight.record).toMatchObject({
+      modelOperation: { phase: 'in_flight' },
+      budget: { providerCalls: 1 },
+      limits: { maxProviderCalls: 2 },
+    });
+    await controller.commitModelOperationResult(
+      {
+        runId: 'run-1',
+        operationId: 'provider-1',
+        messages: [{ kind: 'assistant', content: 'durable provider result', calls: [] }],
+      },
+      active.lease,
+    );
+    await active.lease.release();
+
+    const replacement = createController(store);
+    const resultReady = await replacement.beginResume('run-1');
+    expect(resultReady.checkpoint).toMatchObject({
+      recovery: { action: 'apply_model' },
+      record: { budget: { providerCalls: 1 }, modelOperation: { phase: 'result_ready' } },
+    });
+    const beforeReplayMark = await store.loadRun('owner-1', 'run-1');
+    await expect(
+      replacement.markModelOperationInFlight('run-1', 'provider-1', resultReady.lease),
+    ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
+    expect(await store.loadRun('owner-1', 'run-1')).toEqual(beforeReplayMark);
+
+    contextStore.appendStandalone(
+      { kind: 'assistant', content: 'durable provider result', calls: [] },
+      'external',
+    );
+    await replacement.applyModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'provider-1',
+        contextStore,
+        modelIteration: 1,
+      },
+      resultReady.lease,
+    );
+    await replacement.prepareModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'provider-2',
+        iteration: 1,
+        purpose: 'agent',
+        requestHash: '2'.repeat(64),
+      },
+      resultReady.lease,
+    );
+    await replacement.markModelOperationInFlight('run-1', 'provider-2', resultReady.lease);
+    await replacement.rejectModelOperation('run-1', 'provider-2', resultReady.lease);
+    await replacement.prepareModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'provider-3',
+        iteration: 1,
+        purpose: 'agent',
+        requestHash: '3'.repeat(64),
+      },
+      resultReady.lease,
+    );
+
+    const beforeOverLimit = await store.loadRun('owner-1', 'run-1');
+    await expect(
+      replacement.markModelOperationInFlight('run-1', 'provider-3', resultReady.lease),
+    ).rejects.toMatchObject({ code: 'BUDGET_EXCEEDED' });
+    expect(await store.loadRun('owner-1', 'run-1')).toEqual(beforeOverLimit);
+    expect(beforeOverLimit).toMatchObject({
+      modelOperation: { operationId: 'provider-3', phase: 'prepared' },
+      budget: { providerCalls: 2 },
+    });
+    await resultReady.lease.release();
+  });
+
+  it('resumes prepared work by execution and result-ready work by apply without provider replay', async () => {
+    const store = new RecordingRuntimeStateStore();
+    const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]);
+    const first = createController(store);
+    const created = await first.beginCreate({ contextStore, limits: DEFAULT_SUBAGENT_LIMITS });
+    await first.prepareModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'crash-window-1',
+        iteration: 0,
+        purpose: 'agent',
+        requestHash: 'd'.repeat(64),
+      },
+      created.lease,
+    );
+    await created.lease.release();
+
+    const provider = vi.fn(
+      async () =>
+        [{ kind: 'assistant', content: 'one provider call', calls: [] }] as readonly TestContext[],
+    );
+    const second = createController(store);
+    const prepared = await second.beginResume('run-1');
+    expect(prepared.checkpoint.recovery.action).toBe('execute_model');
+    await second.markModelOperationInFlight('run-1', 'crash-window-1', prepared.lease);
+    const messages = await provider();
+    await second.commitModelOperationResult(
+      { runId: 'run-1', operationId: 'crash-window-1', messages },
+      prepared.lease,
+    );
+    await prepared.lease.release();
+
+    const third = createController(store);
+    const resultReady = await third.beginResume('run-1');
+    expect(resultReady.checkpoint.recovery).toMatchObject({
+      action: 'apply_model',
+      messages,
+    });
+    expect(provider).toHaveBeenCalledTimes(1);
+    for (const message of messages) contextStore.appendStandalone(message, 'external');
+    await third.applyModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'crash-window-1',
+        contextStore,
+        modelIteration: 1,
+      },
+      resultReady.lease,
+    );
+    expect(provider).toHaveBeenCalledTimes(1);
+    await resultReady.lease.release();
+  });
+
+  it.each(['agent', 'context-summary'] as const)(
+    'fails a resumed in-flight %s provider operation as outcome-unknown without replay',
+    async (purpose) => {
+      const store = new RecordingRuntimeStateStore();
+      const first = createController(store);
+      const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]);
+      const active = await first.beginCreate({ contextStore, limits: DEFAULT_SUBAGENT_LIMITS });
+      await first.prepareModelOperation(
+        {
+          runId: 'run-1',
+          operationId: `model-${purpose}`,
+          iteration: 0,
+          purpose,
+          requestHash: 'b'.repeat(64),
+        },
+        active.lease,
+      );
+      await first.markModelOperationInFlight('run-1', `model-${purpose}`, active.lease);
+      await active.lease.release();
+
+      const replacement = createController(store);
+      const resumed = await replacement.beginResume('run-1');
+      expect(resumed.checkpoint.record).toMatchObject({
+        status: 'failed',
+        modelOperation: { phase: 'in_flight', purpose },
+        error: {
+          code: 'INTERNAL_ERROR',
+          causeCode: 'MODEL_OUTCOME_UNKNOWN',
+          outcomeUnknown: true,
+          retryable: false,
+        },
+      });
+      expect(resumed.checkpoint.recovery).toMatchObject({
+        action: 'fail_model_outcome_unknown',
+        error: { causeCode: 'MODEL_OUTCOME_UNKNOWN', outcomeUnknown: true },
+      });
+      const terminalRevision = resumed.checkpoint.record.revision;
+      await resumed.lease.release();
+
+      const observedAgain = await replacement.beginResume('run-1');
+      expect(observedAgain.checkpoint.record.revision).toBe(terminalRevision);
+      expect(observedAgain.checkpoint.record.status).toBe('failed');
+      await observedAgain.lease.release();
+    },
+  );
+
+  it('settles a live provider throw immediately as a safe outcome-unknown terminal run', async () => {
+    const store = new RecordingRuntimeStateStore();
+    const controller = createController(store);
+    const active = await controller.beginCreate({
+      contextStore: new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]),
+      limits: DEFAULT_SUBAGENT_LIMITS,
+    });
+    await controller.prepareModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'provider-throw-1',
+        iteration: 0,
+        purpose: 'agent',
+        requestHash: 'c'.repeat(64),
+      },
+      active.lease,
+    );
+    await controller.markModelOperationInFlight('run-1', 'provider-throw-1', active.lease);
+
+    const failed = await controller.failModelOperationOutcomeUnknown(
+      'run-1',
+      'provider-throw-1',
+      active.lease,
+    );
+    expect(failed.record).toMatchObject({
+      status: 'failed',
+      error: {
+        code: 'INTERNAL_ERROR',
+        causeCode: 'MODEL_OUTCOME_UNKNOWN',
+        outcomeUnknown: true,
+      },
+    });
+    expect(JSON.stringify(failed.record)).not.toContain('provider secret body');
+    await expect(
+      controller.failModelOperationOutcomeUnknown('run-1', 'provider-throw-1', active.lease),
+    ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
+    await active.lease.release();
+  });
+
+  it('leaves the original in-flight record unchanged when provider-result decoding fails', async () => {
+    const store = new RecordingRuntimeStateStore();
+    const codec: AgentProtocolCheckpointCodec<TestProtocol> = {
+      ...TEST_CODEC,
+      decode(value) {
+        if (JSON.stringify(value).includes('undecodable-provider-result')) {
+          throw new Error('provider secret body must not be persisted');
+        }
+        return TEST_CODEC.decode(value);
+      },
+    };
+    const controller = createController(store, { codec });
+    const active = await controller.beginCreate({
+      contextStore: new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]),
+      limits: DEFAULT_SUBAGENT_LIMITS,
+    });
+    await controller.prepareModelOperation(
+      {
+        runId: 'run-1',
+        operationId: 'decode-failure-1',
+        iteration: 0,
+        purpose: 'agent',
+        requestHash: 'e'.repeat(64),
+      },
+      active.lease,
+    );
+    await controller.markModelOperationInFlight('run-1', 'decode-failure-1', active.lease);
+    const before = await store.loadRun('owner-1', 'run-1');
+
+    await expect(
+      controller.commitModelOperationResult(
+        {
+          runId: 'run-1',
+          operationId: 'decode-failure-1',
+          messages: [{ kind: 'assistant', content: 'undecodable-provider-result', calls: [] }],
+        },
+        active.lease,
+      ),
+    ).rejects.toMatchObject({ code: 'CHECKPOINT_VERSION_MISMATCH' });
+    expect(await store.loadRun('owner-1', 'run-1')).toEqual(before);
+    await active.lease.release();
+  });
+
   it('keeps terminal run state irreversible under fenced checkpoint CAS', async () => {
     const store = new RecordingRuntimeStateStore();
     const controller = createController(store);
     const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]);
-    const active = await controller.beginCreate({ contextStore, maxIterations: 3 });
+    const active = await controller.beginCreate({
+      contextStore,
+      limits: DEFAULT_SUBAGENT_LIMITS,
+      maxIterations: 3,
+    });
     await controller.checkpoint(
       {
         runId: 'run-1',
@@ -498,7 +891,7 @@ describe('AgentRunCheckpointController', () => {
     const contextStore = new ContextStore<TestProtocol>([
       { kind: 'user', content: 'exclusive root run' },
     ]);
-    const active = await first.beginCreate({ contextStore });
+    const active = await first.beginCreate({ contextStore, limits: DEFAULT_SUBAGENT_LIMITS });
     const second = createController(store);
 
     await expect(second.acquire('run-1')).rejects.toMatchObject({
@@ -534,7 +927,7 @@ describe('AgentRunCheckpointController', () => {
     const contextStore = new ContextStore<TestProtocol>([
       { kind: 'user', content: 'parent plus child CAS' },
     ]);
-    const active = await controller.beginCreate({ contextStore });
+    const active = await controller.beginCreate({ contextStore, limits: DEFAULT_SUBAGENT_LIMITS });
     expect(active.lease.key).not.toBe(taskLeaseKey);
     expect(controller.transactionDomainId).toBe(store.transactionDomainId);
 
@@ -579,7 +972,257 @@ describe('AgentRunCheckpointController', () => {
     await active.lease.release();
   });
 
-  it('aborts the execution signal when renewal discovers a fencing takeover', async () => {
+  acceptanceIt(
+    'RUN-02.l1.staged-batch-descendant-limit',
+    'aggregate-limit-rolls-back-entire-batch',
+    async () => {
+      const store = new RecordingRuntimeStateStore();
+      const controller = createController(store);
+      const contextStore = new ContextStore<TestProtocol>([
+        { kind: 'user', content: 'one descendant slot remains' },
+      ]);
+      const limits = { ...DEFAULT_SUBAGENT_LIMITS, maxDescendants: 1 };
+      const active = await controller.beginCreate({ contextStore, limits });
+      const staged = ['task-1', 'task-2'].map((taskId, index) => {
+        const create = createStoredChildTask(active.lease.fencingToken, {
+          taskId,
+          subagentSessionId: `child-session-${index + 1}`,
+          requestId: `request-${index + 1}`,
+          idempotencyKey: `request-${index + 1}`,
+          path: [taskId],
+          limits,
+        });
+        return {
+          create,
+          next: { ...create, revision: 1 } satisfies StoredTask,
+          events: [],
+        };
+      });
+
+      await expect(
+        controller.commitWithTasks(
+          { runId: 'run-1', contextStore, modelIteration: 0 },
+          active.lease,
+          staged,
+        ),
+      ).rejects.toMatchObject({ code: 'LIMIT_EXCEEDED' });
+
+      expect(await store.loadTask('owner-1', 'task-1')).toBeUndefined();
+      expect(await store.loadTask('owner-1', 'task-2')).toBeUndefined();
+      await expect(store.loadRun('owner-1', 'run-1')).resolves.toMatchObject({
+        revision: 0,
+        budget: { descendantsCreated: 0 },
+      });
+      await active.lease.release();
+    },
+  );
+
+  acceptanceIt('RUN-07.l1.root-terminalization', 'atomic-clear-and-idempotent-replay', async () => {
+    const store = new RecordingRuntimeStateStore();
+    const controller = createController(store);
+    const contextStore = new ContextStore<TestProtocol>([
+      { kind: 'user', content: 'terminalize root' },
+    ]);
+    const active = await controller.beginCreate({
+      contextStore,
+      limits: DEFAULT_SUBAGENT_LIMITS,
+      maxIterations: 3,
+    });
+    await controller.checkpoint(
+      {
+        runId: 'run-1',
+        contextStore,
+        pendingBatch: createPendingBatch(),
+        pendingApprovals: [],
+      },
+      active.lease,
+    );
+    const terminal = await controller.terminalize(
+      {
+        runId: 'run-1',
+        contextStore,
+        status: 'failed',
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'safe terminal proof',
+          retryable: false,
+          causeCode: 'TEST_TERMINAL',
+        },
+      },
+      active.lease,
+    );
+    expect(terminal.record).toMatchObject({
+      status: 'failed',
+      pendingApprovals: [],
+      endRequested: false,
+      error: { causeCode: 'TEST_TERMINAL' },
+    });
+    expect(terminal.record).not.toHaveProperty('pendingBatch');
+    expect(terminal.record).not.toHaveProperty('compactTransaction');
+    expect(terminal.record).not.toHaveProperty('modelOperation');
+    const terminalRevision = terminal.record.revision;
+
+    const replay = await controller.terminalize(
+      {
+        runId: 'run-1',
+        contextStore,
+        status: 'cancelled',
+        error: { code: 'CANCELLED', message: 'must not replace', retryable: false },
+      },
+      active.lease,
+    );
+    expect(replay.record).toEqual(terminal.record);
+    expect(replay.record.revision).toBe(terminalRevision);
+    await active.lease.release();
+
+    const replacement = createController(store);
+    const restored = await replacement.beginResume('run-1');
+    expect(restored.checkpoint.record).toEqual(terminal.record);
+    expect(restored.checkpoint.record.revision).toBe(terminalRevision);
+    await restored.lease.release();
+  });
+
+  acceptanceIt(
+    'RUN-07.l1.root-descendant-cancellation',
+    'transaction-rollback-cas-recompute-terminal-immutable',
+    async () => {
+      const store = new RecordingRuntimeStateStore();
+      const controller = createController(store);
+      const contextStore = new ContextStore<TestProtocol>([
+        { kind: 'user', content: 'cancel the complete root tree atomically' },
+      ]);
+      const active = await controller.beginCreate({
+        contextStore,
+        limits: DEFAULT_SUBAGENT_LIMITS,
+        maxIterations: 3,
+      });
+      const create = createStoredChildTask(active.lease.fencingToken);
+      await controller.commitWithTasks({ runId: 'run-1', contextStore }, active.lease, [
+        {
+          create,
+          next: Object.freeze({
+            ...create,
+            revision: 1,
+            updatedAt: 1_001,
+          }),
+          events: [],
+        },
+      ]);
+      const beforeFailure = store.snapshot('owner-1');
+      const originalTransaction = store.transaction.bind(store);
+      let failAfterRunCas = true;
+      const transactionSpy = vi
+        .spyOn(store, 'transaction')
+        .mockImplementation(async (ownerSessionId, lease, work) =>
+          originalTransaction(ownerSessionId, lease, async (transaction) => {
+            let runCasCommitted = false;
+            return work({
+              ...transaction,
+              compareAndSetRun: async (...parameters) => {
+                const committed = await transaction.compareAndSetRun(...parameters);
+                runCasCommitted ||= committed;
+                return committed;
+              },
+              compareAndSetTask: async (...parameters) => {
+                if (runCasCommitted && failAfterRunCas) {
+                  failAfterRunCas = false;
+                  throw new Error('root-descendant-cancel failpoint');
+                }
+                return transaction.compareAndSetTask(...parameters);
+              },
+            });
+          }),
+        );
+
+      await expect(
+        controller.terminalizeWithTasks(
+          {
+            runId: 'run-1',
+            contextStore,
+            status: 'cancelled',
+            error: { code: 'CANCELLED', message: 'caller cancelled', retryable: false },
+            reason: 'caller cancelled',
+            operationId: 'atomic-root-cancel',
+          },
+          active.lease,
+        ),
+      ).rejects.toThrow('root-descendant-cancel failpoint');
+      expect(store.snapshot('owner-1')).toEqual(beforeFailure);
+      transactionSpy.mockRestore();
+
+      const originalListTasks = store.listTasksByRun.bind(store);
+      let injectedConcurrentTerminal = false;
+      const listSpy = vi
+        .spyOn(store, 'listTasksByRun')
+        .mockImplementation(async (ownerSessionId, runId) => {
+          const snapshot = await originalListTasks(ownerSessionId, runId);
+          if (!injectedConcurrentTerminal) {
+            injectedConcurrentTerminal = true;
+            const task = snapshot[0]!;
+            const raceLease = await store.acquireLease('task-race:task-1', 10_000);
+            const failed = transitionSubAgentTask(task, 'failed', {
+              now: 1_002,
+              error: { code: 'EXECUTOR_FAILED', message: 'won task CAS', retryable: false },
+            });
+            await commitRuntimeStateMutation(store, 'owner-1', raceLease, {
+              tasks: [
+                {
+                  previous: task,
+                  next: Object.freeze({ ...failed, fencingToken: raceLease.fencingToken }),
+                },
+              ],
+            });
+            await raceLease.release();
+          }
+          return snapshot;
+        });
+
+      const terminal = await controller.terminalizeWithTasks(
+        {
+          runId: 'run-1',
+          contextStore,
+          status: 'cancelled',
+          error: { code: 'CANCELLED', message: 'caller cancelled', retryable: false },
+          reason: 'caller cancelled',
+          operationId: 'atomic-root-cancel',
+        },
+        active.lease,
+      );
+      listSpy.mockRestore();
+
+      expect(terminal.record).toMatchObject({
+        status: 'cancelled',
+        revision: beforeFailure.runs[0]!.revision + 1,
+        error: { code: 'CANCELLED' },
+      });
+      expect(terminal.cancelledTaskIds).toEqual([]);
+      expect(await store.loadTask('owner-1', 'task-1')).toMatchObject({
+        state: 'failed',
+        revision: beforeFailure.tasks[0]!.revision + 1,
+        error: { message: 'won task CAS' },
+      });
+
+      const terminalRevision = terminal.record.revision;
+      const replay = await controller.terminalizeWithTasks(
+        {
+          runId: 'run-1',
+          contextStore,
+          status: 'cancelled',
+          error: { code: 'CANCELLED', message: 'must not replace', retryable: false },
+          operationId: 'different-root-cancel',
+        },
+        active.lease,
+      );
+      expect(replay.record).toEqual(terminal.record);
+      expect(replay.record.revision).toBe(terminalRevision);
+      expect((await store.loadTask('owner-1', 'task-1'))?.revision).toBe(
+        beforeFailure.tasks[0]!.revision + 1,
+      );
+      await active.lease.release();
+    },
+  );
+
+  acceptanceIt('REC-01.l1.root-lease-loss-fencing', 'stale-owner-cannot-terminalize', async () => {
     vi.useFakeTimers();
     try {
       let leaseNow = 100;
@@ -588,7 +1231,20 @@ describe('AgentRunCheckpointController', () => {
       const contextStore = new ContextStore<TestProtocol>([
         { kind: 'user', content: 'lease loss' },
       ]);
-      const active = await controller.beginCreate({ contextStore }, { leaseTtlMs: 30 });
+      const active = await controller.beginCreate(
+        { contextStore, limits: DEFAULT_SUBAGENT_LIMITS },
+        { leaseTtlMs: 30 },
+      );
+      const create = createStoredChildTask(active.lease.fencingToken);
+      await controller.commitWithTasks({ runId: 'run-1', contextStore }, active.lease, [
+        {
+          create,
+          next: Object.freeze({ ...create, revision: 1, updatedAt: 1_001 }),
+          events: [],
+        },
+      ]);
+      const revisionBeforeTakeover = (await store.loadRun('owner-1', 'run-1'))!.revision;
+      const taskRevisionBeforeTakeover = (await store.loadTask('owner-1', 'task-1'))!.revision;
 
       leaseNow = 131;
       const takeover = await store.acquireLease(active.lease.key, 30);
@@ -602,6 +1258,33 @@ describe('AgentRunCheckpointController', () => {
       await expect(
         controller.checkpoint({ runId: 'run-1', contextStore }, active.lease),
       ).rejects.toMatchObject({ code: 'RECOVERY_TARGET_LOST' });
+      await expect(
+        controller.terminalize(
+          {
+            runId: 'run-1',
+            contextStore,
+            status: 'cancelled',
+            error: { code: 'CANCELLED', message: 'stale cancel', retryable: false },
+          },
+          active.lease,
+        ),
+      ).rejects.toMatchObject({ code: 'RECOVERY_TARGET_LOST' });
+      await expect(
+        controller.terminalizeWithTasks(
+          {
+            runId: 'run-1',
+            contextStore,
+            status: 'cancelled',
+            error: { code: 'CANCELLED', message: 'stale tree cancel', retryable: false },
+            operationId: 'stale-tree-cancel',
+          },
+          active.lease,
+        ),
+      ).rejects.toMatchObject({ code: 'RECOVERY_TARGET_LOST' });
+      expect((await store.loadRun('owner-1', 'run-1'))?.revision).toBe(revisionBeforeTakeover);
+      expect((await store.loadTask('owner-1', 'task-1'))?.revision).toBe(
+        taskRevisionBeforeTakeover,
+      );
 
       await takeover.release();
       await active.lease.release();

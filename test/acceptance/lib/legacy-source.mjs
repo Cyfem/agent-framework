@@ -16,13 +16,18 @@ const EXCLUDED_DIRECTORIES = new Set([
 const MAX_SOURCE_BYTES = 4 * 1024 * 1024;
 
 export const LEGACY_SOURCE_SCHEMA = 'subagent-v2-legacy-source-baseline/v1';
-export const DEFAULT_SCAN_ROOTS = Object.freeze(['packages/core', 'demo']);
+export const DEFAULT_SCAN_ROOTS = Object.freeze(['packages', 'demo']);
 export const LEGACY_RULES = Object.freeze([
   Object.freeze({ id: 'v1-sub-agents-option', token: 'subAgents' }),
   Object.freeze({ id: 'v1-agent-constructor', token: 'AgentConstructor' }),
+  Object.freeze({ id: 'v1-agent-instance', token: 'AgentInstance' }),
   Object.freeze({ id: 'v1-runtime-sub-agent', token: 'RuntimeSubAgent' }),
   Object.freeze({ id: 'v1-wire-agent-name', token: 'agentName' }),
   Object.freeze({ id: 'v1-wire-output-description', token: 'outputDescription' }),
+  Object.freeze({
+    id: 'v1-agent-static-description',
+    pattern: /\bstatic\s+(?:readonly\s+)?description\b/gu,
+  }),
 ]);
 
 function assert(condition, message) {
@@ -105,6 +110,14 @@ function countToken(line, token) {
   return count;
 }
 
+function countRule(line, rule) {
+  if (rule.token !== undefined) return countToken(line, rule.token);
+  rule.pattern.lastIndex = 0;
+  let count = 0;
+  while (rule.pattern.exec(line) !== null) count += 1;
+  return count;
+}
+
 export async function scanLegacySource({ rootDirectory, scanRoots = DEFAULT_SCAN_ROOTS } = {}) {
   assert(
     typeof rootDirectory === 'string' && rootDirectory.length > 0,
@@ -131,7 +144,7 @@ export async function scanLegacySource({ rootDirectory, scanRoots = DEFAULT_SCAN
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index] ?? '';
       for (const rule of LEGACY_RULES) {
-        const count = countToken(line, rule.token);
+        const count = countRule(line, rule);
         if (count === 0) continue;
         hits.push({
           rule: rule.id,

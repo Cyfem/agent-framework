@@ -129,6 +129,17 @@ export class RecordingRuntimeStateStore implements AgentRuntimeStateStore {
     return value ? clone(value) : undefined;
   }
 
+  async listTasksByRun(ownerSessionId: string, runId: string): Promise<readonly StoredTask[]> {
+    const tasks = [...(this.#sessions.get(ownerSessionId)?.tasks.values() ?? [])]
+      .filter((task) => task.runId === runId)
+      .sort((left, right) =>
+        left.createdAt === right.createdAt
+          ? left.taskId.localeCompare(right.taskId)
+          : left.createdAt - right.createdAt,
+      );
+    return Object.freeze(clone(tasks));
+  }
+
   async findTaskByIdempotencyKey(
     ownerSessionId: string,
     runId: string,
@@ -266,6 +277,18 @@ export class RecordingRuntimeStateStore implements AgentRuntimeStateStore {
         const value = staged.tasks.get(taskId);
         return value ? clone(value) : undefined;
       },
+      listTasksByRun: async (runId) =>
+        Object.freeze(
+          clone(
+            [...staged.tasks.values()]
+              .filter((task) => task.runId === runId)
+              .sort((left, right) =>
+                left.createdAt === right.createdAt
+                  ? left.taskId.localeCompare(right.taskId)
+                  : left.createdAt - right.createdAt,
+              ),
+          ),
+        ),
       findTaskByIdempotencyKey: async (runId, requestId) => {
         const taskId = staged.idempotency.get(idempotencyIndexKey(runId, requestId));
         const task = taskId ? staged.tasks.get(taskId) : undefined;

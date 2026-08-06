@@ -1,6 +1,12 @@
 import { isDeepStrictEqual } from 'node:util';
 
-import type { ApprovalDecision, ApprovalDirective, ApprovalRequestInput } from './approval';
+import type {
+  ApprovalDecision,
+  ApprovalDecisionRecord,
+  ApprovalDirective,
+  ApprovalRequest,
+  ApprovalRequestInput,
+} from './approval';
 import type { ArtifactStore, SubAgentArtifactClient } from './artifact';
 import {
   BUILTIN_AGENT_PROTOCOL_CHECKPOINT_CODECS,
@@ -24,6 +30,8 @@ import {
 } from './errors';
 import type {
   ExecutorTaskHandle,
+  SubAgentDelegationPauseInput,
+  SubAgentDelegationPauseReceipt,
   SubAgentExecutionControl,
   SubAgentExecutionRequest,
   SubAgentExecutorBinding,
@@ -41,7 +49,13 @@ import {
   resolveSubAgentLimits,
   type ResolvedSubAgentLimits,
 } from './limits';
-import type { SubAgentExecutionOutcome, SubAgentProgress, SubAgentUsageDelta } from './result';
+import type {
+  SubAgentExecutionOutcome,
+  SubAgentFailureInput,
+  SubAgentProgress,
+  SubAgentTaskResult,
+  SubAgentUsageDelta,
+} from './result';
 import {
   assertRuntimeReady,
   acquireRenewingRuntimeLease,
@@ -62,15 +76,17 @@ import {
 } from './runtime-support';
 import type {
   ChildDelegationRequest,
+  AgentRunStateOwnership,
   ModelSubAgentRequest,
   SubAgentDelegationClient,
   SubAgentDispatchContext,
   SubAgentExecuteRequest,
   SubAgentRuntime,
   SubAgentRuntimeOptions,
+  StagedSubAgentTask,
   SubAgentTaskHandle,
 } from './runtime';
-import { commitRuntimeStateMutation } from './state-controller';
+import { commitRuntimeStateMutation, type RuntimeTaskCreateMutation } from './state-controller';
 import {
   appendSafeTaskEvents,
   completeSubAgentTask,
@@ -83,6 +99,7 @@ import type {
   AgentRuntimeStateStore,
   StateLease,
   StoredAgentRun,
+  StoredDelegationPauseV1,
   StoredTask,
   StoredTaskControlOperation,
   StoredTaskControlOperationKind,
@@ -122,10 +139,28 @@ interface StartResult {
   readonly outcome?: SubAgentExecutionOutcome;
 }
 
+interface DelegatedApprovalStart {
+  readonly task: StoredTask;
+  readonly decisions: readonly ApprovalDecision[];
+}
+
+interface DelegatedApprovalCommit {
+  readonly parent: StoredTask;
+  readonly starts: readonly DelegatedApprovalStart[];
+}
+
 interface ExecutionOwnership {
   readonly attempt: number;
   readonly executionEpoch: string;
   readonly executionFencingToken: string;
+}
+
+interface AdoptedCheckpointExecution {
+  readonly task: StoredTask;
+  readonly target: SubAgentExecutionTarget;
+  readonly lease: RenewingRuntimeLease;
+  readonly operation: Extract<PendingRecoveryOperation, { readonly type: 'resume' }>;
+  readonly deadlineAt: number;
 }
 
 type PendingRecoveryOperation =
@@ -209,6 +244,10 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     return this.#ready;
   }
 
+  get limits(): Readonly<ResolvedSubAgentLimits> {
+    return this.#limits;
+  }
+
   init(): Promise<void> {
     if (this.#ready) return Promise.resolve();
     if (this.#initPromise !== undefined) return this.#initPromise;
@@ -266,6 +305,41 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       'execute',
     );
     return this.#createHandle(dispatched.task.taskId);
+  }
+
+  async stageTool(
+    request: ModelSubAgentRequest,
+    context: SubAgentDispatchContext,
+  ): Promise<StagedSubAgentTask> {
+    assertRuntimeSession(context.ownerSessionId, this.sessionId);
+    const ownership = context.runOwnership;
+    if (
+      ownership === undefined ||
+      ownership.ownerSessionId !== this.sessionId ||
+      ownership.runId !== context.runId
+    ) {
+      throw createSubAgentError(
+        'INVALID_STATE_TRANSITION',
+        'A staged subagent create requires live ownership of its root Agent run.',
+      );
+    }
+    if (ownership.signal.aborted) {
+      throw createSubAgentError('CANCELLED', 'The root Agent run ownership was lost.');
+    }
+    return this.#stageCreate(
+      {
+        ...request,
+        runId: context.runId,
+        requestId: context.requestId,
+        ...(context.parentTaskId === undefined ? {} : { parentTaskId: context.parentTaskId }),
+        parentContext: context.parentContext,
+        parentRawHistory: context.parentRawHistory,
+        ...(context.stream === undefined ? {} : { stream: context.stream }),
+        signal: context.signal,
+        ...(context.deadlineAt === undefined ? {} : { deadlineAt: context.deadlineAt }),
+      },
+      ownership.fencingToken,
+    );
   }
 
   async execute(request: SubAgentExecuteRequest): Promise<SubAgentExecutionOutcome> {
@@ -331,6 +405,126 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       this.#startExecution(created.task, target, mode, prepared.signal, prepared.deadlineAt);
     }
     return { handle: this.#createHandle(created.task.taskId), task: created.task };
+  }
+
+  async #stageCreate(
+    request: SubAgentExecuteRequest,
+    fencingToken: string,
+  ): Promise<StagedSubAgentTask> {
+    if (request.stream === true) {
+      throw createSubAgentError(
+        'STREAMING_UNSUPPORTED',
+        'Subagent v2 does not support streaming execution.',
+      );
+    }
+    assertRuntimeReady(this.#ready);
+    assertNonEmpty(fencingToken, 'root run fencingToken');
+    const prepared = this.#prepareCreate(request);
+
+    const replay = await this.stateStore.findTaskByIdempotencyKey(
+      this.sessionId,
+      request.runId,
+      request.requestId,
+    );
+    if (replay !== undefined) {
+      this.#assertIdempotentReplay(replay, prepared);
+      return this.#createStagedTaskToken(replay.taskId, prepared);
+    }
+
+    const taskId = createRuntimeId('task');
+    const subagentSessionId = createRuntimeId('session');
+
+    const target = this.#executors.select(request);
+    throwIfOperationAborted(prepared.signal, prepared.deadlineAt);
+    const parent = await this.#loadAndValidateParent(prepared);
+    this.#validateRetry(prepared, parent);
+    const projectedContext = await this.#projectContext(prepared, parent);
+    const run = await this.#loadRun(request.runId);
+    if (TERMINAL_RUN_STATUSES.has(run.status)) {
+      throw createSubAgentError(
+        'INVALID_STATE_TRANSITION',
+        'A terminal root run cannot create another subagent task.',
+      );
+    }
+    if (run.budget.descendantsCreated >= this.#limits.maxDescendants) {
+      throw createSubAgentError('LIMIT_EXCEEDED', 'The subagent tree exceeds maxDescendants.');
+    }
+
+    const now = Date.now();
+    const remainingMs = Math.max(0, Math.floor(prepared.deadlineAt - now));
+    if (remainingMs < 1) {
+      throw createSubAgentError('TIMED_OUT', 'The subagent task timed out.');
+    }
+    const path = Object.freeze([...(parent?.path ?? []), taskId]);
+    const depth = parent === undefined ? 1 : parent.depth + 1;
+    if (depth > this.#limits.maxDepth) {
+      throw createSubAgentError('LIMIT_EXCEEDED', 'The subagent task exceeds maxDepth.');
+    }
+    const initial = this.#buildInitialTask({
+      prepared,
+      target,
+      parent,
+      projectedContext,
+      taskId,
+      subagentSessionId,
+      path,
+      depth,
+      remainingMs,
+      now,
+      fencingToken,
+    });
+    const queued = appendSafeTaskEvents(
+      initial,
+      [{ type: 'task.queued', timestamp: now, data: { status: 'queued' } }],
+      {
+        eventIds: [createRuntimeId('event')],
+        defaultTimestamp: now,
+      },
+    );
+    const next = Object.freeze({ ...queued.task, fencingToken }) as StoredTask;
+    const taskMutation: RuntimeTaskCreateMutation = Object.freeze({
+      create: initial,
+      next,
+      events: queued.events,
+    });
+    return this.#createStagedTaskToken(taskId, prepared, taskMutation);
+  }
+
+  #createStagedTaskToken(
+    taskId: string,
+    prepared: PreparedCreate,
+    taskMutation?: RuntimeTaskCreateMutation,
+  ): StagedSubAgentTask {
+    let dispatchPromise: Promise<void> | undefined;
+    return Object.freeze({
+      taskId,
+      ...(taskMutation === undefined ? {} : { taskMutation }),
+      dispatch: async (): Promise<SubAgentTaskHandle> => {
+        dispatchPromise ??= this.#dispatchCommittedStagedTask(taskId, prepared);
+        try {
+          await dispatchPromise;
+        } catch (error) {
+          dispatchPromise = undefined;
+          throw error;
+        }
+        return this.#createHandle(taskId);
+      },
+    });
+  }
+
+  async #dispatchCommittedStagedTask(taskId: string, prepared: PreparedCreate): Promise<void> {
+    const task = await this.#loadTask(taskId);
+    this.#assertIdempotentReplay(task, prepared);
+    const outcome = taskOutcome(task);
+    if (outcome !== undefined || this.#active.has(taskId)) return;
+    const target = this.#executors.selectRecovery(task.definition, task.executor);
+    if (task.state !== 'queued') {
+      throw createSubAgentError(
+        'RECOVERY_UNSUPPORTED',
+        'The committed staged task requires authoritative recovery before dispatch.',
+      );
+    }
+    this.#startExecution(task, target, 'execute', prepared.signal, prepared.deadlineAt);
   }
 
   async #dispatchIdempotentTask(
@@ -557,12 +751,14 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
             prepared.request.requestId,
           );
           if (existing !== undefined) {
+            this.#assertPersistedLimits(existing.limits, 'task');
             this.#assertIdempotentReplay(existing, prepared);
             return { status: 'existing' as const, task: existing };
           }
 
           const run = await transaction.loadRun(prepared.request.runId);
           if (run === undefined) throw createResourceNotFoundError();
+          this.#assertPersistedLimits(run.limits, 'root run');
           if (TERMINAL_RUN_STATUSES.has(run.status)) {
             throw createSubAgentError(
               'INVALID_STATE_TRANSITION',
@@ -585,10 +781,12 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
             ) {
               throw createResourceNotFoundError();
             }
+            this.#assertPersistedLimits(currentParent.limits, 'task');
           }
 
           if (prepared.request.retryOf !== undefined) {
             const source = await transaction.loadTask(prepared.request.retryOf);
+            if (source !== undefined) this.#assertPersistedLimits(source.limits, 'task');
             const sourceResult = source?.result;
             const validRetry =
               source !== undefined &&
@@ -605,42 +803,19 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
             }
           }
 
-          const initial: StoredTask = {
-            recordVersion: '1',
-            ownerSessionId: this.sessionId,
-            runId: run.runId,
-            taskId,
-            ...(parent === undefined ? {} : { parentTaskId: parent.taskId }),
-            subagentSessionId,
-            requestId: prepared.request.requestId,
-            idempotencyKey: prepared.request.requestId,
-            definition: Object.freeze({
-              name: target.definition.name,
-              version: target.definition.version,
-            }),
-            executor: target.descriptor.name,
-            input: prepared.input,
-            inputHash: prepared.inputHash,
+          const initial = this.#buildInitialTask({
+            prepared,
+            target,
+            parent,
             projectedContext,
-            state: 'queued',
-            revision: 0,
-            fencingToken: lease.fencingToken,
+            taskId,
+            subagentSessionId,
             path,
             depth,
-            attempt: 1,
-            ...(prepared.request.retryOf === undefined
-              ? {}
-              : { retryOf: prepared.request.retryOf }),
-            approvals: Object.freeze([]),
-            approvalDecisions: Object.freeze([]),
-            controlOperations: Object.freeze([]),
-            recoveryRequired: false,
-            activeElapsedMs: 0,
             remainingMs,
-            eventSequence: 0,
-            createdAt: now,
-            updatedAt: now,
-          };
+            now,
+            fencingToken: lease.fencingToken,
+          });
           const created = await transaction.createTask(initial);
           if (created.status === 'existing') {
             this.#assertIdempotentReplay(created.task, prepared);
@@ -692,6 +867,58 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           return { status: 'created' as const, task: queuedTask };
         }),
     );
+  }
+
+  #buildInitialTask(input: {
+    readonly prepared: PreparedCreate;
+    readonly target: SubAgentExecutionTarget;
+    readonly parent: StoredTask | undefined;
+    readonly projectedContext: readonly SubAgentContextItem[];
+    readonly taskId: string;
+    readonly subagentSessionId: string;
+    readonly path: readonly string[];
+    readonly depth: number;
+    readonly remainingMs: number;
+    readonly now: number;
+    readonly fencingToken: string;
+  }): StoredTask {
+    return Object.freeze({
+      recordVersion: '1' as const,
+      ownerSessionId: this.sessionId,
+      runId: input.prepared.request.runId,
+      taskId: input.taskId,
+      ...(input.parent === undefined ? {} : { parentTaskId: input.parent.taskId }),
+      subagentSessionId: input.subagentSessionId,
+      requestId: input.prepared.request.requestId,
+      idempotencyKey: input.prepared.request.requestId,
+      definition: Object.freeze({
+        name: input.target.definition.name,
+        version: input.target.definition.version,
+      }),
+      executor: input.target.descriptor.name,
+      input: input.prepared.input,
+      inputHash: input.prepared.inputHash,
+      projectedContext: input.projectedContext,
+      limits: Object.freeze({ ...this.#limits }),
+      state: 'queued' as const,
+      revision: 0,
+      fencingToken: input.fencingToken,
+      path: Object.freeze([...input.path]),
+      depth: input.depth,
+      attempt: 1,
+      ...(input.prepared.request.retryOf === undefined
+        ? {}
+        : { retryOf: input.prepared.request.retryOf }),
+      approvals: Object.freeze([]),
+      approvalDecisions: Object.freeze([]),
+      controlOperations: Object.freeze([]),
+      recoveryRequired: false,
+      activeElapsedMs: 0,
+      remainingMs: input.remainingMs,
+      eventSequence: 0,
+      createdAt: input.now,
+      updatedAt: input.now,
+    });
   }
 
   #startExecution(
@@ -795,17 +1022,49 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       deadlineAt,
       this.#executionLeaseTtlMs,
     );
+    return this.#runWithHeldExecutionLease(
+      task,
+      target,
+      operationType,
+      mode,
+      deadlineAt,
+      lease,
+      recoveryOperation,
+      false,
+      parentSignal,
+    );
+  }
+
+  async #runWithHeldExecutionLease(
+    task: StoredTask,
+    target: SubAgentExecutionTarget,
+    operationType: 'create' | 'resume_approval' | 'resume_checkpoint' | 'reconnect',
+    mode: 'execute' | 'spawn',
+    deadlineAt: number,
+    lease: RenewingRuntimeLease,
+    recoveryOperation: PendingRecoveryOperation | undefined,
+    alreadyOwned: boolean,
+    operationParentSignal?: AbortSignal,
+  ): Promise<SubAgentExecutionOutcome> {
     try {
-      const owned = await this.#claimExecutionOwnership(
-        task.taskId,
-        task.attempt,
-        operationType,
-        lease,
-        deadlineAt,
-      );
+      const owned = alreadyOwned
+        ? task
+        : await this.#claimExecutionOwnership(
+            task.taskId,
+            task.attempt,
+            operationType,
+            lease,
+            deadlineAt,
+          );
       const active = this.#active.get(task.taskId);
       if (active !== undefined) active.ownership = executionOwnership(owned);
-      const signal = createOperationSignal({ signal: lease.signal, deadlineAt });
+      const signal = createOperationSignal({
+        signal:
+          operationParentSignal === undefined
+            ? lease.signal
+            : AbortSignal.any([lease.signal, operationParentSignal]),
+        deadlineAt,
+      });
       if (operationType === 'create') {
         return this.#executeCreateOperation(owned, target, mode, signal, deadlineAt);
       }
@@ -861,6 +1120,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         createdAt: now,
         updatedAt: now,
       }),
+      recoveryRequired: false,
       updatedAt: now,
     }) as StoredTask;
     await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
@@ -972,9 +1232,11 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           this.stateStore.transaction(this.sessionId, lease, async (transaction) => {
             const task = await transaction.loadTask(taskId);
             if (task === undefined) throw createResourceNotFoundError();
+            this.#assertPersistedLimits(task.limits, 'task');
             const existingOutcome = taskOutcome(task);
             const run = await transaction.loadRun(task.runId);
             if (run === undefined) throw createResourceNotFoundError();
+            this.#assertPersistedLimits(run.limits, 'root run');
             if (existingOutcome !== undefined) {
               return { status: 'done' as const, task, run, outcome: existingOutcome };
             }
@@ -984,7 +1246,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
                 `A create operation cannot start a task in state ${task.state}.`,
               );
             }
-            if (run.budget.activeExecutions >= this.#limits.maxConcurrent) {
+            if (run.budget.activeExecutions >= task.limits.maxConcurrent) {
               return { status: 'wait' as const };
             }
 
@@ -1103,7 +1365,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       input: task.input,
       projectedContext: normalizeProjectedContext(task.projectedContext),
       delegation: this.#createDelegationSnapshot(task),
-      limits: Object.freeze({ ...this.#limits, timeoutMs: task.remainingMs }),
+      limits: Object.freeze({ ...task.limits, timeoutMs: task.remainingMs }),
       signal,
       deadlineAt,
     });
@@ -1178,6 +1440,8 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
             signal,
             deadlineAt,
           ),
+        fail: (callId: string, failure: SubAgentFailureInput) =>
+          this.#failTask(task.taskId, target, ownership, callId, failure, signal, deadlineAt),
       }),
       commitBinding: (operationId: string, binding: SubAgentExecutorBinding) =>
         this.#commitBinding(
@@ -1199,13 +1463,28 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           signal,
           deadlineAt,
         ),
-      authorizeTool: (operationId: string, request: ApprovalRequestInput) =>
+      authorizeTool: (
+        operationId: string,
+        request: ApprovalRequestInput,
+        checkpoint: SubAgentChildCheckpoint,
+      ) =>
         this.#authorizeTool(
           task.taskId,
           target,
           ownership,
           operationId,
           request,
+          checkpoint,
+          signal,
+          deadlineAt,
+        ),
+      pauseDelegation: (operationId: string, input: SubAgentDelegationPauseInput) =>
+        this.#pauseDelegation(
+          task.taskId,
+          target,
+          ownership,
+          operationId,
+          input,
           signal,
           deadlineAt,
         ),
@@ -1352,6 +1631,134 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     });
   }
 
+  async #failTask(
+    taskId: string,
+    target: SubAgentExecutionTarget,
+    ownership: ExecutionOwnership,
+    callId: string,
+    failure: SubAgentFailureInput,
+    signal: AbortSignal,
+    deadlineAt: number,
+  ): Promise<SubAgentTaskResult> {
+    assertNonEmpty(callId, 'failure callId');
+    await this.#preflightOperationOwner(taskId, target, ownership);
+    const normalizedFailure = normalizeAuthoritativeFailure(failure, target);
+    const operationId = `completion-failure:${callId}`;
+    const payload = cloneJsonValue({
+      callId,
+      status: normalizedFailure.status,
+      error: normalizedFailure.error,
+      ...(normalizedFailure.partialOutput === undefined
+        ? {}
+        : { partialOutput: normalizedFailure.partialOutput }),
+    } as unknown as JsonValue);
+
+    return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
+      const task = await this.#loadTask(taskId);
+      this.#assertOperationOwner(task, target, ownership);
+      const replay = controlOperationReplay(task, operationId, 'failure', payload);
+      if (replay !== undefined) {
+        if (task.result === undefined) {
+          throw createSubAgentError(
+            'INVALID_STATE_TRANSITION',
+            'The durable failure receipt has no terminal task result.',
+          );
+        }
+        return task.result;
+      }
+      if (task.state !== 'running' && task.state !== 'result_submitted') {
+        throw createSubAgentError(
+          'RESULT_PHASE_CLOSED',
+          `The failure phase is closed while the task is ${task.state}.`,
+        );
+      }
+      if (task.state === 'running' && normalizedFailure.partialOutput !== undefined) {
+        throw createSubAgentError(
+          'RESULT_REQUIRED',
+          'A failure partial output requires an authoritative result receipt.',
+        );
+      }
+      if (
+        task.state === 'result_submitted' &&
+        normalizedFailure.partialOutput !== undefined &&
+        !isDeepStrictEqual(normalizedFailure.partialOutput, task.output)
+      ) {
+        throw createSubAgentError(
+          'RESULT_REPLAY_CONFLICT',
+          'The failure partial output conflicts with the durable result receipt.',
+        );
+      }
+
+      const now = Date.now();
+      const terminal = transitionSubAgentTask(task, normalizedFailure.status, {
+        now,
+        error: normalizedFailure.error,
+        ...(task.state === 'result_submitted' || normalizedFailure.partialOutput === undefined
+          ? {}
+          : { partialOutput: normalizedFailure.partialOutput }),
+      });
+      const settledTerminal = settleExecutorOperation(terminal as StoredTask, now);
+      const eventType =
+        normalizedFailure.status === 'cancelled'
+          ? 'task.cancelled'
+          : normalizedFailure.status === 'timed_out'
+            ? 'task.timed_out'
+            : normalizedFailure.status === 'budget_exceeded'
+              ? 'task.budget_exceeded'
+              : 'task.failed';
+      const withEvent = appendSafeTaskEvents(
+        { ...settledTerminal, fencingToken: lease.fencingToken } as StoredTask,
+        [
+          {
+            type: eventType,
+            timestamp: now,
+            data: {
+              status: normalizedFailure.status,
+              errorCode: normalizedFailure.error.code,
+              ...(normalizedFailure.error.outcomeUnknown === undefined
+                ? {}
+                : { outcomeUnknown: normalizedFailure.error.outcomeUnknown }),
+            },
+          },
+        ],
+        {
+          eventIds: [createRuntimeId('event')],
+          defaultTimestamp: now,
+          revisionMode: 'preserve',
+        },
+      );
+      const result = withEvent.task.result;
+      if (result === undefined) {
+        throw createSubAgentError('INTERNAL_ERROR', 'The failure transition produced no result.');
+      }
+      const taskWithReceipt = appendControlOperation(withEvent.task as StoredTask, {
+        operationId,
+        kind: 'failure',
+        payload,
+        result: result as unknown as JsonValue,
+        completedAt: now,
+        fencingToken: lease.fencingToken,
+        revisionMode: 'preserve',
+      });
+      const run = await this.#loadRun(task.runId);
+      const wasActive = task.activeStartedAt !== undefined;
+      const nextRun = wasActive ? this.#releaseActiveExecution(run, lease, now) : run;
+      await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
+        ...(wasActive ? { run: { previous: run, next: nextRun } } : {}),
+        tasks: [{ previous: task, next: taskWithReceipt, events: withEvent.events }],
+      });
+      this.#emitTelemetry({
+        type: 'task.failed',
+        timestamp: now,
+        sessionId: this.sessionId,
+        runId: task.runId,
+        taskId,
+        errorCode: normalizedFailure.error.code,
+      });
+      return result;
+    });
+  }
+
   async #commitBinding(
     taskId: string,
     target: SubAgentExecutionTarget,
@@ -1489,20 +1896,30 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           'The Executor binding changed while preparing the child checkpoint.',
         );
       }
+      assertAuthoritativeResultSubmission(task, checkpoint);
       if (controlOperationReplay(task, operationId, 'checkpoint', payload) !== undefined) return;
-      if (task.state !== 'running' && task.state !== 'result_submitted') {
+      const waitingApprovalReplay =
+        task.state === 'waiting_approval' && isDeepStrictEqual(task.childCheckpoint, checkpoint);
+      if (task.state !== 'running' && task.state !== 'result_submitted' && !waitingApprovalReplay) {
         throw createSubAgentError(
           'INVALID_STATE_TRANSITION',
-          'A child checkpoint can be committed only by an active task.',
+          'A child checkpoint can be committed only by an active task or as an exact approval replay.',
         );
       }
-      const changed = Object.freeze({
-        ...task,
+      assertChildCheckpointTransition(task.childCheckpoint, checkpoint);
+      const clearDelegationPause =
+        task.delegationPause !== undefined &&
+        delegationPauseBatchCompleted(checkpoint, task.delegationPause);
+      const taskWithoutDelegationPause = { ...task };
+      delete taskWithoutDelegationPause.delegationPause;
+      const changedDraft = {
+        ...(clearDelegationPause ? taskWithoutDelegationPause : task),
         childCheckpoint: checkpoint,
         revision: task.revision + 1,
         fencingToken: lease.fencingToken,
         updatedAt: Date.now(),
-      }) as StoredTask;
+      };
+      const changed = Object.freeze(changedDraft) as StoredTask;
       const next = appendControlOperation(changed, {
         operationId,
         kind: 'checkpoint',
@@ -1603,6 +2020,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     ownership: ExecutionOwnership,
     operationId: string,
     input: ApprovalRequestInput,
+    checkpointCandidate: SubAgentChildCheckpoint,
     signal: AbortSignal,
     deadlineAt: number,
   ): Promise<ApprovalDirective> {
@@ -1616,6 +2034,68 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     }
     validateApprovalRequestInput(input);
 
+    const before = await this.#loadTask(taskId);
+    this.#assertOperationOwner(before, target, ownership);
+    if (before.binding === undefined) {
+      throw createSubAgentError(
+        'BINDING_INVALID',
+        'Approval suspension requires a durable Executor binding.',
+      );
+    }
+    validateBinding(before.binding, taskId, this.sessionId, target);
+    const checkpoint = await this.#normalizeChildCheckpoint(
+      checkpointCandidate,
+      signal,
+      deadlineAt,
+      {
+        runnerId: before.binding.runnerId,
+        runnerVersion: before.binding.runnerVersion,
+      },
+    );
+    if (
+      !target.descriptor.childCheckpointVersions.includes(checkpoint.version) ||
+      checkpoint.runnerId !== before.binding.runnerId ||
+      checkpoint.runnerVersion !== before.binding.runnerVersion ||
+      !target.descriptor.runnerCompatibility.some(
+        (runner) =>
+          runner.runnerId === checkpoint.runnerId &&
+          runner.runnerVersion === checkpoint.runnerVersion &&
+          runner.childCheckpointVersions.includes(checkpoint.version),
+      )
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_VERSION_MISMATCH',
+        'The approval checkpoint is incompatible with the active child runner.',
+      );
+    }
+    assertApprovalCheckpoint(checkpoint, input.callId, input.toolName);
+    const checkpointCall = approvalCheckpointCall(checkpoint, input.callId, input.toolName);
+    const priorDecision = before.approvalDecisions.find(({ callId }) => callId === input.callId);
+    if (priorDecision === undefined) {
+      if (checkpointCall.status !== 'in_flight' || (checkpointCall.approvals?.length ?? 0) !== 0) {
+        throw createSubAgentError(
+          'INVALID_STATE_TRANSITION',
+          'A first approval suspension requires one in-flight call without approval IDs.',
+        );
+      }
+    } else if (
+      checkpointCall.status !== 'waiting_approval' ||
+      !isDeepStrictEqual(checkpointCall.approvals, [priorDecision.approvalId])
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'An approval resume checkpoint does not match the durable approval decision.',
+      );
+    }
+    const checkpointPayload = cloneJsonValue(checkpoint as unknown as JsonValue);
+    const payload = cloneJsonValue({
+      callId: input.callId,
+      toolName: input.toolName,
+      summary: input.summary,
+      ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+      checkpointHash: canonicalJsonSha256(checkpointPayload),
+    });
+
     const directive = await withRuntimeLease(
       this.stateStore,
       this.sessionId,
@@ -1624,12 +2104,12 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       async (lease): Promise<ApprovalDirective> => {
         const task = await this.#loadTask(taskId);
         this.#assertOperationOwner(task, target, ownership);
-        const payload = cloneJsonValue({
-          callId: input.callId,
-          toolName: input.toolName,
-          summary: input.summary,
-          ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
-        });
+        if (!isDeepStrictEqual(task.binding, before.binding)) {
+          throw createSubAgentError(
+            'RECOVERY_TARGET_LOST',
+            'The Executor binding changed while preparing the approval checkpoint.',
+          );
+        }
         const replay = controlOperationReplay(task, operationId, 'approval', payload);
         if (replay !== undefined) return replay.result as unknown as ApprovalDirective;
         if (task.state !== 'running') {
@@ -1662,13 +2142,6 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
               : 'The approval request was rejected.',
           );
         }
-        if (task.binding === undefined) {
-          throw createSubAgentError(
-            'BINDING_INVALID',
-            'Approval suspension requires a durable Executor binding.',
-          );
-        }
-
         const now = Date.now();
         const approval = Object.freeze({
           ...input,
@@ -1682,7 +2155,16 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           now,
           approvals: [...task.approvals, approval],
         });
-        const settledPaused = settleExecutorOperation(paused as StoredTask, now);
+        const checkpointWithApproval = attachApprovalToChildCheckpoint(
+          checkpoint,
+          input.callId,
+          input.toolName,
+          approval.approvalId,
+        );
+        const settledPaused = Object.freeze({
+          ...settleExecutorOperation(paused as StoredTask, now),
+          childCheckpoint: checkpointWithApproval,
+        }) as StoredTask;
         const withEvents = appendSafeTaskEvents(
           { ...settledPaused, fencingToken: lease.fencingToken } as StoredTask,
           [
@@ -1735,6 +2217,185 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       });
     }
     return directive;
+  }
+
+  async #pauseDelegation(
+    taskId: string,
+    target: SubAgentExecutionTarget,
+    ownership: ExecutionOwnership,
+    operationId: string,
+    input: SubAgentDelegationPauseInput,
+    signal: AbortSignal,
+    deadlineAt: number,
+  ): Promise<SubAgentDelegationPauseReceipt> {
+    assertNonEmpty(operationId, 'delegation pause operationId');
+    await this.#preflightOperationOwner(taskId, target, ownership);
+    if (!target.descriptor.capabilities.approval) {
+      throw createSubAgentError(
+        'UNSUPPORTED_CAPABILITY',
+        'The selected Executor does not support approval suspension.',
+      );
+    }
+    const before = await this.#loadTask(taskId);
+    this.#assertOperationOwner(before, target, ownership);
+    if (before.binding === undefined) {
+      throw createSubAgentError(
+        'BINDING_INVALID',
+        'Delegation suspension requires a durable Executor binding.',
+      );
+    }
+    validateBinding(before.binding, taskId, this.sessionId, target);
+    const checkpoint = await this.#normalizeChildCheckpoint(input.checkpoint, signal, deadlineAt, {
+      runnerId: before.binding.runnerId,
+      runnerVersion: before.binding.runnerVersion,
+    });
+    if (
+      !target.descriptor.childCheckpointVersions.includes(checkpoint.version) ||
+      !target.descriptor.runnerCompatibility.some(
+        (runner) =>
+          runner.runnerId === checkpoint.runnerId &&
+          runner.runnerVersion === checkpoint.runnerVersion &&
+          runner.childCheckpointVersions.includes(checkpoint.version),
+      )
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_VERSION_MISMATCH',
+        'The delegation checkpoint is incompatible with the active child runner.',
+      );
+    }
+    const normalizedCalls = validateDelegationPauseCheckpoint(
+      checkpoint,
+      input.calls,
+      this.sessionId,
+    );
+    const payload = cloneJsonValue({
+      checkpointHash: canonicalJsonSha256(checkpoint as unknown as JsonValue),
+      calls: normalizedCalls,
+    } as unknown as JsonValue);
+
+    return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) =>
+      this.stateStore.transaction(this.sessionId, lease, async (transaction) => {
+        const parent = await transaction.loadTask(taskId);
+        if (parent === undefined) throw createResourceNotFoundError();
+        this.#assertPersistedLimits(parent.limits, 'task');
+        this.#assertOperationOwner(parent, target, ownership);
+        if (!isDeepStrictEqual(parent.binding, before.binding)) {
+          throw createSubAgentError(
+            'RECOVERY_TARGET_LOST',
+            'The Executor binding changed while preparing the delegation checkpoint.',
+          );
+        }
+        const replay = controlOperationReplay(parent, operationId, 'delegation_pause', payload);
+        if (replay !== undefined) {
+          return replay.result as unknown as SubAgentDelegationPauseReceipt;
+        }
+        if (parent.state !== 'running') {
+          throw createSubAgentError(
+            'INVALID_STATE_TRANSITION',
+            'Nested delegation can pause only the current running parent attempt.',
+          );
+        }
+
+        const approvals: ApprovalRequest[] = [];
+        for (const call of normalizedCalls) {
+          const leaf = await transaction.loadTask(call.childTaskId);
+          if (
+            leaf === undefined ||
+            leaf.ownerSessionId !== this.sessionId ||
+            leaf.runId !== parent.runId ||
+            leaf.parentTaskId !== parent.taskId
+          ) {
+            throw createResourceNotFoundError();
+          }
+          this.#assertPersistedLimits(leaf.limits, 'task');
+          if (
+            leaf.state !== 'waiting_approval' ||
+            !isDeepStrictEqual(leaf.approvals, call.approvals)
+          ) {
+            throw createSubAgentError(
+              'INVALID_STATE_TRANSITION',
+              'A linked leaf task is no longer waiting on the exact delegated approvals.',
+            );
+          }
+          approvals.push(...call.approvals.map((approval) => Object.freeze({ ...approval })));
+        }
+
+        const now = Date.now();
+        const paused = transitionSubAgentTask(parent, 'waiting_approval', { now, approvals });
+        const settledPaused = Object.freeze({
+          ...settleExecutorOperation(paused as StoredTask, now),
+          childCheckpoint: checkpoint,
+          delegationPause: Object.freeze({
+            version: '1' as const,
+            batchId: checkpoint.pendingBatch!.batchId,
+            calls: Object.freeze(
+              normalizedCalls.map((call) =>
+                Object.freeze({
+                  callId: call.callId,
+                  childTaskId: call.childTaskId,
+                  approvalIds: Object.freeze(call.approvals.map(({ approvalId }) => approvalId)),
+                }),
+              ),
+            ),
+          }),
+        }) as StoredTask;
+        const withEvents = appendSafeTaskEvents(
+          { ...settledPaused, fencingToken: lease.fencingToken } as StoredTask,
+          [
+            ...approvals.map(
+              (approval): ExecutorEventInput => ({
+                type: 'approval.requested',
+                data: {
+                  approvalId: approval.approvalId,
+                  toolName: approval.toolName,
+                  callId: approval.callId,
+                },
+              }),
+            ),
+            { type: 'task.paused', data: { status: 'waiting_approval' } },
+          ],
+          {
+            eventIds: approvals
+              .map(() => createRuntimeId('event'))
+              .concat(createRuntimeId('event')),
+            defaultTimestamp: now,
+            revisionMode: 'preserve',
+          },
+        );
+        const receipt = Object.freeze({
+          checkpointRevision: withEvents.task.revision,
+          approvals: Object.freeze(approvals),
+        });
+        const nextParent = appendControlOperation(withEvents.task as StoredTask, {
+          operationId,
+          kind: 'delegation_pause',
+          payload,
+          result: receipt as unknown as JsonValue,
+          completedAt: now,
+          fencingToken: lease.fencingToken,
+          revisionMode: 'preserve',
+        });
+        const run = await transaction.loadRun(parent.runId);
+        if (run === undefined) throw createResourceNotFoundError();
+        this.#assertPersistedLimits(run.limits, 'root run');
+        const nextRun = this.#releaseActiveExecution(run, lease, now);
+        const parentCommitted = await transaction.compareAndSetTask(
+          parent.taskId,
+          parent.revision,
+          lease.fencingToken,
+          nextParent,
+        );
+        const runCommitted = await transaction.compareAndSetRun(
+          run.runId,
+          run.revision,
+          lease.fencingToken,
+          nextRun,
+        );
+        if (!parentCommitted || !runCommitted) throw stateCasConflict();
+        await transaction.appendEvents(parent.taskId, withEvents.events);
+        return receipt;
+      }),
+    );
   }
 
   async #reportProgress(
@@ -1884,7 +2545,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       let budget: StoredAgentRun['budget'];
       let budgetFailure: SubAgentRuntimeError | undefined;
       try {
-        if (usage.turns > this.#limits.maxTurns) {
+        if (usage.turns > task.limits.maxTurns) {
           throw createSubAgentError('BUDGET_EXCEEDED', 'The subagent task exceeds maxTurns.');
         }
         budget = reserveTreeBudget(
@@ -1895,7 +2556,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
             outputTokens: delta.outputTokens ?? 0,
             ...(delta.cost === undefined ? {} : { cost: delta.cost }),
           },
-          this.#limits,
+          task.limits,
         );
       } catch (error) {
         if (!(error instanceof SubAgentRuntimeError) || error.code !== 'BUDGET_EXCEEDED') {
@@ -2043,6 +2704,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       },
       execute,
       spawn,
+      resumeTool: (childTaskId: string) => this.#resumeDelegatedTool(parent, childTaskId),
     });
   }
 
@@ -2087,6 +2749,32 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         'The parent delegation client belongs to an obsolete task attempt.',
       );
     }
+  }
+
+  async #resumeDelegatedTool(parent: StoredTask, childTaskId: string): Promise<SubAgentTaskHandle> {
+    assertNonEmpty(childTaskId, 'delegated childTaskId');
+    await this.#assertDelegationOwner(parent);
+    const currentParent = await this.#loadTask(parent.taskId);
+    const pause = currentParent.delegationPause;
+    const pendingBatch = currentParent.childCheckpoint?.pendingBatch;
+    const linkedByPausedApproval =
+      pause?.calls.some((call) => call.childTaskId === childTaskId) === true;
+    const linkedByAuthoritativeBatch =
+      pause !== undefined &&
+      pendingBatch?.batchId === pause.batchId &&
+      pendingBatch.calls.some((call) => call.kind === 'agent' && call.taskId === childTaskId);
+    if (pause === undefined || (!linkedByPausedApproval && !linkedByAuthoritativeBatch)) {
+      throw createResourceNotFoundError();
+    }
+    const child = await this.#loadTask(childTaskId);
+    if (
+      child.ownerSessionId !== this.sessionId ||
+      child.runId !== parent.runId ||
+      child.parentTaskId !== parent.taskId
+    ) {
+      throw createResourceNotFoundError();
+    }
+    return this.recover(this.sessionId, childTaskId);
   }
 
   #delegatedCatalogEntries(parent: StoredTask): readonly SubAgentCatalogEntry[] {
@@ -2149,7 +2837,20 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     const existingOutcome = taskOutcome(existing);
     if (existingOutcome !== undefined) return existingOutcome;
 
-    const descriptor = safeExecutorError(error);
+    // The durable child checkpoint is authoritative over a simultaneous host
+    // cancellation. Once a provider intent is in-flight, cancellation cannot
+    // prove whether the provider accepted the request, so the task must retain
+    // the non-retryable outcome-unknown fence instead of becoming cancelled.
+    const descriptor =
+      existing.childCheckpoint?.modelOperation?.phase === 'in_flight'
+        ? Object.freeze({
+            code: 'EXECUTOR_FAILED' as const,
+            message: 'The provider outcome could not be confirmed.',
+            retryable: false,
+            causeCode: 'MODEL_OUTCOME_UNKNOWN',
+            outcomeUnknown: true,
+          })
+        : safeExecutorError(error);
     const state =
       descriptor.code === 'CANCELLED'
         ? 'cancelled'
@@ -2469,6 +3170,269 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     });
   }
 
+  async cancelRunDescendants(
+    sessionId: string,
+    runId: string,
+    ownership: AgentRunStateOwnership,
+    reason?: string,
+    options?: { readonly operationId?: string },
+  ): Promise<readonly SubAgentTaskSnapshot[]> {
+    if (sessionId !== this.sessionId) throw createResourceNotFoundError();
+    assertRuntimeReady(this.#ready);
+    assertNonEmpty(runId, 'runId');
+    if (
+      typeof ownership !== 'object' ||
+      ownership === null ||
+      ownership.ownerSessionId !== this.sessionId ||
+      ownership.runId !== runId ||
+      typeof ownership.fencingToken !== 'string' ||
+      ownership.fencingToken.length === 0 ||
+      typeof ownership.useStateLease !== 'function'
+    ) {
+      throw createSubAgentError(
+        'INVALID_STATE_TRANSITION',
+        'Descendant cancellation requires live ownership of the exact root Agent run.',
+      );
+    }
+    const operationRoot =
+      options?.operationId ??
+      `cancel-run-${canonicalJsonSha256({ runId, reason: reason ?? null })}`;
+    assertNonEmpty(operationRoot, 'cancel run operationId');
+    const payload = cloneJsonValue({ reason: reason ?? null });
+    let committedTasks: readonly StoredTask[] = Object.freeze([]);
+    let newlyCancelledTaskIds = new Set<string>();
+
+    await ownership.useStateLease(async (lease) => {
+      if (
+        lease.key !== `agent-run:${JSON.stringify([this.sessionId, runId])}` ||
+        lease.fencingToken !== ownership.fencingToken
+      ) {
+        throw createSubAgentError(
+          'INVALID_STATE_TRANSITION',
+          'The root Agent run ownership proof no longer matches its StateStore lease.',
+          { retryable: true, causeCode: 'STATE_FENCING_MISMATCH' },
+        );
+      }
+
+      for (;;) {
+        ownership.signal.throwIfAborted();
+        const run = await this.stateStore.loadRun(this.sessionId, runId);
+        if (run === undefined || run.ownerSessionId !== this.sessionId) {
+          throw createResourceNotFoundError();
+        }
+        const tasks = await this.stateStore.listTasksByRun(this.sessionId, runId);
+        if (tasks.some((task) => task.ownerSessionId !== this.sessionId || task.runId !== runId)) {
+          throw createSubAgentError(
+            'INTERNAL_ERROR',
+            'The StateStore returned a task outside the requested root run.',
+          );
+        }
+        if (TERMINAL_RUN_STATUSES.has(run.status)) {
+          committedTasks = Object.freeze([...tasks]);
+          if (run.status === 'cancelled') {
+            newlyCancelledTaskIds = new Set(
+              tasks
+                .filter((task) => {
+                  if (task.state !== 'cancelled') return false;
+                  const operationId = `${operationRoot}:${task.taskId}`;
+                  return controlOperationReplay(task, operationId, 'cancel', payload) !== undefined;
+                })
+                .map(({ taskId }) => taskId),
+            );
+          }
+          return;
+        }
+
+        const now = Date.now();
+        let activeCancelled = 0;
+        const taskMutations = tasks.flatMap((task) => {
+          if (taskOutcome(task) !== undefined) return [];
+          const operationId = `${operationRoot}:${task.taskId}`;
+          if (controlOperationReplay(task, operationId, 'cancel', payload) !== undefined) return [];
+          const descriptor: SubAgentErrorDescriptor = Object.freeze({
+            code: 'CANCELLED',
+            message: reason?.trim()
+              ? 'The subagent task was cancelled by the host.'
+              : 'The subagent task was cancelled.',
+            retryable: false,
+          });
+          const cancelled = transitionSubAgentTask(task, 'cancelled', {
+            now,
+            error: descriptor,
+          });
+          const settled = settleExecutorOperation(cancelled as StoredTask, now);
+          const withEvent = appendSafeTaskEvents(
+            { ...settled, fencingToken: lease.fencingToken } as StoredTask,
+            [{ type: 'task.cancelled', timestamp: now, data: { status: 'cancelled' } }],
+            {
+              eventIds: [createRuntimeId('event')],
+              defaultTimestamp: now,
+              revisionMode: 'preserve',
+            },
+          );
+          const next = appendControlOperation(withEvent.task as StoredTask, {
+            operationId,
+            kind: 'cancel',
+            payload,
+            result: null,
+            completedAt: now,
+            fencingToken: lease.fencingToken,
+            revisionMode: 'preserve',
+          });
+          if (task.activeStartedAt !== undefined) activeCancelled += 1;
+          return [{ previous: task, next, events: withEvent.events }];
+        });
+        const nextActive = run.budget.activeExecutions - activeCancelled;
+        if (nextActive < 0) {
+          throw createSubAgentError(
+            'INVALID_STATE_TRANSITION',
+            'The root run active execution budget is inconsistent with descendant tasks.',
+          );
+        }
+        const nextRun: StoredAgentRun = Object.freeze({
+          ...run,
+          revision: run.revision + 1,
+          fencingToken: lease.fencingToken,
+          budget: Object.freeze({ ...run.budget, activeExecutions: nextActive }),
+          updatedAt: Math.max(now, run.updatedAt),
+        });
+        try {
+          const committed = await commitRuntimeStateMutation(
+            this.stateStore,
+            this.sessionId,
+            lease,
+            {
+              run: { previous: run, next: nextRun },
+              ...(taskMutations.length === 0 ? {} : { tasks: taskMutations }),
+            },
+          );
+          const byId = new Map(committed.tasks.map((task) => [task.taskId, task]));
+          committedTasks = Object.freeze(tasks.map((task) => byId.get(task.taskId) ?? task));
+          newlyCancelledTaskIds = new Set(taskMutations.map(({ next }) => next.taskId));
+          return;
+        } catch (error) {
+          if (
+            !(
+              error instanceof SubAgentRuntimeError &&
+              error.descriptor.causeCode === 'STATE_CAS_CONFLICT'
+            )
+          ) {
+            throw error;
+          }
+        }
+      }
+    });
+
+    for (const task of committedTasks) {
+      if (task.state !== 'cancelled' || !newlyCancelledTaskIds.has(task.taskId)) continue;
+      const operationId = `${operationRoot}:${task.taskId}`;
+      this.#active
+        .get(task.taskId)
+        ?.controller.abort(createSubAgentError('CANCELLED', 'The task was cancelled by the host.'));
+      try {
+        const executor = this.#executors.getExecutor(task.executor);
+        if (task.binding === undefined || executor === undefined) continue;
+        const target = this.#executors.selectRecovery(task.definition, task.executor);
+        validateBinding(task.binding, task.taskId, this.sessionId, target);
+        const deadlineAt = Date.now() + this.#limits.timeoutMs;
+        const signal = createOperationSignal({ deadlineAt });
+        await raceWithOperationSignal(
+          Promise.resolve(
+            executor.cancel(task.binding, {
+              operationId,
+              ...(reason === undefined ? {} : { reason }),
+              signal,
+              deadlineAt,
+            }),
+          ),
+          signal,
+          deadlineAt,
+        );
+      } catch {
+        // The atomic Core terminal remains authoritative when adapter cleanup cannot acknowledge.
+      }
+    }
+    return Object.freeze(committedTasks.map(taskSnapshot));
+  }
+
+  async recover(
+    sessionId: string,
+    taskId: string,
+    options: { readonly decisions?: readonly ApprovalDecision[] } = {},
+  ): Promise<SubAgentTaskHandle> {
+    assertRuntimeSession(sessionId, this.sessionId);
+    assertRuntimeReady(this.#ready);
+    const decisions = Object.freeze([...(options.decisions ?? [])]);
+    let task = await this.#loadTask(taskId);
+    const terminal = taskOutcome(task);
+    if (terminal?.type === 'terminal') return this.#createHandle(taskId);
+
+    const resident = this.#active.get(taskId);
+    if (resident !== undefined) {
+      if (task.state !== 'waiting_approval') {
+        if (decisions.length > 0) {
+          throw createSubAgentError(
+            'INVALID_STATE_TRANSITION',
+            'Approval decisions cannot be applied to a running resident task.',
+          );
+        }
+        return this.#createHandle(taskId);
+      }
+      await resident.promise;
+      task = await this.#loadTask(taskId);
+    }
+
+    if (task.state === 'waiting_approval') {
+      if (decisions.length === 0) return this.#createHandle(taskId);
+      await this.resume(this.sessionId, taskId, { decisions });
+      return this.#createHandle(taskId);
+    }
+    if (decisions.length > 0) {
+      throw createSubAgentError(
+        'INVALID_STATE_TRANSITION',
+        'Approval decisions require an authoritative waiting-approval task.',
+      );
+    }
+
+    if (task.state === 'queued') {
+      const target = this.#executors.selectRecovery(task.definition, task.executor);
+      const deadlineAt = Date.now() + task.remainingMs;
+      const signal = createOperationSignal({ deadlineAt });
+      this.#startExecution(task, target, 'execute', signal, deadlineAt);
+      return this.#createHandle(taskId);
+    }
+    if (task.state !== 'running' && task.state !== 'result_submitted') {
+      throw createSubAgentError(
+        'RECOVERY_UNSUPPORTED',
+        'The authoritative task state has no supported recovery action.',
+      );
+    }
+    if (task.error?.outcomeUnknown === true) {
+      throw createSubAgentError(
+        'RECOVERY_UNSUPPORTED',
+        'A provider outcome-unknown task cannot be recovered automatically.',
+      );
+    }
+
+    const selected = this.#executors.selectRecovery(task.definition, task.executor);
+    this.#assertExecutionTarget(task, selected);
+    if (selected.descriptor.capabilities.recovery.resume === 'checkpoint') {
+      const recovery = await this.#resolveRecoveryTarget(task, 'checkpoint');
+      task = await this.#prepareRecoveryCheckpoint(recovery.task, recovery.target);
+      const adopted = await this.#adoptCheckpointExecution(task, recovery.target);
+      if (!('lease' in adopted)) return this.#createHandle(taskId);
+      this.#startAdoptedCheckpointExecution(adopted);
+      return this.#createHandle(taskId);
+    }
+    if (selected.descriptor.capabilities.recovery.reconnect === 'external_binding') {
+      return this.reconnect(this.sessionId, taskId);
+    }
+    throw createSubAgentError(
+      'RECOVERY_TARGET_LOST',
+      'The same-process child execution handle is no longer resident.',
+    );
+  }
+
   async resume(
     sessionId: string,
     taskId: string,
@@ -2505,8 +3469,37 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       target = recovery.target;
       task = await this.#prepareRecoveryCheckpoint(task, target);
       const decisions = Object.freeze([...(options.decisions ?? [])]);
-      validateApprovalDecisionSet(task, decisions);
-      task = await this.#commitApprovalDecisions(taskId, decisions);
+      if (task.delegationPause !== undefined) {
+        validateApprovalDecisionSubset(task, decisions);
+        const leafTargets = await this.#prepareDelegatedApprovalTargets(task, decisions);
+        const committed = await this.#commitDelegatedApprovalDecisions(taskId, decisions);
+        task = committed.parent;
+        for (const start of committed.starts) {
+          if (this.#active.has(start.task.taskId)) continue;
+          const leafTarget = leafTargets.get(start.task.taskId);
+          if (leafTarget === undefined) {
+            throw createSubAgentError(
+              'RECOVERY_TARGET_LOST',
+              'A delegated leaf recovery target was lost after approval commit.',
+            );
+          }
+          this.#startRecoveredExecution(
+            start.task,
+            leafTarget,
+            {
+              type: 'resume',
+              reason: 'approval',
+              binding: start.task.binding as SubAgentExecutorBinding,
+              checkpoint: start.task.childCheckpoint as SubAgentChildCheckpoint,
+              approvals: start.decisions,
+            },
+            'execute',
+          );
+        }
+      } else {
+        validateApprovalDecisionSet(task, decisions);
+        task = await this.#commitApprovalDecisions(taskId, decisions);
+      }
       const outcome = taskOutcome(task);
       if (outcome !== undefined) return outcome;
       operation = {
@@ -2521,21 +3514,23 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       task = recovery.task;
       target = recovery.target;
       task = await this.#prepareRecoveryCheckpoint(task, target);
-      if (!task.recoveryRequired || task.state !== 'running') {
+      if (task.state !== 'running' && task.state !== 'result_submitted') {
         throw createSubAgentError(
           'RECOVERY_UNSUPPORTED',
           'The task has no durable checkpoint recovery to resume.',
         );
       }
-      task = await this.#commitCheckpointRecovery(taskId);
-      const recoveryOutcome = taskOutcome(task);
-      if (recoveryOutcome !== undefined) return recoveryOutcome;
-      operation = {
-        type: 'resume',
-        reason: 'checkpoint',
-        binding: task.binding as SubAgentExecutorBinding,
-        checkpoint: task.childCheckpoint as SubAgentChildCheckpoint,
-      };
+      const adopted = await this.#adoptCheckpointExecution(task, target);
+      if (!('lease' in adopted)) {
+        const recoveryOutcome = taskOutcome(adopted);
+        if (recoveryOutcome !== undefined) return recoveryOutcome;
+        throw createSubAgentError(
+          'RECOVERY_UNSUPPORTED',
+          'The task changed state before checkpoint orphan adoption.',
+        );
+      }
+      this.#startAdoptedCheckpointExecution(adopted);
+      return this.#active.get(taskId)!.promise;
     }
 
     this.#startRecoveredExecution(task, target, operation, 'execute');
@@ -2546,12 +3541,36 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     assertRuntimeSession(sessionId, this.sessionId);
     assertRuntimeReady(this.#ready);
     const task = await this.#loadTask(taskId);
+    const selectedTarget = this.#executors.selectRecovery(task.definition, task.executor);
+    this.#assertExecutionTarget(task, selectedTarget);
+    if (selectedTarget.descriptor.capabilities.recovery.reconnect !== 'external_binding') {
+      throw createSubAgentError(
+        'UNSUPPORTED_CAPABILITY',
+        'The persisted Executor does not support external reconnect.',
+      );
+    }
     const terminal = taskOutcome(task);
     if (terminal !== undefined) {
-      throw createSubAgentError(
-        'INVALID_STATE_TRANSITION',
-        'A terminal subagent task cannot be reconnected.',
-      );
+      if (task.binding === undefined) {
+        throw createSubAgentError('BINDING_INVALID', 'Reconnect requires an Executor binding.');
+      }
+      validateBinding(task.binding, task.taskId, this.sessionId, selectedTarget);
+      if (
+        measureCanonicalJsonBytes(task.binding as unknown as JsonValue) >
+        selectedTarget.descriptor.maxBindingBytes
+      ) {
+        throw createSubAgentError(
+          'BINDING_INVALID',
+          'The persisted Executor binding is oversized.',
+        );
+      }
+      if (task.binding.subagentSessionId !== task.subagentSessionId) {
+        throw createSubAgentError(
+          'BINDING_INVALID',
+          'The persisted Executor binding child session identity is invalid.',
+        );
+      }
+      return this.#createHandle(taskId);
     }
     if (task.error?.outcomeUnknown === true) {
       throw createSubAgentError(
@@ -2561,12 +3580,6 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     }
     if (this.#active.has(taskId)) return this.#createHandle(taskId);
     const { target } = await this.#resolveRecoveryTarget(task, 'reconnect');
-    if (target.descriptor.capabilities.recovery.reconnect !== 'external_binding') {
-      throw createSubAgentError(
-        'RECOVERY_UNSUPPORTED',
-        'The persisted Executor does not support external reconnect.',
-      );
-    }
     const reconnected = await this.#commitReconnectRecovery(taskId);
     if (taskOutcome(reconnected) !== undefined) return this.#createHandle(taskId);
     this.#startRecoveredExecution(
@@ -2787,12 +3800,13 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     }
     const deadlineAt = Date.now() + this.#limits.timeoutMs;
     const signal = createOperationSignal({ deadlineAt });
-    const migrated = await this.#normalizeChildCheckpoint(
+    const normalized = await this.#normalizeChildCheckpoint(
       task.childCheckpoint,
       signal,
       deadlineAt,
       { runnerId: task.binding.runnerId, runnerVersion: task.binding.runnerVersion },
     );
+    const migrated = reconcileRecoveryResultSubmission(task, normalized);
     if (
       !target.descriptor.childCheckpointVersions.includes(migrated.version) ||
       !target.descriptor.runnerCompatibility.some(
@@ -2832,6 +3846,276 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     });
   }
 
+  async #prepareDelegatedApprovalTargets(
+    parent: StoredTask,
+    decisions: readonly ApprovalDecision[],
+  ): Promise<ReadonlyMap<string, SubAgentExecutionTarget>> {
+    const pause = parent.delegationPause;
+    if (pause === undefined) {
+      throw createSubAgentError(
+        'INVALID_STATE_TRANSITION',
+        'The parent task has no delegated approval pause record.',
+      );
+    }
+    const decisionIds = new Set(decisions.map(({ approvalId }) => approvalId));
+    const childTaskIds = pause.calls
+      .filter((call) => call.approvalIds.some((approvalId) => decisionIds.has(approvalId)))
+      .map(({ childTaskId }) => childTaskId);
+    const targets = new Map<string, SubAgentExecutionTarget>();
+    for (const childTaskId of childTaskIds) {
+      let child = await this.#loadTask(childTaskId);
+      if (
+        child.ownerSessionId !== this.sessionId ||
+        child.runId !== parent.runId ||
+        child.parentTaskId !== parent.taskId
+      ) {
+        throw createResourceNotFoundError();
+      }
+      if (child.state !== 'waiting_approval') continue;
+      const recovery = await this.#resolveRecoveryTarget(child, 'approval');
+      child = await this.#prepareRecoveryCheckpoint(recovery.task, recovery.target);
+      if (child.state !== 'waiting_approval') {
+        throw createSubAgentError(
+          'INVALID_STATE_TRANSITION',
+          'A delegated leaf changed state while preparing approval recovery.',
+        );
+      }
+      targets.set(childTaskId, recovery.target);
+    }
+    return targets;
+  }
+
+  async #commitDelegatedApprovalDecisions(
+    taskId: string,
+    decisions: readonly ApprovalDecision[],
+  ): Promise<DelegatedApprovalCommit> {
+    const deadlineAt = Date.now() + this.#limits.timeoutMs;
+    const signal = createOperationSignal({ deadlineAt });
+    return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) =>
+      this.stateStore.transaction(this.sessionId, lease, async (transaction) => {
+        const parent = await transaction.loadTask(taskId);
+        if (parent === undefined) throw createResourceNotFoundError();
+        this.#assertPersistedLimits(parent.limits, 'task');
+        if (parent.state !== 'waiting_approval' || parent.delegationPause === undefined) {
+          const outcome = taskOutcome(parent);
+          if (outcome !== undefined) return Object.freeze({ parent, starts: Object.freeze([]) });
+          throw createSubAgentError(
+            'INVALID_STATE_TRANSITION',
+            'Delegated approval decisions require a paused parent task.',
+          );
+        }
+        validateApprovalDecisionSubset(parent, decisions);
+        const run = await transaction.loadRun(parent.runId);
+        if (run === undefined) throw createResourceNotFoundError();
+        this.#assertPersistedLimits(run.limits, 'root run');
+        const now = Date.now();
+        const decisionById = new Map(decisions.map((decision) => [decision.approvalId, decision]));
+        const leafMutations: {
+          readonly previous: StoredTask;
+          readonly next: StoredTask;
+          readonly events: readonly SubAgentTaskEvent[];
+          readonly started: boolean;
+        }[] = [];
+        const parentDecisionRecords: ApprovalDecisionRecord[] = [];
+        const leafSnapshots = new Map<string, StoredTask>();
+
+        for (const link of parent.delegationPause.calls) {
+          const original = await transaction.loadTask(link.childTaskId);
+          if (
+            original === undefined ||
+            original.ownerSessionId !== this.sessionId ||
+            original.runId !== parent.runId ||
+            original.parentTaskId !== parent.taskId
+          ) {
+            throw createResourceNotFoundError();
+          }
+          this.#assertPersistedLimits(original.limits, 'task');
+          let current = original;
+          const eventInputs: ExecutorEventInput[] = [];
+          for (const approval of original.approvals) {
+            const decision = decisionById.get(approval.approvalId);
+            if (decision === undefined || current.state !== 'waiting_approval') continue;
+            const decided = decideApproval(current, { decision, now });
+            current = decided.task as StoredTask;
+            if (!decided.replayed) {
+              parentDecisionRecords.push(decided.decision);
+              eventInputs.push({
+                type: 'approval.decided',
+                data: {
+                  approvalId: decided.decision.approvalId,
+                  reasonCode: decided.decision.decision,
+                },
+              });
+            }
+          }
+          const started = original.state === 'waiting_approval' && current.state === 'running';
+          if (started) {
+            current = Object.freeze({ ...current, recoveryRequired: true }) as StoredTask;
+            eventInputs.push({ type: 'task.resumed', data: { status: 'running' } });
+          } else if (current.result !== undefined && original.result === undefined) {
+            eventInputs.push({
+              type: 'task.failed',
+              data: {
+                status: current.state,
+                ...(current.error === undefined ? {} : { errorCode: current.error.code }),
+              },
+            });
+          }
+          if (!isDeepStrictEqual(current, original)) {
+            const withEvents = appendSafeTaskEvents(
+              { ...current, fencingToken: lease.fencingToken } as StoredTask,
+              eventInputs,
+              {
+                eventIds: eventInputs.map(() => createRuntimeId('event')),
+                defaultTimestamp: now,
+                revisionMode: 'preserve',
+              },
+            );
+            current = withEvents.task;
+            leafMutations.push({
+              previous: original,
+              next: current,
+              events: withEvents.events,
+              started,
+            });
+          }
+          leafSnapshots.set(link.childTaskId, current);
+        }
+
+        const remainingApprovals = parent.delegationPause.calls.flatMap((link) => {
+          const leaf = leafSnapshots.get(link.childTaskId);
+          return leaf?.state === 'waiting_approval' ? [...leaf.approvals] : [];
+        });
+        let nextParent: StoredTask;
+        const parentEventInputs: ExecutorEventInput[] = parentDecisionRecords.map((decision) => ({
+          type: 'approval.decided',
+          data: { approvalId: decision.approvalId, reasonCode: decision.decision },
+        }));
+        if (remainingApprovals.length === 0) {
+          nextParent = transitionSubAgentTask(parent, 'running', {
+            now,
+            approvals: [],
+          }) as StoredTask;
+          nextParent = Object.freeze({
+            ...nextParent,
+            approvalDecisions: Object.freeze([
+              ...parent.approvalDecisions,
+              ...parentDecisionRecords.map((decision) => Object.freeze({ ...decision })),
+            ]),
+            recoveryRequired: true,
+          }) as StoredTask;
+          parentEventInputs.push({ type: 'task.resumed', data: { status: 'running' } });
+        } else {
+          nextParent = Object.freeze({
+            ...parent,
+            revision: parent.revision + 1,
+            fencingToken: lease.fencingToken,
+            updatedAt: now,
+            approvals: Object.freeze(
+              remainingApprovals.map((approval) => Object.freeze({ ...approval })),
+            ),
+            approvalDecisions: Object.freeze([
+              ...parent.approvalDecisions,
+              ...parentDecisionRecords.map((decision) => Object.freeze({ ...decision })),
+            ]),
+          }) as StoredTask;
+        }
+        const parentWithEvents = appendSafeTaskEvents(
+          { ...nextParent, fencingToken: lease.fencingToken } as StoredTask,
+          parentEventInputs,
+          {
+            eventIds: parentEventInputs.map(() => createRuntimeId('event')),
+            defaultTimestamp: now,
+            revisionMode: 'preserve',
+          },
+        );
+        nextParent = parentWithEvents.task;
+
+        const starts = leafMutations.filter(({ started }) => started);
+        const slotsNeeded = starts.length + (nextParent.state === 'running' ? 1 : 0);
+        if (run.budget.activeExecutions + slotsNeeded > this.#limits.maxConcurrent) {
+          throw createSubAgentError(
+            'LIMIT_EXCEEDED',
+            'No subagent execution slot is available for delegated approval resume.',
+            { retryable: true },
+          );
+        }
+        const nextRun =
+          slotsNeeded === 0
+            ? run
+            : Object.freeze({
+                ...run,
+                revision: run.revision + 1,
+                fencingToken: lease.fencingToken,
+                budget: Object.freeze({
+                  ...run.budget,
+                  activeExecutions: run.budget.activeExecutions + slotsNeeded,
+                }),
+                updatedAt: now,
+              });
+
+        const parentCommitted = await transaction.compareAndSetTask(
+          parent.taskId,
+          parent.revision,
+          lease.fencingToken,
+          nextParent,
+        );
+        if (!parentCommitted) throw stateCasConflict();
+        for (const mutation of leafMutations) {
+          const committed = await transaction.compareAndSetTask(
+            mutation.previous.taskId,
+            mutation.previous.revision,
+            lease.fencingToken,
+            mutation.next,
+          );
+          if (!committed) throw stateCasConflict();
+        }
+        if (
+          nextRun !== run &&
+          !(await transaction.compareAndSetRun(
+            run.runId,
+            run.revision,
+            lease.fencingToken,
+            nextRun,
+          ))
+        ) {
+          throw stateCasConflict();
+        }
+        await transaction.appendEvents(parent.taskId, parentWithEvents.events);
+        for (const mutation of leafMutations) {
+          await transaction.appendEvents(mutation.previous.taskId, mutation.events);
+        }
+        return Object.freeze({
+          parent: nextParent,
+          starts: Object.freeze(
+            starts.map(({ next }) =>
+              Object.freeze({
+                task: next,
+                decisions: Object.freeze(
+                  next.approvalDecisions
+                    .filter(
+                      (
+                        record,
+                      ): record is ApprovalDecisionRecord & { readonly decision: 'approved' } =>
+                        record.decision === 'approved',
+                    )
+                    .map(({ approvalId, expectedRevision, decision, reason }) =>
+                      Object.freeze({
+                        approvalId,
+                        expectedRevision,
+                        decision,
+                        ...(reason === undefined ? {} : { reason }),
+                      }),
+                    ),
+                ),
+              }),
+            ),
+          ),
+        });
+      }),
+    );
+  }
+
   async #commitApprovalDecisions(
     taskId: string,
     decisions: readonly ApprovalDecision[],
@@ -2842,8 +4126,10 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       this.stateStore.transaction(this.sessionId, lease, async (transaction) => {
         const original = await transaction.loadTask(taskId);
         if (original === undefined) throw createResourceNotFoundError();
+        this.#assertPersistedLimits(original.limits, 'task');
         const run = await transaction.loadRun(original.runId);
         if (run === undefined) throw createResourceNotFoundError();
+        this.#assertPersistedLimits(run.limits, 'root run');
         if (original.state !== 'waiting_approval') {
           const outcome = taskOutcome(original);
           if (outcome !== undefined) return original;
@@ -2868,6 +4154,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
             });
           }
           if (current.state !== 'waiting_approval') break;
+        }
+        if (current.state === 'running') {
+          current = Object.freeze({ ...current, recoveryRequired: true }) as StoredTask;
         }
         if (
           current.state === 'running' &&
@@ -2933,8 +4222,184 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     );
   }
 
-  async #commitCheckpointRecovery(taskId: string): Promise<StoredTask> {
-    return this.#commitRunningRecovery(taskId, 'checkpoint');
+  async #adoptCheckpointExecution(
+    preparedTask: StoredTask,
+    target: SubAgentExecutionTarget,
+  ): Promise<AdoptedCheckpointExecution | StoredTask> {
+    const acquisitionDeadlineAt = Date.now() + this.#limits.timeoutMs;
+    const acquisitionSignal = createOperationSignal({ deadlineAt: acquisitionDeadlineAt });
+    const lease = await acquireRenewingRuntimeLease(
+      this.stateStore,
+      `subagent-task:${this.sessionId}:${preparedTask.taskId}`,
+      acquisitionSignal,
+      acquisitionDeadlineAt,
+      this.#executionLeaseTtlMs,
+    );
+    try {
+      for (;;) {
+        throwIfOperationAborted(lease.signal, acquisitionDeadlineAt);
+        const task = await this.#loadTask(preparedTask.taskId);
+        const outcome = taskOutcome(task);
+        if (outcome !== undefined || task.state === 'waiting_approval') {
+          await lease.stop();
+          return task;
+        }
+        if (task.state !== 'running' && task.state !== 'result_submitted') {
+          throw createSubAgentError(
+            'RECOVERY_UNSUPPORTED',
+            'Checkpoint orphan adoption requires an active authoritative task.',
+          );
+        }
+        this.#assertExecutionTarget(task, target);
+        if (task.binding === undefined || task.childCheckpoint === undefined) {
+          throw createSubAgentError(
+            'CHECKPOINT_VERSION_MISMATCH',
+            'Checkpoint orphan adoption requires a complete binding and child checkpoint.',
+          );
+        }
+        validateBinding(task.binding, task.taskId, this.sessionId, target);
+        if (task.binding.subagentSessionId !== task.subagentSessionId) {
+          throw createSubAgentError(
+            'BINDING_INVALID',
+            'The checkpoint binding child session identity is invalid.',
+          );
+        }
+        if (
+          !target.descriptor.childCheckpointVersions.includes(task.childCheckpoint.version) ||
+          !target.descriptor.runnerCompatibility.some(
+            (runner) =>
+              runner.runnerId === task.childCheckpoint?.runnerId &&
+              runner.runnerVersion === task.childCheckpoint.runnerVersion &&
+              runner.childCheckpointVersions.includes(task.childCheckpoint.version),
+          )
+        ) {
+          throw createSubAgentError(
+            'CHECKPOINT_VERSION_MISMATCH',
+            'The orphan child checkpoint is incompatible with the selected Executor.',
+          );
+        }
+        assertAuthoritativeResultSubmission(task, task.childCheckpoint);
+
+        const now = Date.now();
+        const elapsed = Math.max(0, now - (task.activeStartedAt ?? now));
+        const remainingMs = Math.max(0, task.remainingMs - elapsed);
+        const stoppedDraft = { ...task };
+        delete stoppedDraft.activeStartedAt;
+        const stopped = Object.freeze({
+          ...stoppedDraft,
+          activeElapsedMs: task.activeElapsedMs + elapsed,
+          remainingMs,
+        }) as StoredTask;
+        if (remainingMs < 1) {
+          const timedOut = transitionSubAgentTask(stopped, 'timed_out', {
+            now,
+            error: {
+              code: 'TIMED_OUT',
+              message: 'The subagent task timed out before checkpoint orphan adoption.',
+              retryable: false,
+            },
+          });
+          const withEvent = appendSafeTaskEvents(
+            { ...timedOut, fencingToken: lease.lease.fencingToken } as StoredTask,
+            [{ type: 'task.timed_out', data: { status: 'timed_out' } }],
+            {
+              eventIds: [createRuntimeId('event')],
+              defaultTimestamp: now,
+              revisionMode: 'preserve',
+            },
+          );
+          const run = await this.#loadRun(task.runId);
+          const nextRun =
+            task.activeStartedAt === undefined
+              ? run
+              : this.#releaseActiveExecution(run, lease.lease, now);
+          try {
+            await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
+              ...(nextRun === run ? {} : { run: { previous: run, next: nextRun } }),
+              tasks: [{ previous: task, next: withEvent.task, events: withEvent.events }],
+            });
+            await lease.stop();
+            return withEvent.task;
+          } catch (error) {
+            if (
+              error instanceof SubAgentRuntimeError &&
+              error.descriptor.causeCode === 'STATE_CAS_CONFLICT'
+            ) {
+              await waitForRuntimeRetry(lease.signal, acquisitionDeadlineAt, 1);
+              continue;
+            }
+            throw error;
+          }
+        }
+
+        const attempt = task.attempt + 1;
+        const executionEpoch = createRuntimeId('epoch');
+        const operationId = createRuntimeId('operation');
+        const changed = Object.freeze({
+          ...stopped,
+          revision: task.revision + 1,
+          attempt,
+          recoveryRequired: false,
+          activeStartedAt: now,
+          executionEpoch,
+          executionFencingToken: lease.lease.fencingToken,
+          executorOperation: Object.freeze({
+            version: '1' as const,
+            operationId,
+            type: 'resume_checkpoint' as const,
+            attempt,
+            executionEpoch,
+            status: 'dispatched' as const,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          fencingToken: lease.lease.fencingToken,
+          updatedAt: now,
+        }) as StoredTask;
+        const withEvents = appendSafeTaskEvents(
+          changed,
+          [
+            { type: 'recovery.started', data: { status: task.state } },
+            { type: 'recovery.resumed', data: { status: task.state } },
+          ],
+          {
+            eventIds: [createRuntimeId('event'), createRuntimeId('event')],
+            defaultTimestamp: now,
+            revisionMode: 'preserve',
+          },
+        );
+        try {
+          await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
+            tasks: [{ previous: task, next: withEvents.task, events: withEvents.events }],
+          });
+          const owned = withEvents.task;
+          return Object.freeze({
+            task: owned,
+            target,
+            lease,
+            operation: Object.freeze({
+              type: 'resume' as const,
+              reason: 'checkpoint' as const,
+              binding: owned.binding as SubAgentExecutorBinding,
+              checkpoint: owned.childCheckpoint as SubAgentChildCheckpoint,
+            }),
+            deadlineAt: now + remainingMs,
+          });
+        } catch (error) {
+          if (
+            error instanceof SubAgentRuntimeError &&
+            error.descriptor.causeCode === 'STATE_CAS_CONFLICT'
+          ) {
+            await waitForRuntimeRetry(lease.signal, acquisitionDeadlineAt, 1);
+            continue;
+          }
+          throw error;
+        }
+      }
+    } catch (error) {
+      await lease.stop();
+      throw error;
+    }
   }
 
   async #commitReconnectRecovery(taskId: string): Promise<StoredTask> {
@@ -2950,10 +4415,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
       const task = await this.#loadTask(taskId);
       const validState = task.state === 'running' || task.state === 'result_submitted';
-      if (
-        !validState ||
-        (kind === 'checkpoint' && (task.state !== 'running' || !task.recoveryRequired))
-      ) {
+      if (!validState || (kind === 'checkpoint' && !task.recoveryRequired)) {
         throw createSubAgentError(
           'RECOVERY_UNSUPPORTED',
           `The task does not support ${kind} recovery in its current state.`,
@@ -3068,6 +4530,40 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     this.#active.set(task.taskId, { promise, controller });
   }
 
+  #startAdoptedCheckpointExecution(adopted: AdoptedCheckpointExecution): void {
+    const { task, target, lease, operation, deadlineAt } = adopted;
+    const controller = new AbortController();
+    const promise = Promise.resolve()
+      .then(() =>
+        this.#runWithHeldExecutionLease(
+          task,
+          target,
+          'resume_checkpoint',
+          'execute',
+          deadlineAt,
+          lease,
+          operation,
+          true,
+          controller.signal,
+        ),
+      )
+      .catch(async (error: unknown) =>
+        this.#finalizeExecutionError(
+          task.taskId,
+          task.attempt,
+          error,
+          true,
+          executionOwnership(task),
+        ),
+      )
+      .finally(() => this.#active.delete(task.taskId));
+    this.#active.set(task.taskId, {
+      promise,
+      controller,
+      ownership: executionOwnership(task),
+    });
+  }
+
   async #runRecoveredTask(
     task: StoredTask,
     target: SubAgentExecutionTarget,
@@ -3127,13 +4623,27 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     assertNonEmpty(taskId, 'taskId');
     const task = await this.stateStore.loadTask(this.sessionId, taskId);
     if (task === undefined) throw createResourceNotFoundError();
+    this.#assertPersistedLimits(task.limits, 'task');
     return task;
   }
 
   async #loadRun(runId: string): Promise<StoredAgentRun> {
     const run = await this.stateStore.loadRun(this.sessionId, runId);
     if (run === undefined) throw createResourceNotFoundError();
+    this.#assertPersistedLimits(run.limits, 'root run');
     return run;
+  }
+
+  #assertPersistedLimits(
+    limits: Readonly<ResolvedSubAgentLimits>,
+    recordKind: 'root run' | 'task',
+  ): void {
+    if (!isDeepStrictEqual(limits, this.#limits)) {
+      throw createSubAgentError(
+        'CHECKPOINT_VERSION_MISMATCH',
+        `The persisted ${recordKind} limits do not match this SubAgentRuntime.`,
+      );
+    }
   }
 
   #emitTelemetry(event: Parameters<AgentTelemetrySink['emit']>[0]): void {
@@ -3248,6 +4758,268 @@ function validateApprovalRequestInput(input: ApprovalRequestInput): void {
   }
 }
 
+function assertChildCheckpointTransition(
+  previous: SubAgentChildCheckpoint | undefined,
+  next: SubAgentChildCheckpoint,
+): void {
+  const before = previous?.modelOperation;
+  const after = next.modelOperation;
+  if (before === undefined && after === undefined) return;
+  if (isDeepStrictEqual(previous, next)) return;
+  const validStep =
+    (before === undefined && after?.phase === 'prepared') ||
+    (before?.phase === 'prepared' && after?.phase === 'in_flight') ||
+    (before?.phase === 'in_flight' && after?.phase === 'result_ready') ||
+    // A trusted runner may clear an in-flight intent only after the provider
+    // returned an explicit rejection (for example an HTTP 400). That outcome
+    // is known not to have produced a model result and is therefore safe to
+    // retry through the model-error recovery state machine.
+    (before?.phase === 'in_flight' && after === undefined) ||
+    (before?.phase === 'result_ready' && after === undefined);
+  if (!validStep) {
+    throw createSubAgentError(
+      'INVALID_STATE_TRANSITION',
+      'A child Model operation must advance prepared, in-flight, result-ready, then apply, or clear after an explicit provider rejection.',
+    );
+  }
+  if (
+    before !== undefined &&
+    after !== undefined &&
+    (before.version !== after.version ||
+      before.operationId !== after.operationId ||
+      before.iteration !== after.iteration ||
+      before.purpose !== after.purpose ||
+      before.requestHash !== after.requestHash ||
+      before.preparedAt !== after.preparedAt ||
+      after.updatedAt < before.updatedAt)
+  ) {
+    throw createSubAgentError(
+      'INVALID_STATE_TRANSITION',
+      'A child Model operation transition cannot change its durable identity or request hash.',
+    );
+  }
+  if (before !== undefined && after !== undefined) {
+    const stableCheckpoint =
+      previous !== undefined &&
+      previous.runnerId === next.runnerId &&
+      previous.runnerVersion === next.runnerVersion &&
+      previous.modelIteration === next.modelIteration &&
+      previous.maxIterations === next.maxIterations &&
+      isDeepStrictEqual(previous.protocolContext, next.protocolContext) &&
+      isDeepStrictEqual(previous.contextStore, next.contextStore) &&
+      isDeepStrictEqual(previous.pendingBatch, next.pendingBatch) &&
+      isDeepStrictEqual(previous.compactTransaction, next.compactTransaction);
+    if (!stableCheckpoint) {
+      throw createSubAgentError(
+        'INVALID_STATE_TRANSITION',
+        'A child checkpoint cannot change loop state while a Model request is open.',
+      );
+    }
+  }
+}
+
+function approvalCheckpointCall(
+  checkpoint: SubAgentChildCheckpoint,
+  callId: string,
+  toolName: string,
+): NonNullable<SubAgentChildCheckpoint['pendingBatch']>['calls'][number] {
+  const matches = checkpoint.pendingBatch?.calls.filter((call) => call.callId === callId) ?? [];
+  const call = matches[0];
+  if (
+    matches.length !== 1 ||
+    call === undefined ||
+    call.kind !== 'tool' ||
+    call.name !== toolName
+  ) {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The approval checkpoint does not contain the exact active Tool call.',
+    );
+  }
+  return call;
+}
+
+function assertApprovalCheckpoint(
+  checkpoint: SubAgentChildCheckpoint,
+  callId: string,
+  toolName: string,
+): void {
+  const call = approvalCheckpointCall(checkpoint, callId, toolName);
+  if (call.status !== 'in_flight' && call.status !== 'waiting_approval') {
+    throw createSubAgentError(
+      'INVALID_STATE_TRANSITION',
+      'An approval checkpoint call must be in-flight or already waiting approval.',
+    );
+  }
+  if (call.approvals !== undefined) {
+    const ids = new Set(call.approvals);
+    if (
+      ids.size !== call.approvals.length ||
+      call.approvals.some(
+        (approvalId: string) => typeof approvalId !== 'string' || approvalId.length === 0,
+      )
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'The approval checkpoint contains invalid approval identities.',
+      );
+    }
+  }
+}
+
+function validateDelegationPauseCheckpoint(
+  checkpoint: SubAgentChildCheckpoint,
+  inputCalls: SubAgentDelegationPauseInput['calls'],
+  ownerSessionId: string,
+): readonly Readonly<{
+  callId: string;
+  childTaskId: string;
+  approvals: readonly ApprovalRequest[];
+}>[] {
+  const pending = checkpoint.pendingBatch;
+  if (pending === undefined || !Array.isArray(inputCalls) || inputCalls.length === 0) {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'A delegation pause requires a pending batch with paused nested calls.',
+    );
+  }
+  const pausedCalls = pending.calls.filter(
+    (call) => call.kind === 'agent' && call.status === 'waiting_approval',
+  );
+  if (pausedCalls.length !== inputCalls.length) {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The delegation pause must include every paused nested call exactly once.',
+    );
+  }
+
+  const childTaskIds = new Set<string>();
+  const approvalIds = new Set<string>();
+  const normalized = inputCalls.map((input, index) => {
+    assertNonEmpty(input.callId, 'delegation callId');
+    assertNonEmpty(input.childTaskId, 'delegation childTaskId');
+    if (childTaskIds.has(input.childTaskId)) {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'A delegated leaf task cannot appear twice in one pause record.',
+      );
+    }
+    childTaskIds.add(input.childTaskId);
+    const call = pausedCalls[index];
+    if (
+      call === undefined ||
+      call.callId !== input.callId ||
+      call.taskId !== input.childTaskId ||
+      call.name !== 'agent' ||
+      !Array.isArray(input.approvals) ||
+      input.approvals.length === 0
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'A delegated pause call does not match the provider batch checkpoint.',
+      );
+    }
+    const approvals = input.approvals.map((approval: ApprovalRequest) => {
+      if (
+        typeof approval !== 'object' ||
+        approval === null ||
+        typeof approval.approvalId !== 'string' ||
+        approval.approvalId.length === 0 ||
+        approvalIds.has(approval.approvalId) ||
+        approval.ownerSessionId !== ownerSessionId ||
+        approval.taskId !== input.childTaskId ||
+        typeof approval.callId !== 'string' ||
+        approval.callId.length === 0 ||
+        typeof approval.toolName !== 'string' ||
+        approval.toolName.length === 0 ||
+        typeof approval.summary !== 'string' ||
+        approval.summary.length === 0 ||
+        !Number.isFinite(approval.createdAt) ||
+        !Number.isSafeInteger(approval.revision)
+      ) {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'A delegated approval request is invalid or outside the linked leaf task.',
+        );
+      }
+      approvalIds.add(approval.approvalId);
+      return Object.freeze({ ...approval });
+    });
+    if (
+      !isDeepStrictEqual(
+        call.approvals,
+        approvals.map(({ approvalId }: ApprovalRequest) => approvalId),
+      )
+    ) {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'Delegated approval IDs do not match the paused provider call.',
+      );
+    }
+    return Object.freeze({
+      callId: input.callId,
+      childTaskId: input.childTaskId,
+      approvals: Object.freeze(approvals),
+    });
+  });
+  return Object.freeze(normalized);
+}
+
+function delegationPauseBatchCompleted(
+  checkpoint: SubAgentChildCheckpoint,
+  pause: StoredDelegationPauseV1,
+): boolean {
+  const pending = checkpoint.pendingBatch;
+  if (pending === undefined || pending.batchId !== pause.batchId) return true;
+  return pause.calls.every((link) => {
+    const call = pending.calls.find(
+      (candidate) =>
+        candidate.kind === 'agent' &&
+        candidate.callId === link.callId &&
+        candidate.taskId === link.childTaskId,
+    );
+    return (
+      call !== undefined &&
+      (call.status === 'result_ready' ||
+        call.status === 'result_submitted' ||
+        call.status === 'applied')
+    );
+  });
+}
+
+function attachApprovalToChildCheckpoint(
+  checkpoint: SubAgentChildCheckpoint,
+  callId: string,
+  toolName: string,
+  approvalId: string,
+): SubAgentChildCheckpoint {
+  const target = approvalCheckpointCall(checkpoint, callId, toolName);
+  if (target.status !== 'in_flight' || (target.approvals?.length ?? 0) !== 0) {
+    throw createSubAgentError(
+      'INVALID_STATE_TRANSITION',
+      'A first approval suspension requires one in-flight call without approval IDs.',
+    );
+  }
+  const pendingBatch = checkpoint.pendingBatch!;
+  return Object.freeze({
+    ...checkpoint,
+    pendingBatch: Object.freeze({
+      ...pendingBatch,
+      calls: Object.freeze(
+        pendingBatch.calls.map((call) =>
+          call.callId === callId
+            ? Object.freeze({
+                ...call,
+                status: 'waiting_approval' as const,
+                approvals: Object.freeze([approvalId]),
+              })
+            : Object.freeze({ ...call }),
+        ),
+      ),
+    }),
+  });
+}
+
 function validateApprovalDecisionSet(
   task: StoredTask,
   decisions: readonly ApprovalDecision[],
@@ -3269,6 +5041,34 @@ function validateApprovalDecisionSet(
     throw createSubAgentError(
       'APPROVAL_REQUIRED',
       'Resume requires exactly one decision for every current approval request.',
+    );
+  }
+}
+
+function validateApprovalDecisionSubset(
+  task: StoredTask,
+  decisions: readonly ApprovalDecision[],
+): void {
+  if (
+    task.state !== 'waiting_approval' ||
+    task.approvals.length === 0 ||
+    task.delegationPause === undefined
+  ) {
+    throw createSubAgentError(
+      'INVALID_STATE_TRANSITION',
+      'Delegated approval decisions require a waiting parent task.',
+    );
+  }
+  const pendingIds = new Set(task.approvals.map(({ approvalId }) => approvalId));
+  const decisionIds = decisions.map(({ approvalId }) => approvalId);
+  if (
+    decisions.length === 0 ||
+    new Set(decisionIds).size !== decisions.length ||
+    decisionIds.some((approvalId) => !pendingIds.has(approvalId))
+  ) {
+    throw createSubAgentError(
+      'APPROVAL_REQUIRED',
+      'Delegated resume requires a non-empty unique subset of current approval decisions.',
     );
   }
 }
@@ -3542,6 +5342,60 @@ function validateChildCheckpointV1(
       'The child checkpoint iteration counters are invalid.',
     );
   }
+  const modelOperation = checkpoint.modelOperation;
+  if (modelOperation !== undefined) {
+    const validBase =
+      modelOperation.version === '1' &&
+      typeof modelOperation.operationId === 'string' &&
+      modelOperation.operationId.length > 0 &&
+      modelOperation.iteration === checkpoint.modelIteration &&
+      (modelOperation.purpose === 'agent' || modelOperation.purpose === 'context-summary') &&
+      /^[0-9a-f]{64}$/u.test(modelOperation.requestHash) &&
+      (modelOperation.phase === 'prepared' ||
+        modelOperation.phase === 'in_flight' ||
+        modelOperation.phase === 'result_ready') &&
+      Number.isSafeInteger(modelOperation.preparedAt) &&
+      modelOperation.preparedAt >= 0 &&
+      Number.isSafeInteger(modelOperation.updatedAt) &&
+      modelOperation.updatedAt >= modelOperation.preparedAt;
+    if (!validBase) {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'The child Model operation checkpoint is invalid.',
+      );
+    }
+    if (modelOperation.phase === 'result_ready') {
+      if (
+        modelOperation.result === undefined ||
+        modelOperation.result.protocol !== protocol.protocol ||
+        modelOperation.result.codecVersion !== protocol.codecVersion
+      ) {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The child Model result checkpoint is incompatible.',
+        );
+      }
+      try {
+        codec.decode(modelOperation.result.value);
+      } catch {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The child Model result checkpoint cannot be decoded.',
+        );
+      }
+    } else if (modelOperation.result !== undefined) {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'Only a result-ready child Model operation may retain provider messages.',
+      );
+    }
+    if (checkpoint.pendingBatch !== undefined) {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'A child checkpoint cannot retain a Model operation and Tool batch together.',
+      );
+    }
+  }
   const pending = checkpoint.pendingBatch;
   if (pending !== undefined) {
     if (
@@ -3581,15 +5435,45 @@ function validateChildCheckpointV1(
           'result_ready',
           'result_submitted',
           'applied',
-        ].includes(call.status) ||
-        (call.kind === 'end-agent' && !pending.endRequested)
+        ].includes(call.status)
       ) {
         throw createSubAgentError(
           'CHECKPOINT_MIGRATION_FAILED',
           'The child pending batch contains an invalid call.',
         );
       }
+      const approvalIds = call.approvals ?? [];
+      if (
+        new Set(approvalIds).size !== approvalIds.length ||
+        approvalIds.some(
+          (approvalId: string) => typeof approvalId !== 'string' || approvalId.length === 0,
+        ) ||
+        (call.status === 'waiting_approval' && approvalIds.length === 0) ||
+        (call.status !== 'waiting_approval' && approvalIds.length > 0) ||
+        (['result_ready', 'result_submitted', 'applied'].includes(call.status) &&
+          call.result === undefined) ||
+        (['prepared', 'in_flight', 'waiting_approval'].includes(call.status) &&
+          call.result !== undefined)
+      ) {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'The child pending batch contains invalid approval or result state.',
+        );
+      }
       callIds.add(call.callId);
+    }
+    if (pending.endRequested) {
+      const endCalls = pending.calls.filter((call) => call.kind === 'end-agent');
+      if (
+        pending.calls.length !== 1 ||
+        endCalls.length !== 1 ||
+        !['result_ready', 'result_submitted', 'applied'].includes(endCalls[0]!.status)
+      ) {
+        throw createSubAgentError(
+          'CHECKPOINT_MIGRATION_FAILED',
+          'A completed child end-agent request must be standalone and result-ready.',
+        );
+      }
     }
   }
   const compact = checkpoint.compactTransaction;
@@ -3610,7 +5494,190 @@ function validateChildCheckpointV1(
       'The child compact transaction checkpoint is invalid.',
     );
   }
+  const resultSubmission = checkpoint.resultSubmission;
+  if (resultSubmission !== undefined) {
+    try {
+      if (
+        resultSubmission.version !== '1' ||
+        typeof resultSubmission.callId !== 'string' ||
+        resultSubmission.callId.length === 0 ||
+        !/^[0-9a-f]{64}$/u.test(resultSubmission.outputHash)
+      ) {
+        throw new TypeError('invalid result submission identity');
+      }
+      assertJsonValue(resultSubmission.output, {
+        maxBytes: DEFAULT_SUBAGENT_IO_LIMITS.maxOutputBytes,
+        label: 'Child result submission output',
+      });
+      if (canonicalJsonSha256(resultSubmission.output) !== resultSubmission.outputHash) {
+        throw new TypeError('invalid result submission hash');
+      }
+    } catch {
+      throw createSubAgentError(
+        'CHECKPOINT_MIGRATION_FAILED',
+        'The child result submission checkpoint is invalid.',
+      );
+    }
+  }
+  assertResultSubmissionPendingBatchLink(checkpoint);
   return Object.freeze(cloneJsonValue(value) as unknown as SubAgentChildCheckpoint);
+}
+
+function assertResultSubmissionPendingBatchLink(checkpoint: SubAgentChildCheckpoint): void {
+  const submission = checkpoint.resultSubmission;
+  const pending = checkpoint.pendingBatch;
+  if (submission === undefined || pending === undefined) return;
+  const resultCalls = pending.calls.filter((call) => call.name === 'agent-result');
+  const call = resultCalls[0];
+  if (resultCalls.length === 0) {
+    const endCall = pending.calls[0];
+    if (
+      pending.calls.length === 1 &&
+      endCall?.kind === 'end-agent' &&
+      endCall.name === 'end-agent' &&
+      (endCall.status === 'prepared' ||
+        endCall.status === 'in_flight' ||
+        endCall.status === 'result_ready' ||
+        endCall.status === 'applied')
+    ) {
+      return;
+    }
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'After result submission, only the matching agent-result or standalone end-agent batch is valid.',
+    );
+  }
+  const input = call?.input;
+  const inputRecord =
+    typeof input === 'object' && input !== null && !Array.isArray(input)
+      ? (input as Record<string, JsonValue>)
+      : undefined;
+  const expectedInput: JsonValue = { result: submission.output };
+  if (
+    resultCalls.length !== 1 ||
+    call === undefined ||
+    call.callId !== submission.callId ||
+    call.kind !== 'tool' ||
+    inputRecord === undefined ||
+    Object.keys(inputRecord).length !== 1 ||
+    !Object.hasOwn(inputRecord, 'result') ||
+    !isDeepStrictEqual(inputRecord.result, submission.output) ||
+    call.inputHash !== canonicalJsonSha256(expectedInput) ||
+    (call.status !== 'in_flight' && call.status !== 'result_submitted' && call.status !== 'applied')
+  ) {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The child agent-result call does not match its authoritative result submission.',
+    );
+  }
+  if (call.status === 'in_flight') return;
+  if (typeof call.result !== 'string') {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The child agent-result Tool output is invalid.',
+    );
+  }
+  let result: unknown;
+  try {
+    result = JSON.parse(call.result);
+  } catch {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The child agent-result Tool output is invalid.',
+    );
+  }
+  if (
+    typeof result !== 'object' ||
+    result === null ||
+    Array.isArray(result) ||
+    Object.keys(result).length !== 3 ||
+    (result as Record<string, unknown>).ok !== true ||
+    ((result as Record<string, unknown>).status !== 'accepted' &&
+      (result as Record<string, unknown>).status !== 'replayed') ||
+    (result as Record<string, unknown>).outputHash !== submission.outputHash
+  ) {
+    throw createSubAgentError(
+      'CHECKPOINT_MIGRATION_FAILED',
+      'The child agent-result Tool output does not match the authoritative result hash.',
+    );
+  }
+}
+
+function authoritativeResultSubmission(
+  task: StoredTask,
+): NonNullable<SubAgentChildCheckpoint['resultSubmission']> {
+  if (task.output === undefined || task.resultReceipt === undefined) {
+    throw createSubAgentError(
+      'INTERNAL_ERROR',
+      'The authoritative result-submitted task is incomplete.',
+    );
+  }
+  assertJsonValue(task.output, {
+    maxBytes: DEFAULT_SUBAGENT_IO_LIMITS.maxOutputBytes,
+    label: 'Subagent output',
+  });
+  const outputHash = canonicalJsonSha256(task.output);
+  if (outputHash !== task.resultReceipt.outputHash) {
+    throw createSubAgentError(
+      'INTERNAL_ERROR',
+      'The authoritative task output does not match its result receipt.',
+    );
+  }
+  return Object.freeze({
+    version: '1' as const,
+    callId: task.resultReceipt.callId,
+    output: cloneJsonValue(task.output),
+    outputHash,
+  });
+}
+
+function assertAuthoritativeResultSubmission(
+  task: StoredTask,
+  checkpoint: SubAgentChildCheckpoint,
+): void {
+  const submission = checkpoint.resultSubmission;
+  if (task.state !== 'result_submitted') {
+    if (submission !== undefined) {
+      throw createSubAgentError(
+        'INVALID_STATE_TRANSITION',
+        'Only a result-submitted task may retain a child result submission checkpoint.',
+      );
+    }
+    return;
+  }
+  if (submission === undefined) {
+    throw createSubAgentError(
+      'RESULT_REQUIRED',
+      'A result-submitted task checkpoint requires its authoritative result projection.',
+    );
+  }
+  const authoritative = authoritativeResultSubmission(task);
+  if (!isDeepStrictEqual(submission, authoritative)) {
+    throw createSubAgentError(
+      'RESULT_REPLAY_CONFLICT',
+      'The child result submission checkpoint conflicts with the authoritative task result.',
+    );
+  }
+}
+
+function reconcileRecoveryResultSubmission(
+  task: StoredTask,
+  checkpoint: SubAgentChildCheckpoint,
+): SubAgentChildCheckpoint {
+  if (task.state !== 'result_submitted') {
+    assertAuthoritativeResultSubmission(task, checkpoint);
+    return checkpoint;
+  }
+  if (checkpoint.resultSubmission !== undefined) {
+    assertAuthoritativeResultSubmission(task, checkpoint);
+    return checkpoint;
+  }
+  const reconciled = Object.freeze({
+    ...checkpoint,
+    resultSubmission: authoritativeResultSubmission(task),
+  });
+  assertResultSubmissionPendingBatchLink(reconciled);
+  return reconciled;
 }
 
 function taskSnapshot(task: StoredTask): SubAgentTaskSnapshot {
@@ -3652,5 +5719,96 @@ function sanitizeResultError(error: SubAgentErrorDescriptor): SubAgentErrorDescr
     ...(error.causeCode === undefined ? {} : { causeCode: error.causeCode }),
     ...(error.outcomeUnknown === undefined ? {} : { outcomeUnknown: error.outcomeUnknown }),
     ...(error.eventCursor === undefined ? {} : { eventCursor: error.eventCursor }),
+  });
+}
+
+function normalizeAuthoritativeFailure(
+  candidate: SubAgentFailureInput,
+  target: SubAgentExecutionTarget,
+): Readonly<SubAgentFailureInput> {
+  if (typeof candidate !== 'object' || candidate === null) {
+    throw createSubAgentError('INVALID_OUTPUT', 'The authoritative failure is invalid.');
+  }
+  if (
+    candidate.status !== 'failed' &&
+    candidate.status !== 'cancelled' &&
+    candidate.status !== 'timed_out' &&
+    candidate.status !== 'budget_exceeded'
+  ) {
+    throw createSubAgentError('INVALID_OUTPUT', 'The authoritative failure status is invalid.');
+  }
+  if (typeof candidate.error !== 'object' || candidate.error === null) {
+    throw createSubAgentError('INVALID_OUTPUT', 'The authoritative failure error is invalid.');
+  }
+  const candidateCode = SUBAGENT_ERROR_CODES.includes(candidate.error.code)
+    ? candidate.error.code
+    : 'EXECUTOR_FAILED';
+  const expectedCode =
+    candidate.status === 'cancelled'
+      ? 'CANCELLED'
+      : candidate.status === 'timed_out'
+        ? 'TIMED_OUT'
+        : candidate.status === 'budget_exceeded'
+          ? 'BUDGET_EXCEEDED'
+          : undefined;
+  if (expectedCode !== undefined && candidateCode !== expectedCode) {
+    throw createSubAgentError(
+      'INVALID_OUTPUT',
+      `The ${candidate.status} failure must use error code ${expectedCode}.`,
+    );
+  }
+  if (
+    candidate.status === 'failed' &&
+    (candidateCode === 'CANCELLED' ||
+      candidateCode === 'TIMED_OUT' ||
+      candidateCode === 'BUDGET_EXCEEDED')
+  ) {
+    throw createSubAgentError(
+      'INVALID_OUTPUT',
+      'A failed terminal cannot use a control-terminal error code.',
+    );
+  }
+  const error: SubAgentErrorDescriptor = Object.freeze({
+    code: candidateCode,
+    message:
+      candidate.status === 'cancelled'
+        ? 'The subagent task was cancelled.'
+        : candidate.status === 'timed_out'
+          ? 'The subagent task timed out.'
+          : candidate.status === 'budget_exceeded'
+            ? 'The subagent task exceeded its budget.'
+            : 'The subagent execution failed.',
+    retryable: candidate.error.retryable === true,
+    ...(candidate.status === 'failed' && candidate.error.outcomeUnknown === true
+      ? { outcomeUnknown: true }
+      : {}),
+  });
+
+  let partialOutput: JsonValue | undefined;
+  if (candidate.partialOutput !== undefined) {
+    const parsed = target.definition.outputSchema.safeParse(candidate.partialOutput);
+    if (!parsed.success) {
+      throw createSubAgentError(
+        'INVALID_OUTPUT',
+        'The subagent partial output failed schema validation.',
+      );
+    }
+    try {
+      assertJsonValue(parsed.data, {
+        maxBytes: DEFAULT_SUBAGENT_IO_LIMITS.maxOutputBytes,
+        label: 'Subagent partial output',
+      });
+    } catch {
+      throw createSubAgentError(
+        'INVALID_OUTPUT',
+        'The subagent partial output is not JSON-safe or exceeds the output byte limit.',
+      );
+    }
+    partialOutput = cloneJsonValue(parsed.data as JsonValue);
+  }
+  return Object.freeze({
+    status: candidate.status,
+    error,
+    ...(partialOutput === undefined ? {} : { partialOutput }),
   });
 }

@@ -7,6 +7,8 @@
 
 ## 安装
 
+本 README 对应当前 checkout 中待发布的 `2.0.0` 源码。npm registry 上该包的 `latest` 目前仍是 `1.0.0`；以下安装命令与 v2 API 示例应在 `2.0.0` 发布后使用。在此之前请从仓库 workspace 构建和验收。
+
 ```bash
 npm install @ruixutong.manee/maneeagent-framework zod
 ```
@@ -30,19 +32,23 @@ npm install @ruixutong.manee/maneeagent-framework zod
 - 事件系统：可观察模型响应、工具调用、工具错误、Agent 状态和 Agent 错误。
 - Context compact：active-only 工具 payload 压缩、外部摘要策略与 context-length 恢复，raw history 保留原文。
 - Skills：通过内置 `skill` 工具按名称渐进加载 instructions、文本资源和显式启用的脚本。
-- Sub-agents：通过内置 `agent` 工具调度同协议子代理。
+- Subagent v2：typed definition、显式 Executor placement、跨协议 child Agent、审批/嵌套审批、持久 resume、typed result 与树级取消。
 
 ## 公开入口
 
-| 运行时导出             | 用途                                                        |
-| ---------------------- | ----------------------------------------------------------- |
-| `Agent`                | 协议无关的任务循环、上下文、工具和生命周期编排。            |
-| `Tool`                 | 将类方法注册为 Agent 工具的标准装饰器。                     |
-| `Model`                | 接入自定义消息协议时实现的抽象基类。                        |
-| `OpenAIResponsesModel` | Responses API 与 OpenAI-compatible endpoint 适配器。        |
-| `OpenAIChatModel`      | Chat Completions API 与 OpenAI-compatible endpoint 适配器。 |
+| 根入口导出                                                       | 用途                                                                       |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `Agent` / `AgentRunOutcome`                                      | 协议无关的任务循环与四类 durable run outcome。                             |
+| `Tool` / `ToolRuntimeContext`                                    | 装饰器/运行时 Tool，以及可信的 call、signal、deadline、run/task metadata。 |
+| `Model` / `OpenAIResponsesModel` / `OpenAIChatModel`             | 自定义协议抽象与两个 OpenAI-compatible adapter。                           |
+| `defineSubAgent` / `SubAgentDefinition` / `SubAgentRuntime`      | typed definition、Catalog/Router、持久状态与控制面 Runtime。               |
+| `SubAgentExecutor` / `ExecutorTaskHandle`                        | placement adapter 与 Core 包装前的 Executor task SPI。                     |
+| `AgentRuntimeStateStore` / `ArtifactStore`                       | durable run/task state 与 opaque artifact 的 adapter SPI。                 |
+| `SubAgentChildRunner` / `AgentProtocolCheckpointCodec`           | 协议无关 child loop bridge 与版本化协议 checkpoint codec。                 |
+| `AgentTelemetrySink` 及 Subagent state/result/approval contracts | Executor、StateStore、telemetry adapter 共用的稳定控制面契约。             |
+| `createSubAgentRuntime`                                          | 同步创建 session-bound Runtime；异步校验由 `runtime.init()` 完成。         |
 
-包根入口还导出 Agent、Model、Responses 和 Chat 的配套 TypeScript 类型，不提供子路径入口或 CLI `bin`。
+包根入口同时导出 Agent、Model、Responses、Chat 与 Subagent v2 的配套 TypeScript 类型、常量和 adapter-facing state/control records。当前只公开 `.`，不提供子路径入口或 CLI `bin`。
 
 ## 快速开始
 
@@ -90,11 +96,16 @@ const agent = new NotesAgent({
 
 agent.init();
 
-const context = await agent.agent('请保存一条笔记：今天完成 README。');
-console.log(context);
+const outcome = await agent.agent('请保存一条笔记：今天完成 README。');
+
+if (outcome.status === 'succeeded') {
+  console.log(outcome.context);
+} else {
+  console.log(outcome.status, outcome.runId);
+}
 ```
 
-`OPENAI_API_KEY` 和 `OPENAI_MODEL` 只是这个示例使用的环境变量名称，不是框架约定。`init()` 是显式配置校验入口：调用 `agent()` 或 `toolCall()` 前必须先调用它；如果之后修改了 `agent.tools` 或 `agent.subAgents`，需要再次调用。示例显式设置 `maxIterations`，避免模型没有按要求调用 `end-agent` 时持续请求。
+`OPENAI_API_KEY` 和 `OPENAI_MODEL` 只是这个示例使用的环境变量名称，不是框架约定。`init()` 是显式配置校验入口：调用 `agent()` 或 `toolCall()` 前必须先调用它；如果之后修改了 Tools、system prompts、Skills/`skillRuntime`、context compact 或模型错误恢复等运行语义配置，需要再次调用。示例显式设置 `maxIterations`，避免模型没有按要求调用 `end-agent` 时持续请求。
 
 ## Agent 与 Model
 
@@ -125,7 +136,7 @@ abstract class Model<P extends AgentProtocol> {
 
 ## 工具系统
 
-每个 Agent 实例都会自动注册三个框架工具：`agent` 用于调度子代理，`skill` 用于渐进加载技能，`end-agent` 用于正常结束任务。即使当前没有子代理或 Skills，这些工具仍属于 Agent 的运行时工具集合；自定义工具不得与它们重名，`init()` 会统一校验工具名和子代理类名是否唯一。
+每个 Agent 实例都会注册 `skill` 和 `end-agent`；只有 ready Runtime 的有效 Catalog 非空时，才向模型加入 `agent` Tool。child Agent 还会由 Executor bridge 注入 typed `agent-result`。这些名称属于框架保留名，自定义工具不得冲突；`init()` 会统一校验。
 
 ### 装饰器工具
 
@@ -222,11 +233,11 @@ unsubscribe();
 - `onAfterToolCall`：工具结果已经写入 context 后触发。
 - `onToolCallError`：`before`、`calling`、`after` 任一阶段发生错误时触发。
 - `onAgentStatusChanged`：进入指定状态后触发。
-- `onAgentError`：`agent()` 抛错时触发。
+- `onAgentError`：run 失败、取消或配置/调用错误被 Agent 观察到时触发；可恢复的 `failed` / `cancelled` run 通常同时以 outcome 返回。
 
 `before` listener 如果希望异步异常取消真实工具调用，必须同时设置 `{ await: true, errorCancel: true }`。`after` listener 异常只会上报，不会中断 Agent 主循环。
 
-`agent(input, options)` 与 `toolCall(call, options)` 可接收 `signal`、绝对 Unix 毫秒时间戳 `deadlineAt` 和只在宿主内部传播的 `runtime` identity。同一 run 的 Model、Tool、摘要、payload compactor、listener 和 model-error recovery 共用取消链路；取消/超时不会进入普通模型错误分类与 retry。声明两个参数的 Tool handler 会收到第二个 `ToolRuntimeContext`，其中包含当前 call、signal、deadline 和可选的 session/run/task identity；单参数 handler 保持原调用方式。自定义异步实现必须协作式监听 signal，框架不能强制终止任意第三方 Promise。
+`agent(input, options)` 与 `toolCall(call, options)` 可接收 `signal` 和绝对 Unix 毫秒时间戳 `deadlineAt`。同一 run 的 Model、Tool、摘要、payload compactor、listener 和 model-error recovery 共用取消链路；取消/超时不会进入普通模型错误分类与 retry。声明两个参数的 Tool handler 会收到第二个 `ToolRuntimeContext`，其中包含当前 call、signal、deadline 和由框架生成的可选 session/run/task identity；这些身份不来自模型输入。单参数 handler 保持原调用方式。自定义异步实现必须协作式监听 signal，框架不能强制终止任意第三方 Promise。
 
 ## 上下文与历史
 
@@ -508,62 +519,155 @@ Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL
 
 `addSkill()` 只修改 configured sources。非运行状态下会立即使 Agent 回到未初始化；运行中添加只标记 dirty，当前 run 继续使用旧 snapshot。两种情况都必须在下一次运行前重新 `init()`，新 Skill 才会生效。父 Agent 的 Skill 和 runtime 配置不会自动传播给动态子代理。
 
-## Subagent v2 Core Runtime（C2–C5）
+## Subagent v2
 
-当前 workspace 版本为 `2.0.0`，包根已导出下列协议无关 contracts，供后续 Runtime 和独立 Executor 包实现：
+当前 checkout 的 `2.0.0` 源码已把 durable Runtime 接入公开 `Agent` loop，并删除迁移前的 `subAgents` 类数组和旧 model wire。Subagent 由三层组成：
 
-- 严格 JSON-safe 边界、duplicate-aware parser、RFC 8785/JCS canonical JSON、UTF-8 尺寸与 SHA-256。
-- `SubAgentDefinition`、Executor policy、显式 context projection、Artifact opaque reference 与固定 IO/projection/artifact limits。
-- `SubAgentExecutor`、版本化 binding codec、availability probe、create/resume/reconnect operation 和隐藏 binding 的 host handle。
-- task/result/error/approval/budget contracts，以及 exactly-once `ResultReceipt` / `CompletionReceipt`。
-- `AgentRuntimeStateStore`、run/task 独立 revision、lease/fencing、稳定 provenance checkpoint、Chat/Responses codec 和 migrator SPI。
-- `SubAgentChildRunner`、`ToolRuntimeContext`、`AgentRunOutcome`、安全 telemetry sink 与 `SubAgentRuntime` contract。
-- `ContextStore.exportCheckpoint()` / `ContextStore.restoreCheckpoint()`：使用稳定 raw/span/entry ID 保存并恢复 raw history、active projection、rolling summary 和 open loop，不依赖进程内对象引用。
-- 纯任务状态机：终态不可逆、首个合法 revision/fencing CAS 胜出、JCS result receipt、持久 completion receipt、严格 approval 过期边界、树级 budget 与安全事件序列。
-- `commitRuntimeStateMutation()`：用声明式 plan 在同一 StateStore transaction 中提交 root run、child task 与事件；事务 callback 不向调用者开放，内部只等待 transaction-local Store 操作。
-- `createStoredTaskIdempotently()`：在最终写入点执行 transaction-local 幂等 lookup/create，关闭并发 create 竞态。
-- `SubAgentDefinitionRegistry` 与 `SubAgentExecutorRegistry`：区分 active/recovery-only definition，`init()` 冻结 `supports()`，仅 `refreshCatalog()` 更新 availability revision；allowlist、capability 与 availability 取保守交集。
-- `createModelSubAgentToolDefinition()`：只在非空目录时生成模型工具，wire 精确为 `{ subAgent, executor, input }`，JSON schema 使用根 object 与 `oneOf`，空目录时返回 `null`。
-- `createSubAgentRuntime()`：同步构造、异步 `init()`，支持无 fallback 的显式 placement、run-scope 幂等 create、树级 limits/budget、typed result、standalone completion、后台 handle、session guard、审批 open-loop resume、Host-only retry、取消、事件 cursor 与精确版本恢复。
-- Executor control plane 使用 operation ID + payload hash 保存可重放 receipt；task execution epoch 持有固定 fencing token 的续租 lease，失租会中止本次执行。binding、child checkpoint、审批、进度、预算、事件和取消都在 durable CAS 边界内提交。
-- 完整 child checkpoint 保存 runner identity、协议 context、稳定 provenance `ContextStore`、模型迭代、整批待处理 calls 和 compact transaction；runner checkpoint 在 resume、Executor binding 在 resume/reconnect 的真实恢复路径执行 copy-on-write 迁移，失败不会覆盖原记录。
-- 内部 `AgentRunCheckpointController` 与 durable Tool batch planner 已实现根 run 长 lease、父 checkpoint + child task 原子 CAS、审批 open-loop 恢复、普通 Tool 串行 settle、同批 agent call 两阶段并发提交和 provider 顺序回填。这些是 C6 接入公开 `Agent` loop 的基础，不是一个单独的 npm API 入口。
+1. `SubAgentDefinition` 声明稳定 name/version、Zod input/output、Executor policy、context projection 和可选 delegation allowlist。
+2. `SubAgentRuntime` 绑定 owner session、definitions、Executors、StateStore、limits 与 telemetry，并生成当前可用 Catalog。
+3. 具体 Executor 在受信任 registry 中解析 definition version，创建一个全新的 child Agent；Core 不从模型输入动态加载类或模块。
 
-`ModelSubAgentRequest` 的公开字段精确为 `{ subAgent, executor, input }`。task/session/binding/retry/approval 等 host metadata 不属于模型 wire。`ArtifactReference` 也只包含版本、opaque ID、media type、大小和 SHA-256，不含路径、URL 或凭据。
+官方本地实现位于 [`@ruixutong.manee/maneeagent-executor-local`](../executor-local/README.md)。该包当前同样是 workspace 中的待发布 `2.0.0`，尚未出现在 npm registry；下面的安装命令面向两个 v2 包发布后。示例故意让 Responses 父 Agent 调度 Chat child，说明协议不是继承关系。
 
-官方 [`@ruixutong.manee/maneeagent-executor-local`](../executor-local/README.md) 已提供本地 Executor、Memory StateStore 与单机 Atomic File StateStore。Core 仍未把上述 controller 接入公开 `Agent` loop，也尚未删除 `AgentOptions.subAgents`；这两件事必须在 C6 原子切换。在此之前，下方说明仍对应当前可运行的迁移前 Agent loop，不是 v2 兼容层承诺。
-
-## 子代理（迁移前 Agent loop）
-
-子代理必须与父代理使用同一个协议规格。父代理通过内置 `agent` 工具按子代理类名调度子代理，子代理通过运行时注入的 `agent-result` 工具汇报结果。
+```bash
+npm install @ruixutong.manee/maneeagent-framework @ruixutong.manee/maneeagent-executor-local zod
+```
 
 ```ts
-class ReviewAgent extends Agent<OpenAIResponsesProtocol> {
-  static description = '审查文本质量并输出修改建议。';
+import {
+  Agent,
+  createSubAgentRuntime,
+  defineSubAgent,
+  type Model,
+  type OpenAIChatProtocol,
+  type OpenAIResponsesProtocol,
+} from '@ruixutong.manee/maneeagent-framework';
+import {
+  createLocalAgentRunnerRegistration,
+  LocalSubAgentRunnerRegistry,
+  MemoryAgentRuntimeStateStore,
+  MemorySubAgentExecutor,
+} from '@ruixutong.manee/maneeagent-executor-local';
+import { z } from 'zod';
 
-  @Tool({
-    name: 'score-writing',
-    description: '给文本质量打分。',
-    parameters: z.object({
-      text: z.string().min(1),
-    }),
-  })
-  #scoreWriting(parameters: unknown): Record<string, unknown> {
-    const { text } = parameters as { text: string };
-    return {
-      length: text.length,
-      score: 8,
-    };
-  }
-}
+declare const parentModel: Model<OpenAIResponsesProtocol>;
+declare const reviewerModel: Model<OpenAIChatProtocol>;
 
-const parent = new Agent<OpenAIResponsesProtocol>({
-  llm: model,
-  subAgents: [ReviewAgent],
+const reviewer = defineSubAgent({
+  name: 'reviewer',
+  version: '2.0.0',
+  description: '审查一段文本并返回 typed findings。',
+  inputSchema: z.object({ text: z.string().min(1) }).strict(),
+  outputSchema: z
+    .object({ verdict: z.enum(['pass', 'revise']), findings: z.array(z.string()) })
+    .strict(),
 });
 
-parent.init();
+const registry = new LocalSubAgentRunnerRegistry([
+  createLocalAgentRunnerRegistration({
+    definition: reviewer,
+    runnerId: 'reviewer-chat-agent',
+    runnerVersion: '2.0.0',
+    createAgent: () =>
+      new Agent<OpenAIChatProtocol>({
+        llm: reviewerModel,
+        maxIterations: 8,
+        systemPrompts: ['先调用 agent-result 提交 typed result，再单独调用 end-agent。'],
+      }),
+    buildInput: ({ input }) => `请审查：${input.text}`,
+  }),
+]);
+
+const stateStore = new MemoryAgentRuntimeStateStore();
+const runtime = createSubAgentRuntime({
+  sessionId: 'session-42',
+  activeDefinitions: [reviewer],
+  executors: [new MemorySubAgentExecutor({ name: 'local', registry })],
+  stateStore,
+});
+
+await runtime.init();
+
+const parent = new Agent<OpenAIResponsesProtocol>({
+  llm: parentModel,
+  sessionId: 'session-42',
+  subAgentRuntime: runtime,
+  maxIterations: 8,
+}).init();
+
+const outcome = await parent.agent('请调用 reviewer 审查这段文本。');
 ```
+
+`createSubAgentRuntime()` 是同步构造；`await runtime.init()` 才会校验 Catalog、Executor `supports()`、binding/checkpoint codec 和 migrator。同步 `Agent.init()` 只接受 ready Runtime，并要求 `Agent.sessionId === runtime.sessionId`。`refreshCatalog()` 显式更新 availability revision；已初始化 Agent 会在下一次模型请求边界按新 revision 重建模型可见 schema，不会在一次 provider response 的处理中途换表，也不会静默 fallback 到另一个 Executor。
+
+### 模型如何选择 Subagent 与 Executor
+
+模型只看到 `{ subAgent, executor, input }`。Core 将有效 definition、definition allowlist、Executor capability、`supports()` 和 availability 做保守交集，并用根 object + `oneOf` 生成动态 schema：
+
+```json
+{
+  "subAgent": "reviewer",
+  "executor": "local",
+  "input": { "text": "..." }
+}
+```
+
+taskId、session、binding、recoveryData、retryOf、权限和审批数据不会进入模型 wire。Catalog 为空时，`agent` Tool 完全不出现。模型显式选择不支持的组合会确定失败，不会降级或重路由。
+
+父批次先把普通 Tool 串行 settle 并持久化，再并发提交同批 `agent` calls；child 完成顺序可以不同，但结果始终按 provider call 顺序回填。`end-agent` 必须单独成批。child 使用独立 Agent/context，通过 typed `agent-result` 提交 output schema 候选，再单独调用 `end-agent`；result receipt、completion receipt 和 terminal CAS 都是 authoritative，Executor 的 raw return 不能覆盖持久结果。
+
+### 生命周期与审批恢复
+
+`agent()` 和 `resumeRun()` 返回四类 outcome：
+
+- `succeeded`：包含 `sessionId`、`runId` 和 active `context`。
+- `waiting_approval`：包含 `checkpointRevision` 和一个或多个 leaf `approvals`；handler 尚未执行。
+- `cancelled` / `failed`：包含稳定 error descriptor 与当前 active `context`。
+
+配置、未初始化、错误 session、并发调用、无效 resume 和 `stream: true` 等编程/能力错误仍会抛异常。导致 run 无法继续的 Model/runtime error 会触发 `onAgentError`，并由 `agent()` / `resumeRun()` 返回 `failed` outcome，而不是把 provider/runtime error 直接抛给调用方；单个 Tool call 的错误仍按工具事件与工具结果语义处理。一个实例有待审批 run 时不能启动新 run；可在原实例或使用相同 session、Runtime 与 durable configuration identity 的新实例上提交 decisions：
+
+```ts
+if (outcome.status === 'waiting_approval') {
+  const resumed = await parent.resumeRun({
+    runId: outcome.runId,
+    decisions: outcome.approvals.map((approval) => ({
+      approvalId: approval.approvalId,
+      expectedRevision: approval.revision,
+      decision: 'approved' as const,
+    })),
+  });
+  console.log(resumed.status);
+}
+```
+
+Child Tool 的 approval summary 来自受信任工具配置，不能拼接模型参数。Core 在 handler 前保存完整 call checkpoint；只有原子提交的 `approved` decision 才会执行 handler。`now < expiresAt` 才有效，边界及之后原子过期。嵌套 Subagent 通过 definition 的 `delegation` allowlist 获得 task-scoped Catalog；多个 leaf approvals 会和父 checkpoint 原子关联，允许分批 decision，并沿原 task identity 恢复：
+
+```ts
+const coordinator = defineSubAgent({
+  name: 'coordinator',
+  version: '2.0.0',
+  description: 'Delegate selected checks.',
+  inputSchema: z.object({ request: z.string() }).strict(),
+  outputSchema: z.object({ result: z.string() }).strict(),
+  delegation: { mode: 'allowlist', definitions: ['reviewer'] },
+});
+```
+
+父 Agent 的 Model、Tools、Skills、system prompts、context compact、错误恢复与上下文不会隐式传播。每个 Executor factory 必须显式构造 child 并映射 definition input；context 共享只能通过受限制的 `contextProjector` 输出 text/data/artifact 项。根 run 会持久化 `maxIterations`、初始化后的 configuration hash 和 `runtime.limits`；恢复时三者必须与当前 Agent/Runtime 精确匹配。hash 覆盖协议 codec、system prompts、Tools、Skills/`skillRuntime`、compact 与 recovery 语义，但不固定 provider client 或模型部署名称，替换后者的兼容性由宿主负责。
+
+### Runtime 程序化入口与恢复边界
+
+宿主也可直接使用 `runtime.execute()` / `spawn()`，以及 session-guarded handle 的 `wait()`、`cancel()`、`snapshot()`、`events()`。对父 checkpoint 已关联的 task，`runtime.recover()` 是首选 reconcile 入口：它会按 authoritative state 复用 terminal、等待 resident execution、应用审批、采用 lease 已过期的 checkpoint，或转交 external reconnect，绝不创建替代 task。`resume()` 是显式审批/checkpoint 控制，`reconnect()` 只适用于声明 external binding 的 Executor。Host retry 通过新的 `execute({ retryOf })` 创建新 task，只允许引用同 definition version 的非成功终态；原 task 不会被重开。
+
+`runtime.stageTool()` 是供公开 `Agent` loop 使用的 host-only 原子关联 SPI，不属于模型 wire。它先生成稳定 task identity 与可选 create mutation；父 pending call 与新 child task 在同一 StateStore transaction 成功后，Agent 才调用 staged `dispatch()`。崩溃发生在提交前时 task 不可见，发生在提交后/dispatch 前时恢复进程沿原 run/task/call/request identity 补 dispatch，不会另建 task。
+
+Core 使用 RFC 8785/JCS hash、run/task 独立 revision、lease/fencing、operation receipt 和不可逆 terminal state。完整 checkpoint 包含 Chat/Responses 协议 context、稳定 provenance ContextStore、模型迭代、待处理整批 calls 和 compact transaction；summary 与 tool-payload compact 的 prepared、in-flight、result-ready 崩溃窗口都可恢复。caller 取消 root run 时，root 与所有非终态 descendants 会先在同一 fenced StateStore transaction 中原子进入 `cancelled`，提交成功后才 best-effort 通知具体 Executor 清理 placement；task CAS 竞争会整批回滚、重载并重算，未确认的 adapter cleanup 可以用相同 `operationId` 幂等重放。durable provider operation 在 SDK dispatch 前取消会得到 `cancelled`；intent 已持久化为 `in_flight` 后发生 abort、超时或连接结果不确定时，原 task/run 进入 `failed + outcomeUnknown`，即使取消同时到达也不会覆盖该状态，更不会自动重发真实请求。明确收到的 HTTP 4xx/5xx provider rejection 则可清除 in-flight intent，并进入配置的 model-error recovery。
+
+`runtime.limits` 是初始化后可读的冻结 resolved snapshot，默认 `maxDepth=3`、`maxDescendants=32`、`maxConcurrent=4`、`maxTurns=16`、`timeoutMs=120000`；`maxProviderCalls`、input/output token 与 cost 上限默认不启用。该 snapshot 会持久化到 root run 并由所有 descendant task 继承，恢复时不允许漂移。`maxProviderCalls` 使用同一树级持久 ledger：root 普通请求、`context-summary` 与 child 请求都在 SDK dispatch 前按 operation ID 原子、幂等地预留一次；达到上限时不调用 provider。
+
+Chat/Responses 内置版本化 codec。自定义协议没有 codec 时只能使用宿主实现、Catalog 明确声明 `same_process` 的内存 placement：原 Agent 实例可以保留进程内 identity 并恢复根审批，终态后会释放这些 identity；替换 Agent、跨进程恢复，以及无 codec child 自身产生的 durable 审批仍不支持。Agent 会在每个模型请求边界以及创建 child task 前重新校验当前 effective Catalog；刷新后只要出现 `checkpoint` resume 或 `external_binding` reconnect，就会以 `RECOVERY_UNSUPPORTED` 阻止下一次 provider dispatch 或 task stage。官方 `MemorySubAgentExecutor` 声明的是 `checkpoint` recovery，需要可重建 registry 和持久 StateStore，并不提供这条无 codec `same_process` 路径；它也不支持 external reconnect。远程 placement 只是 child execution location，不转移根 Agent、run、会话或对话所有权，也不实现 handoff。
+
+`ArtifactReference` 只包含版本、opaque ID、media type、大小和 SHA-256，不含路径、URL 或凭据。默认 input/output 各 256 KiB，projection 最多 32 项、单项 64 KiB、合计 128 KiB；默认单 artifact 32 MiB、每 task 8 件/128 MiB。StateStore transaction 内只允许等待 Store 操作，禁止调用 Model、Tool、Executor 或外部网络。
 
 ## Responses API
 
@@ -689,16 +793,18 @@ class MyModel extends Model<MyProtocol> {
 
 ## 生命周期与错误处理
 
-- 调用 `agent()` 或 `toolCall()` 前必须先执行 `init()`；修改 `tools` 或 `subAgents` 后需要重新执行。
-- `agent(input)` 会先把输入构建为 user message，再进入循环。
-- Agent 默认不设置迭代次数上限；真实模型场景建议通过 `maxIterations` 设置保护，达到上限时会抛错并进入 `failed`。
+- 调用 `agent()` 或 `toolCall()` 前必须先执行 `init()`；修改 Tools、system prompts、Skills/`skillRuntime`、context compact 或模型错误恢复等运行语义配置后需要重新执行。配置了 `subAgentRuntime` 时，必须先 `await runtime.init()`。
+- `agent(input)` 会先把输入构建为 user message，再进入循环，并返回 `AgentRunOutcome`，而不是直接返回 context。
+- Agent 默认不设置迭代次数上限；真实模型场景建议通过 `maxIterations` 设置保护，达到上限时 run 返回 `failed` outcome。
 - 内置 `end-agent` 是唯一正常结束条件，模型应在单独一轮中调用；loop 会等它的结果、listener 和 compact 全部成功后再提交 `ended`。
 - 成功响应但没有消息时会额外重试 3 次，即总计最多 4 次响应尝试。
 - 未识别或没有匹配 handler 的模型异常默认额外重试 3 次；设置 `modelErrorRecovery: { unhandledRetryLimit: 0 }` 可恢复旧的立即抛错行为。
 - 配置 summary 后，`context_length_exceeded` 默认由 `core.context_compaction` handler 最多实际执行 2 次；没有 summary 时按普通未知异常处理。
 - 并发调用第二个 `agent()` 会抛出 `Agent is already running.`，但不会把正在运行的任务标记为失败。
-- `stream=true` 当前不支持，会抛出错误。
-- 父代理和子代理必须使用同一个 `AgentProtocol`；每次调度都会创建新的子代理实例和独立上下文。
+- `agent(input, { stream: true })` 当前不支持，会在创建 run/task 前抛出 `STREAMING_UNSUPPORTED`。
+- 父子 Agent 可以使用不同 `AgentProtocol`；每次新执行或 checkpoint 重建都由 Executor factory 提供独立 child 实例和显式配置。
+- 同一实例存在 `waiting_approval` run 时，必须先用对应 `runId` 调用 `resumeRun()`，不能启动另一个 run。
+- root execution lease 被 takeover 时，旧 owner 返回带 `RECOVERY_TARGET_LOST` 的 `failed` outcome，但不会取消 descendants 或写 terminal；新 owner 依据持久 checkpoint 决定继续、apply 或以 `outcomeUnknown` 安全失败。
 
 ### 模型错误恢复
 
@@ -756,13 +862,15 @@ agent.onAfterModelErrorRecovery((event) => {
 | after  | `retry`    | 无视默认额度，强制重试                                |
 | after  | `stop`     | 立即停止                                              |
 
-before/after hook 或 classifier 抛错会立即终止并包装；handler 失败仍进入 after，允许 after 选择重试。发生过恢复活动后仍无法继续时会抛出 `ModelErrorRecoveryError`，其中保留 initial/terminal cause、最终 descriptor/reason、ledger、stage failures，以及最近 64 条 decision trace 和丢弃数量。若第一次失败没有发生重试、handler 或 hook 控制，则继续原样抛出 provider error。
+before/after hook 或 classifier 抛错会让恢复引擎立即终止并包装；handler 失败仍进入 after，允许 after 选择重试。发生过恢复活动后仍无法继续时，引擎把包含 initial/terminal cause、最终 descriptor/reason、ledger、stage failures，以及最近 64 条 decision trace 的 `ModelErrorRecoveryError` 交回 Agent loop；若第一次失败没有发生恢复活动，则交回原 provider error。公开 `agent()` / `resumeRun()` 会通过 `onAgentError` 暴露该错误并返回 `failed` outcome，不会把这两类运行期错误直接抛给调用方。
 
-`retry` / `continue` 属于 forced retry，没有框架硬上限。hook 如果持续返回它们，可能造成无限模型请求和费用；生产环境应结合 event ledger、外部取消信号、超时或自有预算明确终止。
+`retry` / `continue` 属于 forced retry，恢复策略本身没有独立硬上限。配置 `SubAgentRuntime.limits.maxProviderCalls` 时，共享树级 ledger 仍会在 SDK dispatch 前阻断超额请求；未配置时，hook 持续返回 forced retry 可能造成无限模型请求和费用，生产环境应结合 event ledger、外部取消信号、超时或自有预算明确终止。
 
 离线参考实现见仓库中的 [Chat 工具 payload compact](../../demo/src/context-compact-chat.ts) 和 [Responses 摘要 compact](../../demo/src/context-compact-responses.ts)。
 
 ## 发布内容
+
+当前 checkout 只生成待发布的 `2.0.0` 包内容；`npm pack --dry-run` 验证文件与入口，不等同于执行 `npm publish`。
 
 包根目录只公开 `.` 入口：
 

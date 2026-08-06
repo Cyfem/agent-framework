@@ -321,6 +321,16 @@ export function createExecutorConformanceControl(
         completedAt: 1_000 + receiptRevision,
         status: 'completed',
       }),
+      fail: async (_callId, failure) => ({
+        status: failure.status,
+        task: {
+          taskId: options.taskId,
+          subAgent: { name: 'executor-conformance', version: '1' },
+        },
+        executor: 'executor-conformance',
+        error: failure.error,
+        ...(failure.partialOutput === undefined ? {} : { partialOutput: failure.partialOutput }),
+      }),
     },
     commitBinding: async (_operationId, binding) => {
       bindings.push(structuredClone(binding));
@@ -328,10 +338,18 @@ export function createExecutorConformanceControl(
     commitCheckpoint: async (_operationId, checkpoint) => {
       checkpoints.push(structuredClone(checkpoint));
     },
-    authorizeTool: async (_operationId, input): Promise<ApprovalDirective> => {
+    authorizeTool: async (_operationId, input, checkpoint): Promise<ApprovalDirective> => {
       approvalInputs.push(structuredClone(input));
       const approvalId = `approval:${options.taskId}:${input.callId}`;
-      if (options.approval === 'approved') return { type: 'approved', approvalId };
+      if (options.approval === 'approved') {
+        checkpoints.push(structuredClone(checkpoint));
+        return { type: 'approved', approvalId };
+      }
+      checkpoints.push(
+        structuredClone(
+          createWaitingApprovalCheckpoint(checkpoint, input.callId, input.toolName, approvalId),
+        ),
+      );
       return {
         type: 'suspend',
         request: {
@@ -344,6 +362,9 @@ export function createExecutorConformanceControl(
         },
         checkpointRevision: 1,
       };
+    },
+    pauseDelegation: async () => {
+      throw new Error('Delegation pause is outside the Executor conformance scenario.');
     },
     reportProgress: async (_operationId, update) => {
       progress.push(structuredClone(update));
@@ -370,13 +391,54 @@ export function createExecutorConformanceControl(
   });
 }
 
+function createWaitingApprovalCheckpoint(
+  checkpoint: SubAgentChildCheckpoint,
+  callId: string,
+  toolName: string,
+  approvalId: string,
+): SubAgentChildCheckpoint {
+  const pendingBatch = checkpoint.pendingBatch;
+  assert.ok(pendingBatch, 'approval conformance requires a pending child Tool batch');
+  const matches = pendingBatch.calls.filter(
+    (call) => call.callId === callId && call.kind === 'tool' && call.name === toolName,
+  );
+  assert.equal(matches.length, 1, 'approval conformance requires one exact pending Tool call');
+  assert.equal(
+    matches[0]!.status,
+    'in_flight',
+    'the first approval request must suspend an in-flight Tool call',
+  );
+  return Object.freeze({
+    ...structuredClone(checkpoint),
+    pendingBatch: Object.freeze({
+      ...structuredClone(pendingBatch),
+      calls: Object.freeze(
+        pendingBatch.calls.map((call) =>
+          call.callId === callId
+            ? Object.freeze({
+                ...structuredClone(call),
+                status: 'waiting_approval' as const,
+                approvals: Object.freeze([approvalId]),
+              })
+            : Object.freeze(structuredClone(call)),
+        ),
+      ),
+    }),
+  });
+}
+
 export function createExecutorConformanceChildCheckpoint(options: {
   readonly runnerId: string;
   readonly runnerVersion: string;
   readonly codec?: AgentProtocolCheckpointCodec;
+  readonly approvalCallId?: string;
+  readonly approvalToolName?: string;
 }): SubAgentChildCheckpoint {
   const protocol = options.codec?.protocol ?? 'openai-chat';
   const codecVersion = options.codec?.version ?? '1';
+  const callId = options.approvalCallId ?? 'conformance-sensitive-call';
+  const toolName = options.approvalToolName ?? 'conformance-sensitive-tool';
+  const input = Object.freeze({});
   return Object.freeze({
     version: '1',
     runnerId: options.runnerId,
@@ -395,6 +457,26 @@ export function createExecutorConformanceChildCheckpoint(options: {
     },
     modelIteration: 1,
     maxIterations: 4,
+    pendingBatch: {
+      version: '1' as const,
+      batchId: `conformance-approval:${callId}`,
+      assistantMessage: { protocol, codecVersion, value: [] },
+      calls: Object.freeze([
+        {
+          version: '1' as const,
+          operationId: `conformance-approval-operation:${callId}`,
+          kind: 'tool' as const,
+          callId,
+          name: toolName,
+          input,
+          inputHash: canonicalJsonSha256(input),
+          status: 'in_flight' as const,
+          order: 0,
+        },
+      ]),
+      endRequested: false,
+      createdAt: 1,
+    },
   });
 }
 
@@ -556,5 +638,6 @@ function createUnavailableDelegationClient(): SubAgentDelegationClient {
     dispatchTool: unavailable,
     execute: unavailable,
     spawn: unavailable,
+    resumeTool: unavailable,
   });
 }

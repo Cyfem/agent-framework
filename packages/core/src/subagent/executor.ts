@@ -1,4 +1,9 @@
-import type { ApprovalDecision, ApprovalDirective, ApprovalRequestInput } from './approval';
+import type {
+  ApprovalDecision,
+  ApprovalDirective,
+  ApprovalRequest,
+  ApprovalRequestInput,
+} from './approval';
 import type { SubAgentArtifactClient } from './artifact';
 import type { ExecutorAvailabilityProbe, SubAgentExecutorDescriptor } from './catalog';
 import type { SubAgentChildCheckpoint } from './checkpoint';
@@ -9,7 +14,9 @@ import type {
   CompletionReceipt,
   ResultReceipt,
   SubAgentExecutionOutcome,
+  SubAgentFailureInput,
   SubAgentProgress,
+  SubAgentTaskResult,
   SubAgentTaskState,
   SubAgentUsageDelta,
 } from './result';
@@ -114,6 +121,25 @@ export interface SubAgentExecutionRequest<I extends JsonValue = JsonValue> {
 export interface SubAgentCompletionController {
   submitResult(callId: string, candidate: JsonValue): Promise<ResultReceipt>;
   complete(callId: string, proof: { readonly isStandalone: boolean }): Promise<CompletionReceipt>;
+  /** Persist an authoritative failure; raw Executor outcomes can never substitute for this CAS. */
+  fail(callId: string, failure: SubAgentFailureInput): Promise<SubAgentTaskResult>;
+}
+
+export interface SubAgentDelegationPauseCall {
+  readonly callId: string;
+  readonly childTaskId: string;
+  readonly approvals: readonly ApprovalRequest[];
+}
+
+export interface SubAgentDelegationPauseInput {
+  readonly checkpoint: SubAgentChildCheckpoint;
+  /** Every paused nested call in the provider batch, in provider order. */
+  readonly calls: readonly SubAgentDelegationPauseCall[];
+}
+
+export interface SubAgentDelegationPauseReceipt {
+  readonly checkpointRevision: number;
+  readonly approvals: readonly ApprovalRequest[];
 }
 
 /** Task-scoped capabilities exposed to a trusted child runner. */
@@ -125,7 +151,16 @@ export interface SubAgentExecutionControl {
   readonly completion: SubAgentCompletionController;
   commitBinding(operationId: string, binding: SubAgentExecutorBinding): Promise<void>;
   commitCheckpoint(operationId: string, checkpoint: SubAgentChildCheckpoint): Promise<void>;
-  authorizeTool(operationId: string, request: ApprovalRequestInput): Promise<ApprovalDirective>;
+  authorizeTool(
+    operationId: string,
+    request: ApprovalRequestInput,
+    checkpoint: SubAgentChildCheckpoint,
+  ): Promise<ApprovalDirective>;
+  /** Atomically suspend this parent task on one or more durable leaf approvals. */
+  pauseDelegation(
+    operationId: string,
+    input: SubAgentDelegationPauseInput,
+  ): Promise<SubAgentDelegationPauseReceipt>;
   reportProgress(operationId: string, update: SubAgentProgress): Promise<void>;
   consumeBudget(operationId: string, delta: SubAgentUsageDelta): Promise<void>;
   emit(operationId: string, event: ExecutorEventInput): Promise<void>;
@@ -166,7 +201,13 @@ export interface SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<ExecutorTaskHandle>;
-  /** Binding-addressed cancellation remains available after the originating process loses a raw handle. */
+  /**
+   * Binding-addressed cancellation remains available after the originating process loses a raw
+   * handle. Implementations must make `operationId` idempotent: replaying the same operation and
+   * payload has the same result, while a conflicting payload must use the adapter's stable
+   * idempotency-conflict semantics. Core cleanup is best-effort and may replay an operation after
+   * an unavailable adapter, a failure, or an ambiguous acknowledgement.
+   */
   cancel(
     binding: SubAgentExecutorBinding,
     options: {

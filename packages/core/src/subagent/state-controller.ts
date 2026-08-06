@@ -6,12 +6,14 @@ import {
   type SubAgentErrorCode,
 } from './errors';
 import { isTerminalSubAgentTaskState, assertSubAgentTaskTransition } from './state-machine';
+import { resolveSubAgentLimits } from './limits';
 import type {
   AgentRuntimeStateStore,
   CreateStoredTaskResult,
   StateLease,
   StoredAgentRun,
   StoredAgentRunStatus,
+  StoredModelOperationV1,
   StoredTask,
 } from './state-store';
 import type { SubAgentTaskEvent } from './telemetry';
@@ -24,11 +26,24 @@ export interface RuntimeRunMutation {
   readonly next: StoredAgentRun;
 }
 
-export interface RuntimeTaskMutation {
+export interface RuntimeTaskUpdateMutation {
   readonly previous: StoredTask;
   readonly next: StoredTask;
   readonly events?: readonly SubAgentTaskEvent[];
 }
+
+/**
+ * A task identity staged outside persistence and created in the same transaction as its parent's
+ * pending-call checkpoint. `create` is the clean revision-zero record; `next` is the first queued
+ * revision including its durable `task.queued` event.
+ */
+export interface RuntimeTaskCreateMutation {
+  readonly create: StoredTask;
+  readonly next: StoredTask;
+  readonly events?: readonly SubAgentTaskEvent[];
+}
+
+export type RuntimeTaskMutation = RuntimeTaskUpdateMutation | RuntimeTaskCreateMutation;
 
 /**
  * A declarative state transaction. Callers provide records, never a transaction callback, so the
@@ -100,6 +115,24 @@ function assertActiveFence(nextFence: string, lease: StateLease, resource: strin
   }
 }
 
+function assertResolvedLimitsSnapshot(
+  limits: StoredAgentRun['limits'] | StoredTask['limits'],
+  resource: string,
+): void {
+  let resolvedLimits: ReturnType<typeof resolveSubAgentLimits>;
+  try {
+    resolvedLimits = resolveSubAgentLimits(limits);
+  } catch {
+    throw runtimeError('INVALID_STATE_TRANSITION', `${resource} has invalid limits.`);
+  }
+  if (!isDeepStrictEqual(resolvedLimits, limits)) {
+    throw runtimeError(
+      'INVALID_STATE_TRANSITION',
+      `${resource} must persist a complete resolved limits snapshot.`,
+    );
+  }
+}
+
 function assertRunMutation(
   ownerSessionId: string,
   lease: StateLease,
@@ -111,13 +144,15 @@ function assertRunMutation(
   if (
     previous.recordVersion !== next.recordVersion ||
     previous.runId !== next.runId ||
-    previous.createdAt !== next.createdAt
+    previous.createdAt !== next.createdAt ||
+    !isDeepStrictEqual(previous.limits, next.limits)
   ) {
     throw runtimeError(
       'INVALID_STATE_TRANSITION',
       'A runtime run mutation cannot change immutable run identity.',
     );
   }
+  assertResolvedLimitsSnapshot(previous.limits, 'Runtime run');
   assertRevisionStep(previous.revision, next.revision, 'Runtime run');
   assertActiveFence(next.fencingToken, lease, 'Runtime run');
   if (next.updatedAt < previous.updatedAt) {
@@ -125,6 +160,49 @@ function assertRunMutation(
   }
   if (TERMINAL_RUN_STATUSES.has(previous.status)) {
     throw runtimeError('INVALID_STATE_TRANSITION', 'A terminal runtime run is immutable.');
+  }
+  assertModelOperationTransition(previous.modelOperation, next.modelOperation, next.status);
+}
+
+function assertModelOperationTransition(
+  previous: StoredModelOperationV1 | undefined,
+  next: StoredModelOperationV1 | undefined,
+  nextRunStatus: StoredAgentRunStatus,
+): void {
+  if (isDeepStrictEqual(previous, next)) return;
+  const validPhaseStep =
+    (previous === undefined && next?.phase === 'prepared') ||
+    (previous?.phase === 'prepared' && next?.phase === 'in_flight') ||
+    (previous?.phase === 'in_flight' && next?.phase === 'result_ready') ||
+    (previous?.phase === 'result_ready' && next === undefined) ||
+    // The Model adapter may clear an in-flight operation only after classifying an explicit
+    // provider rejection; the AgentRun controller owns that oracle before this generic CAS.
+    (previous?.phase === 'in_flight' && next === undefined) ||
+    // Any non-success terminalization clears resumable work atomically.
+    (previous !== undefined &&
+      next === undefined &&
+      (nextRunStatus === 'failed' || nextRunStatus === 'cancelled'));
+  if (!validPhaseStep) {
+    throw runtimeError(
+      'INVALID_STATE_TRANSITION',
+      'A Model operation must advance through its durable phases or an explicit terminal/rejection settle.',
+    );
+  }
+  if (
+    previous !== undefined &&
+    next !== undefined &&
+    (previous.version !== next.version ||
+      previous.operationId !== next.operationId ||
+      previous.iteration !== next.iteration ||
+      previous.purpose !== next.purpose ||
+      previous.requestHash !== next.requestHash ||
+      previous.preparedAt !== next.preparedAt ||
+      next.updatedAt < previous.updatedAt)
+  ) {
+    throw runtimeError(
+      'INVALID_STATE_TRANSITION',
+      'A Model operation transition cannot change its durable identity or request hash.',
+    );
   }
 }
 
@@ -148,6 +226,7 @@ function assertTaskImmutableIdentity(previous: StoredTask, next: StoredTask): vo
     previous.inputHash === next.inputHash &&
     equalOptional(previous.input, next.input) &&
     equalOptional(previous.projectedContext, next.projectedContext) &&
+    equalOptional(previous.limits, next.limits) &&
     equalOptional(previous.path, next.path) &&
     previous.depth === next.depth &&
     previous.retryOf === next.retryOf &&
@@ -210,7 +289,7 @@ function assertTaskEvents(
 function assertTaskMutation(
   ownerSessionId: string,
   lease: StateLease,
-  mutation: RuntimeTaskMutation,
+  mutation: RuntimeTaskUpdateMutation,
 ): void {
   const { previous, next } = mutation;
   const events = mutation.events ?? [];
@@ -231,6 +310,34 @@ function assertTaskMutation(
   assertTaskEvents(ownerSessionId, previous, next, events);
 }
 
+function assertTaskCreateMutation(
+  ownerSessionId: string,
+  lease: StateLease,
+  mutation: RuntimeTaskCreateMutation,
+): void {
+  const { create, next } = mutation;
+  const events = mutation.events ?? [];
+  assertInitialTaskRecord(ownerSessionId, lease, create);
+  assertOwnerSession(next.ownerSessionId, ownerSessionId);
+  assertTaskImmutableIdentity(create, next);
+  assertRevisionStep(create.revision, next.revision, 'New runtime task');
+  assertActiveFence(next.fencingToken, lease, 'New runtime task');
+  if (next.updatedAt < create.updatedAt) {
+    throw runtimeError(
+      'INVALID_STATE_TRANSITION',
+      'New runtime task updatedAt cannot move backwards.',
+    );
+  }
+  if (create.state !== next.state) assertSubAgentTaskTransition(create.state, next.state);
+  assertTaskEvents(ownerSessionId, create, next, events);
+}
+
+function isTaskCreateMutation(
+  mutation: RuntimeTaskMutation,
+): mutation is RuntimeTaskCreateMutation {
+  return 'create' in mutation;
+}
+
 function assertMutationPlan(
   ownerSessionId: string,
   lease: StateLease,
@@ -247,8 +354,12 @@ function assertMutationPlan(
 
   const taskIds = new Set<string>();
   let runId = mutation.run?.next.runId;
+  let createdTaskCount = 0;
   for (const task of tasks) {
-    assertTaskMutation(ownerSessionId, lease, task);
+    if (isTaskCreateMutation(task)) {
+      assertTaskCreateMutation(ownerSessionId, lease, task);
+      createdTaskCount += 1;
+    } else assertTaskMutation(ownerSessionId, lease, task);
     if (taskIds.has(task.next.taskId)) {
       throw new TypeError('A runtime state mutation cannot update the same task twice.');
     }
@@ -259,6 +370,42 @@ function assertMutationPlan(
         'INVALID_STATE_TRANSITION',
         'One runtime state mutation cannot span multiple root runs.',
       );
+    }
+    if (
+      mutation.run !== undefined &&
+      !isDeepStrictEqual(task.next.limits, mutation.run.next.limits)
+    ) {
+      throw runtimeError(
+        'CHECKPOINT_VERSION_MISMATCH',
+        'A runtime task and its root run must share the same resolved limits snapshot.',
+      );
+    }
+  }
+  if (createdTaskCount > 0) {
+    const runMutation = mutation.run;
+    if (runMutation === undefined) {
+      throw runtimeError(
+        'INVALID_STATE_TRANSITION',
+        'A staged task create must commit with its root run checkpoint and budget.',
+      );
+    }
+    if (
+      runMutation.next.budget.descendantsCreated !==
+        runMutation.previous.budget.descendantsCreated + createdTaskCount ||
+      runMutation.next.budget.activeExecutions !== runMutation.previous.budget.activeExecutions
+    ) {
+      throw runtimeError(
+        'INVALID_STATE_TRANSITION',
+        'A staged task create must reserve exactly one descendant and no execution slot.',
+      );
+    }
+    for (const task of tasks) {
+      if (
+        isTaskCreateMutation(task) &&
+        runMutation.next.budget.descendantsCreated > task.next.limits.maxDescendants
+      ) {
+        throw runtimeError('LIMIT_EXCEEDED', 'The staged task exceeds maxDescendants.');
+      }
     }
   }
   return tasks;
@@ -293,10 +440,23 @@ export async function commitRuntimeStateMutation(
     }
 
     for (const task of tasks) {
-      const { previous, next } = task;
-      const current = await transaction.loadTask(previous.taskId);
-      if (current === undefined) throw createResourceNotFoundError();
-      if (!isDeepStrictEqual(current, previous)) throw createCasConflictError('task');
+      const previous = isTaskCreateMutation(task) ? task.create : task.previous;
+      const { next } = task;
+      if (isTaskCreateMutation(task)) {
+        const existing = await transaction.findTaskByIdempotencyKey(
+          task.create.runId,
+          task.create.requestId,
+        );
+        if (existing !== undefined) throw createCasConflictError('task');
+        const created = await transaction.createTask(task.create);
+        if (created.status !== 'created' || !isDeepStrictEqual(created.task, task.create)) {
+          throw createCasConflictError('task');
+        }
+      } else {
+        const current = await transaction.loadTask(previous.taskId);
+        if (current === undefined) throw createResourceNotFoundError();
+        if (!isDeepStrictEqual(current, previous)) throw createCasConflictError('task');
+      }
       const committed = await transaction.compareAndSetTask(
         previous.taskId,
         previous.revision,
@@ -335,6 +495,7 @@ function assertInitialTaskRecord(
 ): void {
   assertOwnerSession(record.ownerSessionId, ownerSessionId);
   assertActiveFence(record.fencingToken, lease, 'New runtime task');
+  assertResolvedLimitsSnapshot(record.limits, 'A new runtime task');
   const hasIllegalInitialState =
     record.binding !== undefined ||
     record.resultReceipt !== undefined ||
@@ -351,6 +512,7 @@ function assertInitialTaskRecord(
     record.executionFencingToken !== undefined ||
     record.executorOperation !== undefined ||
     record.childCheckpoint !== undefined ||
+    record.delegationPause !== undefined ||
     record.attempt !== 1 ||
     record.terminalAt !== undefined ||
     record.activeStartedAt !== undefined ||

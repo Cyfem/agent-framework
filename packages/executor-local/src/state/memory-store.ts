@@ -19,6 +19,7 @@ import {
   findIdempotentTask,
   findSubagentSessionTask,
   insertRun,
+  listTasksByRun,
   readRun,
   readTask,
   readTaskEvents,
@@ -80,6 +81,10 @@ export class MemoryAgentRuntimeStateStore implements AgentRuntimeStateStore {
 
   async loadTask(ownerSessionId: string, taskId: string): Promise<StoredTask | undefined> {
     return readTask(this.#getSession(ownerSessionId), taskId);
+  }
+
+  async listTasksByRun(ownerSessionId: string, runId: string): Promise<readonly StoredTask[]> {
+    return listTasksByRun(this.#getSession(ownerSessionId), runId);
   }
 
   async findTaskByIdempotencyKey(

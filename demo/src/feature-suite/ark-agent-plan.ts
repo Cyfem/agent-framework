@@ -7,6 +7,7 @@
  */
 import {
   Agent,
+  defineSubAgent,
   OpenAIChatModel,
   OpenAIResponsesModel,
   Tool,
@@ -22,6 +23,9 @@ import {
   type ToolPayloadCompactInfo,
 } from '@manee/agent-framework';
 import { z } from 'zod';
+
+import { requireSucceededContext } from '../run-outcome';
+import { createDemoLocalSubAgentRuntime } from '../local-subagent-runtime';
 
 import {
   assertFeature,
@@ -243,9 +247,6 @@ class ResponsesFeatureAgent extends Agent<OpenAIResponsesProtocol> {
 }
 
 class ChatFeatureVerifierAgent extends Agent<OpenAIChatProtocol> {
-  static override name = 'chat-feature-verifier';
-  static override description = 'Verifies nested Chat sub-agent dispatch and result reporting.';
-
   constructor(options: AgentOptions<OpenAIChatProtocol>) {
     super({
       ...options,
@@ -273,10 +274,6 @@ class ChatFeatureVerifierAgent extends Agent<OpenAIChatProtocol> {
 }
 
 class ResponsesFeatureVerifierAgent extends Agent<OpenAIResponsesProtocol> {
-  static override name = 'responses-feature-verifier';
-  static override description =
-    'Verifies nested Responses sub-agent dispatch and result reporting.';
-
   constructor(options: AgentOptions<OpenAIResponsesProtocol>) {
     super({
       ...options,
@@ -303,6 +300,32 @@ class ResponsesFeatureVerifierAgent extends Agent<OpenAIResponsesProtocol> {
   }
 }
 
+const chatFeatureVerifierDefinition = defineSubAgent({
+  name: 'chat-feature-verifier',
+  version: '2.0.0',
+  description: 'Build the exact Chat feature-suite proof marker in an isolated local Agent.',
+  inputSchema: z.object({
+    label: z.string().min(1),
+    numbers: z.array(z.number()).min(1),
+  }),
+  outputSchema: z.string().min(1),
+  executorPolicy: { allowedNames: ['local-chat'] },
+  delegation: { mode: 'none' },
+});
+
+const responsesFeatureVerifierDefinition = defineSubAgent({
+  name: 'responses-feature-verifier',
+  version: '2.0.0',
+  description: 'Build the exact Responses feature-suite proof marker in an isolated local Agent.',
+  inputSchema: z.object({
+    label: z.string().min(1),
+    numbers: z.array(z.number()).min(1),
+  }),
+  outputSchema: z.string().min(1),
+  executorPolicy: { allowedNames: ['local-responses'] },
+  delegation: { mode: 'none' },
+});
+
 async function runChatScenario(configuration: ArkAgentPlanConfiguration): Promise<void> {
   logFeatureEvent('chat', 'start');
 
@@ -313,6 +336,19 @@ async function runChatScenario(configuration: ArkAgentPlanConfiguration): Promis
   };
   const evidence = createScenarioEvidence('chat');
   activeScenarioEvidence.chat = evidence;
+  const sessionId = 'ark-agent-plan-chat';
+  const { runtime } = await createDemoLocalSubAgentRuntime({
+    sessionId,
+    executorName: 'local-chat',
+    definition: chatFeatureVerifierDefinition,
+    registration: {
+      runnerId: 'chat-feature-verifier-agent',
+      runnerVersion: '2.0.0',
+      createAgent: () => new ChatFeatureVerifierAgent({ llm: model }),
+      buildInput: ({ input }) =>
+        `Build the feature proof with label ${input.label} and numbers ${JSON.stringify(input.numbers)}.`,
+    },
+  });
   const agent = new ChatFeatureAgent({
     llm: model,
     initContext: [seedMessage],
@@ -323,7 +359,8 @@ async function runChatScenario(configuration: ArkAgentPlanConfiguration): Promis
       contextLengthRecoveryLimit: 0,
     },
     skills: [createInlineSkill()],
-    subAgents: [ChatFeatureVerifierAgent],
+    subAgentRuntime: runtime,
+    sessionId,
     skillRuntime: {
       scripts: {
         autoDetect: false,
@@ -346,8 +383,11 @@ async function runChatScenario(configuration: ArkAgentPlanConfiguration): Promis
   observeToolNames(agent, evidence, 'chat');
   agent.init();
 
-  const activeContext = await agent.agent(
-    'Execute the Chat Agent Plan feature-suite exactly as specified in the system prompt.',
+  const activeContext = requireSucceededContext(
+    await agent.agent(
+      'Execute the Chat Agent Plan feature-suite exactly as specified in the system prompt.',
+    ),
+    'Ark Agent Plan Chat parent',
   );
 
   assertChatScenario({ agent, model, activeContext, seedMessage, evidence });
@@ -368,6 +408,19 @@ async function runResponsesScenario(configuration: ArkAgentPlanConfiguration): P
   };
   const evidence = createScenarioEvidence('responses');
   activeScenarioEvidence.responses = evidence;
+  const sessionId = 'ark-agent-plan-responses';
+  const { runtime } = await createDemoLocalSubAgentRuntime({
+    sessionId,
+    executorName: 'local-responses',
+    definition: responsesFeatureVerifierDefinition,
+    registration: {
+      runnerId: 'responses-feature-verifier-agent',
+      runnerVersion: '2.0.0',
+      createAgent: () => new ResponsesFeatureVerifierAgent({ llm: model }),
+      buildInput: ({ input }) =>
+        `Build the feature proof with label ${input.label} and numbers ${JSON.stringify(input.numbers)}.`,
+    },
+  });
   const agent = new ResponsesFeatureAgent({
     llm: model,
     initContext: [seedMessage],
@@ -378,7 +431,8 @@ async function runResponsesScenario(configuration: ArkAgentPlanConfiguration): P
       contextLengthRecoveryLimit: 0,
     },
     skills: [{ source: 'file', path: fileSkillPath }],
-    subAgents: [ResponsesFeatureVerifierAgent],
+    subAgentRuntime: runtime,
+    sessionId,
     skillRuntime: {
       scripts: {
         autoDetect: false,
@@ -405,8 +459,11 @@ async function runResponsesScenario(configuration: ArkAgentPlanConfiguration): P
     'The portable file Skill must initialize without ignored-source diagnostics.',
   );
 
-  const activeContext = await agent.agent(
-    'Execute the Responses Agent Plan feature-suite exactly as specified in the system prompt.',
+  const activeContext = requireSucceededContext(
+    await agent.agent(
+      'Execute the Responses Agent Plan feature-suite exactly as specified in the system prompt.',
+    ),
+    'Ark Agent Plan Responses parent',
   );
 
   assertResponsesScenario({ agent, model, activeContext, seedMessage, evidence });
@@ -569,7 +626,7 @@ function observeToolNames<P extends OpenAIChatProtocol | OpenAIResponsesProtocol
       (_parameters, _call, result) => {
         evidence.completedTools.push(tool);
         if (tool === 'agent') {
-          evidence.parentSubAgentResults.push(String(result));
+          evidence.parentSubAgentResults.push(readSucceededSubAgentOutput(result));
         }
       },
       { await: true },
@@ -601,6 +658,19 @@ function observeSubAgentToolNames<P extends OpenAIChatProtocol | OpenAIResponses
   }
 }
 
+function readSucceededSubAgentOutput(result: unknown): string {
+  assertFeature(
+    typeof result === 'object' && result !== null && !Array.isArray(result),
+    'Parent agent listener must receive a terminal result envelope.',
+  );
+  const terminal = result as { readonly status?: unknown; readonly output?: unknown };
+  assertFeature(
+    terminal.status === 'succeeded' && typeof terminal.output === 'string',
+    'Parent agent listener must receive a succeeded terminal envelope with a string output.',
+  );
+  return terminal.output;
+}
+
 function buildScenarioPrompt(input: {
   protocol: 'chat' | 'responses';
   skill: string;
@@ -618,10 +688,9 @@ function buildScenarioPrompt(input: {
     })}.`,
     `6. Call ${proofToolName} with {}.`,
     `7. Call agent with ${JSON.stringify({
-      agentName: `${input.protocol}-feature-verifier`,
-      input:
-        'Call build-subagent-proof with label feature-suite and numbers [2,3,5], then report the exact proof marker.',
-      outputDescription: `Exactly ${expectedSubAgentProof(input.protocol)}`,
+      subAgent: `${input.protocol}-feature-verifier`,
+      executor: `local-${input.protocol}`,
+      input: { label: 'feature-suite', numbers: [2, 3, 5] },
     })}.`,
     '8. After observing the sub-agent result, call end-agent by itself.',
   ].join('\n');

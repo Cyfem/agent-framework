@@ -4,6 +4,7 @@
 import { OpenAIResponsesModel, type OpenAIResponsesContext } from '@manee/agent-framework';
 
 import { FinanceMarketNewsAgent } from './finance-news/agent';
+import { requireSucceededContext } from './run-outcome';
 
 const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/v3';
 const defaultArkModel = 'doubao-seed-2-0-pro-260215';
@@ -101,7 +102,7 @@ async function runFinanceNewsDemo(apiKey: string): Promise<void> {
   console.log(`finance news demo: baseURL=${baseURL} model=${modelName}`);
   console.log(`finance news task: ${userTask.replace(/\s+/g, ' ')}`);
 
-  const finalContext = await agent.agent(userTask);
+  const finalContext = requireSucceededContext(await agent.agent(userTask), 'Finance news Agent');
 
   console.log(`finance news demo complete: messages=${finalContext.length}`);
 }

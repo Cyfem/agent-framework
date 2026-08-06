@@ -17,6 +17,22 @@ export interface EncodedAgentProtocolCheckpoint {
   readonly value: JsonValue;
 }
 
+export type DurableAgentModelOperationPurpose = 'agent' | 'context-summary';
+export type DurableAgentModelOperationPhase = 'prepared' | 'in_flight' | 'result_ready';
+
+/** Protocol-neutral provider operation shared by root and child Agent checkpoints. */
+export interface DurableAgentModelOperationV1 {
+  readonly version: '1';
+  readonly operationId: string;
+  readonly iteration: number;
+  readonly purpose: DurableAgentModelOperationPurpose;
+  readonly requestHash: string;
+  readonly phase: DurableAgentModelOperationPhase;
+  readonly result?: EncodedAgentProtocolCheckpoint;
+  readonly preparedAt: number;
+  readonly updatedAt: number;
+}
+
 /** Strict versioned codec required for durable or cross-process restoration. */
 export interface AgentProtocolCheckpointCodec<P extends AgentProtocol = AgentProtocol> {
   readonly protocol: string;
@@ -95,6 +111,8 @@ export interface DurableContextCompactTransactionV1 {
   readonly phase: 'prepared' | 'in_flight' | 'result_ready' | 'applied';
   readonly preparedAt: number;
   readonly updatedAt: number;
+  /** JSON-safe deterministic rebuild metadata; never contains provider bodies or credentials. */
+  readonly metadata?: JsonValue;
   readonly result?: JsonValue;
   readonly outcomeUnknown?: boolean;
 }
@@ -110,8 +128,16 @@ export interface SubAgentChildCheckpointV1 {
   readonly contextStore: ContextStoreCheckpointV1;
   readonly modelIteration: number;
   readonly maxIterations: number | null;
+  readonly modelOperation?: DurableAgentModelOperationV1;
   readonly pendingBatch?: SubAgentChildPendingBatchV1;
   readonly compactTransaction?: SubAgentChildCompactTransactionV1;
+  /** Minimal authoritative result projection required to resume the result-closed child phase. */
+  readonly resultSubmission?: {
+    readonly version: '1';
+    readonly callId: string;
+    readonly output: JsonValue;
+    readonly outputHash: string;
+  };
 }
 
 export type SubAgentChildCheckpoint = SubAgentChildCheckpointV1;

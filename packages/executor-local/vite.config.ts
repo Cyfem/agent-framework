@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url';
 
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 import { createDecoratorsPlugin } from '../../tooling/vite/decorators';
 
@@ -12,7 +12,9 @@ export default defineConfig({
     environment: 'node',
     globals: false,
     clearMocks: true,
+    setupFiles: ['test/network-deny.setup.ts'],
     include: ['test/**/*.test.ts'],
+    exclude: [...configDefaults.exclude, 'test/**/*.process.test.ts'],
   },
   resolve: {
     alias: {

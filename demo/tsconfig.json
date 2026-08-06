@@ -4,7 +4,9 @@
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": ["node"],
     "paths": {
-      "@manee/agent-framework": ["../packages/core/src/index.ts"]
+      "@manee/agent-framework": ["../packages/core/src/index.ts"],
+      "@manee/agent-executor-local": ["../packages/executor-local/src/index.ts"],
+      "@ruixutong.manee/maneeagent-framework": ["../packages/core/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts", "electron-weixin/**/*.ts", "vite.config.ts"]

@@ -35,6 +35,7 @@ export interface AgentRunError {
   readonly message: string;
   readonly retryable: boolean;
   readonly causeCode?: string;
+  readonly outcomeUnknown?: boolean;
 }
 
 /** Durable root Agent outcome. Pauses and runtime failures do not throw. */

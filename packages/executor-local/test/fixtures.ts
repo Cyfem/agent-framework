@@ -1,5 +1,6 @@
 import {
   canonicalJsonSha256,
+  DEFAULT_SUBAGENT_LIMITS,
   type StateLease,
   type StoredAgentRun,
   type StoredTask,
@@ -31,6 +32,8 @@ export function createRun(overrides: Partial<StoredAgentRun> = {}): StoredAgentR
     },
     modelIteration: 0,
     maxIterations: 10,
+    configurationHash: '0'.repeat(64),
+    limits: DEFAULT_SUBAGENT_LIMITS,
     budget: {
       descendantsCreated: 0,
       activeExecutions: 0,
@@ -61,6 +64,7 @@ export function createTask(lease: StateLease, overrides: Partial<StoredTask> = {
     input,
     inputHash: canonicalJsonSha256(input),
     projectedContext: [],
+    limits: DEFAULT_SUBAGENT_LIMITS,
     state: 'queued',
     revision: 0,
     fencingToken: lease.fencingToken,

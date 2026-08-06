@@ -11,6 +11,8 @@ import {
 } from '@manee/agent-framework';
 import { z } from 'zod';
 
+import { requireSucceededContext } from './run-outcome';
+
 const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/v3';
 const defaultArkModel = 'doubao-seed-2-0-pro-260215';
 
@@ -114,13 +116,16 @@ async function runArkGlmDemo(apiKey: string): Promise<void> {
 
   console.log(`ark demo: baseURL=${baseURL} model=${modelName}`);
 
-  const finalContext = await agent.agent(
-    [
-      'Run a minimal smoke test for this agent framework.',
-      'Use record-agent-fact to save one short fact about the test.',
-      'After the tool result is available, call end-agent alone.',
-      'Do not modify files.',
-    ].join('\n'),
+  const finalContext = requireSucceededContext(
+    await agent.agent(
+      [
+        'Run a minimal smoke test for this agent framework.',
+        'Use record-agent-fact to save one short fact about the test.',
+        'After the tool result is available, call end-agent alone.',
+        'Do not modify files.',
+      ].join('\n'),
+    ),
+    'Ark Responses demo Agent',
   );
 
   console.log(`ark demo complete: messages=${finalContext.length}`);

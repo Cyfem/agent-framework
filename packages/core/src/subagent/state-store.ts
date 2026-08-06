@@ -1,6 +1,7 @@
 import type { ApprovalDecisionRecord, ApprovalRequest } from './approval';
 import type {
   ContextStoreCheckpointV1,
+  DurableAgentModelOperationV1,
   DurableContextCompactTransactionV1,
   EncodedAgentProtocolCheckpoint,
   SubAgentChildCheckpoint,
@@ -9,7 +10,7 @@ import type { SubAgentContextItem, SubAgentDefinitionRef } from './definition';
 import type { SubAgentErrorDescriptor } from './errors';
 import type { SubAgentExecutorBinding } from './executor';
 import type { JsonValue } from './json';
-import type { TreeBudgetSnapshot } from './limits';
+import type { ResolvedSubAgentLimits, TreeBudgetSnapshot } from './limits';
 import type {
   CompletionReceipt,
   ResultReceipt,
@@ -27,15 +28,25 @@ export type StoredAgentRunStatus =
   | 'failed';
 
 export type StoredPendingToolCallKind = 'tool' | 'agent' | 'end-agent';
-export type StoredPendingToolCallStatus = 'pending' | 'running' | 'paused' | 'settled' | 'applied';
+export type StoredPendingToolCallStatus =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'settled'
+  | 'result_submitted'
+  | 'applied';
 
 export interface StoredPendingToolCall {
+  readonly operationId: string;
   readonly callId: string;
   readonly name: string;
   readonly order: number;
   readonly kind: StoredPendingToolCallKind;
+  readonly input: JsonValue;
+  readonly inputHash: string;
   readonly status: StoredPendingToolCallStatus;
   readonly taskId?: string;
+  readonly approvalIds?: readonly string[];
   readonly output?: JsonValue;
   readonly error?: SubAgentErrorDescriptor;
 }
@@ -48,6 +59,10 @@ export interface StoredPendingToolBatch {
   readonly endRequested: boolean;
   readonly createdAt: number;
 }
+
+export type StoredModelOperationPurpose = DurableAgentModelOperationV1['purpose'];
+export type StoredModelOperationPhase = DurableAgentModelOperationV1['phase'];
+export type StoredModelOperationV1 = DurableAgentModelOperationV1;
 
 /** Durable root-run state required to resume the same open model loop. */
 export interface StoredAgentRun {
@@ -62,11 +77,17 @@ export interface StoredAgentRun {
   readonly contextStore: ContextStoreCheckpointV1;
   readonly modelIteration: number;
   readonly maxIterations: number | null;
+  /** SHA-256 of initialized root Agent configuration that affects durable replay semantics. */
+  readonly configurationHash: string;
+  /** Immutable tree limits shared by root Model calls and every descendant task. */
+  readonly limits: Readonly<ResolvedSubAgentLimits>;
+  readonly modelOperation?: StoredModelOperationV1;
   readonly pendingBatch?: StoredPendingToolBatch;
   readonly compactTransaction?: DurableContextCompactTransactionV1;
   readonly budget: TreeBudgetSnapshot;
   readonly pendingApprovals: readonly ApprovalRequest[];
   readonly endRequested: boolean;
+  readonly error?: SubAgentErrorDescriptor;
   readonly createdAt: number;
   readonly updatedAt: number;
 }
@@ -78,7 +99,19 @@ export type StoredTaskControlOperationKind =
   | 'progress'
   | 'budget'
   | 'event'
-  | 'cancel';
+  | 'cancel'
+  | 'failure'
+  | 'delegation_pause';
+
+export interface StoredDelegationPauseV1 {
+  readonly version: '1';
+  readonly batchId: string;
+  readonly calls: readonly {
+    readonly callId: string;
+    readonly childTaskId: string;
+    readonly approvalIds: readonly string[];
+  }[];
+}
 
 /** Durable replay receipt for control-plane operations that can cross a transport boundary. */
 export interface StoredTaskControlOperation {
@@ -115,6 +148,8 @@ export interface StoredTask {
   readonly input: JsonValue;
   readonly inputHash: string;
   readonly projectedContext: readonly SubAgentContextItem[];
+  /** Immutable effective limits captured when this task identity is created. */
+  readonly limits: Readonly<ResolvedSubAgentLimits>;
   readonly state: SubAgentTaskState;
   readonly revision: number;
   readonly fencingToken: string;
@@ -127,6 +162,8 @@ export interface StoredTask {
   readonly retryOf?: string;
   readonly binding?: SubAgentExecutorBinding;
   readonly childCheckpoint?: SubAgentChildCheckpoint;
+  /** Opaque host-only link from a paused parent batch to all approval-producing leaf tasks. */
+  readonly delegationPause?: StoredDelegationPauseV1;
   readonly controlOperations: readonly StoredTaskControlOperation[];
   readonly resultReceipt?: ResultReceipt;
   readonly completionReceipt?: CompletionReceipt;
@@ -174,6 +211,7 @@ export class StateLeaseUnavailableError extends Error {
 export interface AgentRuntimeStateTransaction {
   loadRun(runId: string): Promise<StoredAgentRun | undefined>;
   loadTask(taskId: string): Promise<StoredTask | undefined>;
+  listTasksByRun(runId: string): Promise<readonly StoredTask[]>;
   findTaskByIdempotencyKey(runId: string, requestId: string): Promise<StoredTask | undefined>;
   findTaskBySubAgentSession(subagentSessionId: string): Promise<StoredTask | undefined>;
   createTask(record: StoredTask): Promise<CreateStoredTaskResult>;
@@ -198,6 +236,8 @@ export interface AgentRuntimeStateStore {
   createRun(record: StoredAgentRun): Promise<void>;
   loadRun(ownerSessionId: string, runId: string): Promise<StoredAgentRun | undefined>;
   loadTask(ownerSessionId: string, taskId: string): Promise<StoredTask | undefined>;
+  /** Authoritative owner-scoped snapshot of every descendant task attached to one root run. */
+  listTasksByRun(ownerSessionId: string, runId: string): Promise<readonly StoredTask[]>;
   findTaskByIdempotencyKey(
     ownerSessionId: string,
     runId: string,

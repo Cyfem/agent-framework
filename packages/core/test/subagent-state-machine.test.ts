@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { acceptanceIt } from '../../../testkit';
 
 import { SubAgentRuntimeError } from '../src/subagent/errors';
-import { DEFAULT_SUBAGENT_IO_LIMITS } from '../src/subagent/limits';
+import { DEFAULT_SUBAGENT_IO_LIMITS, DEFAULT_SUBAGENT_LIMITS } from '../src/subagent/limits';
 import {
   appendSafeTaskEvents,
   assertSubAgentTaskTransition,
@@ -32,6 +32,7 @@ function task(overrides: Partial<StoredTask> = {}): StoredTask {
     input: { topic: 'state machines' },
     inputHash: 'input-hash',
     projectedContext: [],
+    limits: DEFAULT_SUBAGENT_LIMITS,
     state: 'running',
     revision: 3,
     fencingToken: 'fence-7',

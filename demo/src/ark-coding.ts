@@ -17,6 +17,8 @@ import {
 } from '@manee/agent-framework';
 import { z } from 'zod';
 
+import { requireSucceededContext } from './run-outcome';
+
 const defaultArkCodingBaseURL = 'https://ark.cn-beijing.volces.com/api/coding/v3';
 const defaultArkCodingModel = 'glm-5.1';
 
@@ -117,12 +119,15 @@ async function runArkCodingDemo(apiKey: string): Promise<void> {
 
   console.log(`ark coding demo: baseURL=${baseURL} model=${modelName}`);
 
-  const finalContext = await agent.agent(
-    [
-      'Run a minimal smoke test for this agent framework on Ark Coding Plan.',
-      'Use record-coding-plan-fact to save one short fact about this test.',
-      'After the tool result is available, call end-agent alone.',
-    ].join('\n'),
+  const finalContext = requireSucceededContext(
+    await agent.agent(
+      [
+        'Run a minimal smoke test for this agent framework on Ark Coding Plan.',
+        'Use record-coding-plan-fact to save one short fact about this test.',
+        'After the tool result is available, call end-agent alone.',
+      ].join('\n'),
+    ),
+    'Ark Coding demo Agent',
   );
 
   const toolOutputs = finalContext.filter((message) => message.role === 'tool');

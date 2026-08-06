@@ -6,6 +6,8 @@ import {
   OpenAIChatModel,
   OpenAIResponsesModel,
   type AgentProtocol,
+  type AgentRunOutcome,
+  type ContextOf,
   type ModelGenerateRequest,
   type ModelGenerateResult,
   type OpenAIChatContext,
@@ -24,6 +26,24 @@ import {
   toolCall,
   type TestProtocol,
 } from './helpers/mock-models';
+
+function succeededContext<P extends AgentProtocol>(
+  outcome: AgentRunOutcome<P>,
+): readonly ContextOf<P>[] {
+  expect(outcome.status).toBe('succeeded');
+  if (outcome.status !== 'succeeded') {
+    throw new Error(`Expected a succeeded Agent run, received ${outcome.status}.`);
+  }
+  return outcome.context;
+}
+
+async function expectFailedRun<P extends AgentProtocol>(
+  promise: Promise<AgentRunOutcome<P>>,
+  expectedCode = 'INTERNAL_ERROR',
+): Promise<void> {
+  const outcome = await promise;
+  expect(outcome).toMatchObject({ status: 'failed', error: { code: expectedCode } });
+}
 
 type GenerateEntry<P extends AgentProtocol> =
   | ModelGenerateResult<P>
@@ -182,7 +202,7 @@ describe('tool payload compact configuration', () => {
     omitted.tools.push(runtimeTool('echo', () => 'short', z.object({ value: z.string() })));
     omitted.init();
 
-    await expect(omitted.agent('omitted')).rejects.toThrow('exceeded maxIterations');
+    await expectFailedRun(omitted.agent('omitted'), 'LIMIT_EXCEEDED');
 
     const disabledModel = new MockModel([
       response(assistant('', [toolCall('disabled-1', 'echo', longArguments)])),
@@ -195,7 +215,7 @@ describe('tool payload compact configuration', () => {
     disabled.tools.push(runtimeTool('echo', () => 'short', z.object({ value: z.string() })));
     disabled.init();
 
-    await expect(disabled.agent('disabled')).rejects.toThrow('exceeded maxIterations');
+    await expectFailedRun(disabled.agent('disabled'), 'LIMIT_EXCEEDED');
 
     const defaultsModel = new MockModel([
       response(assistant('', [toolCall('defaults-1', 'echo', longArguments)])),
@@ -208,9 +228,7 @@ describe('tool payload compact configuration', () => {
     defaults.tools.push(runtimeTool('echo', () => 'short', z.object({ value: z.string() })));
     defaults.init();
 
-    await expect(defaults.agent('defaults')).rejects.toThrow(
-      'does not support tool payload rewriting',
-    );
+    await expectFailedRun(defaults.agent('defaults'));
   });
 
   it('validates malformed compact options during init, not construction', () => {
@@ -279,7 +297,7 @@ describe('tool payload compact vertical integration', () => {
     );
     agent.init();
 
-    const active = await agent.agent('start');
+    const active = succeededContext(await agent.agent('start'));
     const raw = agent.getHistory();
     const rawAssistant = raw.find(
       (message) => message.role === 'assistant' && message.tool_calls?.[0]?.id === firstCall.id,
@@ -352,7 +370,7 @@ describe('tool payload compact vertical integration', () => {
     agent.tools.push(runtimeTool('produce', handler, z.object({ amount: z.number() })));
     agent.init();
 
-    const active = await agent.agent('start');
+    const active = succeededContext(await agent.agent('start'));
     const raw = agent.getHistory();
     const activeCall = active.find(
       (message) => message.type === 'function_call' && message.call_id === call.call_id,
@@ -450,7 +468,7 @@ describe('tool payload compact vertical integration', () => {
     );
     agent.init();
 
-    const active = await agent.agent('start');
+    const active = succeededContext(await agent.agent('start'));
 
     expect(canceledHandler).not.toHaveBeenCalled();
     expect(compactOrder).toEqual(
@@ -518,7 +536,7 @@ describe('tool payload compact vertical integration', () => {
     );
     agent.init();
 
-    await expect(agent.agent('start')).rejects.toThrow('second result compactor failed');
+    await expectFailedRun(agent.agent('start'));
 
     const raw = agent.getHistory();
     const active = agent.getContext();
@@ -558,7 +576,7 @@ describe('tool payload compact vertical integration', () => {
     );
     agent.init();
 
-    await expect(agent.agent('start')).rejects.toThrow('does not support tool payload rewriting');
+    await expectFailedRun(agent.agent('start'));
     const raw = agent.getHistory();
     const active = agent.getContext();
     active.forEach((message, index) => expect(message).toBe(raw[index]));
@@ -594,9 +612,7 @@ describe('tool payload compact vertical integration', () => {
     );
     agent.init();
 
-    await expect(agent.agent('start')).rejects.toThrow(
-      'Context changed after the loop snapshot was captured',
-    );
+    await expectFailedRun(agent.agent('start'));
 
     const raw = agent.getHistory();
     const active = agent.getContext();
@@ -651,7 +667,7 @@ describe('tool compact loop finalization', () => {
     expect(settled).toBe(false);
 
     listenerGate.release();
-    const active = await run;
+    const active = succeededContext(await run);
 
     expect(compactor).toHaveBeenCalled();
     expect(active).toContainEqual({ role: 'user', content: 'listener finalized' });
@@ -696,7 +712,7 @@ describe('tool compact loop finalization', () => {
     expect(ended).not.toHaveBeenCalled();
 
     compactGate.release();
-    const active = await run;
+    const active = succeededContext(await run);
 
     expect(ended).toHaveBeenCalledOnce();
     expect(
@@ -742,7 +758,7 @@ describe('tool compact loop finalization', () => {
     agent.onAgentStatusChanged('failed', failed);
     agent.init();
 
-    await expect(agent.agent('start')).rejects.toThrow('end compact failed');
+    await expectFailedRun(agent.agent('start'));
 
     expect(ended).not.toHaveBeenCalled();
     expect(failed).toHaveBeenCalledOnce();
@@ -776,7 +792,7 @@ describe('tool compact loop finalization', () => {
     });
     agent.init();
 
-    await expect(agent.agent('start')).rejects.toThrow('exceeded maxIterations');
+    await expectFailedRun(agent.agent('start'), 'LIMIT_EXCEEDED');
 
     expect(inputCompactor).not.toHaveBeenCalled();
     expect(resultCompactor).not.toHaveBeenCalled();

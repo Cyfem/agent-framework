@@ -56,6 +56,9 @@ importers:
 
   demo:
     dependencies:
+      '@manee/agent-executor-local':
+        specifier: workspace:@ruixutong.manee/maneeagent-executor-local@*
+        version: link:../packages/executor-local
       '@manee/agent-framework':
         specifier: workspace:@ruixutong.manee/maneeagent-framework@*
         version: link:../packages/core

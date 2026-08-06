@@ -173,7 +173,7 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
         return execution;
       }
       const childRequest = toChildRequest(request);
-      const runner = await this.#registry.create(childRequest);
+      const runner = await this.#registry.create(childRequest, this.descriptor.name);
       const runnerIdentity = this.#registry.runnerFor(request.definition);
       const bindingState: MemoryBindingState = {
         kind: 'maneeagent-memory-local/v1',
@@ -231,7 +231,7 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
       }
 
       if (execution === undefined || request.operation.reason === 'checkpoint') {
-        const runner = await this.#registry.create(toChildRequest(request));
+        const runner = await this.#registry.create(toChildRequest(request), this.descriptor.name);
         execution = {
           request,
           binding: request.operation.binding,

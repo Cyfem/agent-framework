@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { acceptanceIt } from '../../../testkit';
+import { Deferred, acceptanceIt } from '../../../testkit';
 import type { ApprovalRequest } from '../src/subagent/approval';
 import { SubAgentRuntimeError } from '../src/subagent/errors';
 import type { StoredPendingToolBatch } from '../src/subagent/state-store';
@@ -169,6 +169,123 @@ describe('durable Tool batch planning', () => {
     resolveLongSibling();
     await Promise.resolve();
   });
+
+  acceptanceIt(
+    'BATCH-01.l1.staggered-sibling-reconcile',
+    'multi-round-authoritative-sibling-reconcile',
+    async () => {
+      const plan = createPlan('agent', 'agent');
+      const checkpoints: StoredPendingToolBatch[] = [];
+      const observationRelease = new Deferred<void>();
+      let secondState: 'running' | 'paused' = 'running';
+      const submitAgent = vi.fn((call: ReturnType<typeof parsedCall>) => ({
+        status: 'running' as const,
+        taskId: call.id === 'call-0' ? 'task-first' : 'task-second',
+      }));
+      const reconcileAgent = vi.fn((call: ReturnType<typeof parsedCall>) => {
+        if (call.id === 'call-0') {
+          return {
+            status: 'paused' as const,
+            taskId: 'task-first',
+            approvals: [approval('task-first')],
+            checkpointRevision: 4,
+          };
+        }
+        return secondState === 'running'
+          ? { status: 'running' as const, taskId: 'task-second' }
+          : {
+              status: 'paused' as const,
+              taskId: 'task-second',
+              approvals: [approval('task-second')],
+              checkpointRevision: 5,
+            };
+      });
+
+      const first = await executeToolBatchPlan(plan, {
+        ...unreachableCallbacks({ submitAgent }),
+        observeAgent: async (call) => {
+          if (call.id === 'call-0') {
+            return {
+              status: 'paused' as const,
+              taskId: 'task-first',
+              approvals: [approval('task-first')],
+              checkpointRevision: 4,
+            };
+          }
+          await observationRelease.promise;
+          return { status: 'running' as const, taskId: 'task-second' };
+        },
+        reconcileAgent,
+        checkpoint: (checkpoint) => {
+          checkpoints.push(structuredClone(checkpoint));
+        },
+      });
+      expect(first.waitingApproval).toBe(true);
+      expect(first.approvals.map(({ approvalId }) => approvalId)).toEqual(['approval-task-first']);
+      expect(first.checkpoint.calls.map(({ status }) => status)).toEqual(['paused', 'running']);
+      expect(submitAgent).toHaveBeenCalledTimes(2);
+      expect(reconcileAgent).toHaveBeenCalledTimes(1);
+
+      secondState = 'paused';
+      const secondResume = vi.fn((call: ReturnType<typeof parsedCall>) =>
+        call.id === 'call-0'
+          ? {
+              status: 'settled' as const,
+              taskId: 'task-first',
+              output: { status: 'succeeded', proof: 'first' },
+            }
+          : {
+              status: 'paused' as const,
+              taskId: 'task-second',
+              approvals: [approval('task-second')],
+              checkpointRevision: 5,
+            },
+      );
+      const second = await resumeToolBatchPlan(
+        plan,
+        first.checkpoint,
+        unreachableCallbacks({
+          resumeAgent: secondResume,
+          reconcileAgent,
+          checkpoint: (checkpoint) => {
+            checkpoints.push(structuredClone(checkpoint));
+          },
+        }),
+      );
+      expect(second.waitingApproval).toBe(true);
+      expect(second.approvals.map(({ approvalId }) => approvalId)).toEqual([
+        'approval-task-second',
+      ]);
+      expect(second.checkpoint.calls.map(({ status }) => status)).toEqual(['settled', 'paused']);
+      expect(secondResume).toHaveBeenCalledTimes(2);
+
+      const finalResume = vi.fn(() => ({
+        status: 'settled' as const,
+        taskId: 'task-second',
+        output: { status: 'succeeded', proof: 'second' },
+      }));
+      const applied: string[] = [];
+      const completed = await resumeToolBatchPlan(
+        plan,
+        second.checkpoint,
+        unreachableCallbacks({
+          resumeAgent: finalResume,
+          applyResult: (call) => {
+            applied.push(call.id);
+          },
+          checkpoint: (checkpoint) => {
+            checkpoints.push(structuredClone(checkpoint));
+          },
+        }),
+      );
+      expect(completed.complete).toBe(true);
+      expect(completed.waitingApproval).toBe(false);
+      expect(finalResume).toHaveBeenCalledTimes(1);
+      expect(applied).toEqual(['call-0', 'call-1']);
+      expect(checkpoints.at(-1)?.calls.map(({ status }) => status)).toEqual(['applied', 'applied']);
+      observationRelease.resolve(undefined);
+    },
+  );
 
   it('persists each returned taskId without waiting for a slower sibling submission', async () => {
     const plan = createPlan('agent', 'agent');

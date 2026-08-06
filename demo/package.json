@@ -30,6 +30,7 @@
   },
   "dependencies": {
     "@manee/agent-framework": "workspace:@ruixutong.manee/maneeagent-framework@*",
+    "@manee/agent-executor-local": "workspace:@ruixutong.manee/maneeagent-executor-local@*",
     "@types/pngjs": "^6.0.5",
     "fast-xml-parser": "^5.8.0",
     "koffi": "^3.0.1",

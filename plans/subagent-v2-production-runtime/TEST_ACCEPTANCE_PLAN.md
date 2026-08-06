@@ -221,19 +221,19 @@ pnpm demo:subagent:v2:ark:full
 
 命令语义：
 
-| 命令                                       | 语义                                                                                                                                |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `pnpm test`                                | 显式组合现有 Core 全量回归、Local Executor 全量测试和 L1-L4；不能继续只过滤 Core，也不能盲目递归执行未来可能联网的 workspace test。 |
-| `pnpm test:subagent:v2`                    | 聚焦 L1、L2、L4，便于开发者快速定位 v2 合约失败；L0 由独立静态/pack 门禁完成。                                                      |
-| `pnpm test:subagent:v2:process`            | 聚焦 L3，启动真实 child process 验证 File Store、WAL 和 fencing。                                                                   |
-| `pnpm acceptance:subagent:v2:offline`      | 创建唯一 evidenceRunId，按发布顺序编排静态、测试、process、pack、回归 demo 与 evidence 校验，输出当前平台 shard。                   |
-| `pnpm validate:subagent:v2:manifest`       | 纯静态校验 acceptance manifest schema、全局唯一 caseId、requirement/layer/variant 完整性和引用文件存在性。                          |
-| `pnpm validate:subagent:v2:evidence`       | 在测试完成后把本次 Vitest/process/pack/平台 reporter 产物与 manifest、git SHA 和构建版本对照，拒绝陈旧证据。                        |
-| `pnpm validate:subagent:v2:legacy`         | 只扫描可执行源码并拒绝未 allowlist 的 v1 Subagent symbol/wire。                                                                     |
-| `pnpm validate:subagent:v2:pack`           | 在唯一临时 consumer 中构建并验证 Core/Local 的 dry-run、真实 tarball、ESM/CJS/NodeNext 和负向文件清单。                             |
-| `pnpm validate:subagent:v2:release-report` | 显式接收 Windows、Linux 与 Ark evidence 路径，校验同一 commit/manifest/package/lock 后合并 release report。                         |
-| `pnpm demo:subagent:v2:ark:smoke`          | 复用当前综合 feature suite，运行两个跨协议、Skills/context compact 集成场景，硬上限 24 次 provider generate。                       |
-| `pnpm demo:subagent:v2:ark:full`           | 包含 smoke 和全部模型可见/控制终态 v2 场景；要求 `--ack-provider-calls=112`，精确 110 次 SDK attempt，reservation 硬上限 112。      |
+| 命令                                       | 语义                                                                                                                                                                                   |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm test`                                | 显式组合现有 Core 全量回归、Local Executor 全量测试和 L1-L4；不能继续只过滤 Core，也不能盲目递归执行未来可能联网的 workspace test。                                                    |
+| `pnpm test:subagent:v2`                    | 聚焦 L1、L2、L4，便于开发者快速定位 v2 合约失败；L0 由独立静态/pack 门禁完成。                                                                                                         |
+| `pnpm test:subagent:v2:process`            | 聚焦 L3，启动真实 child process 验证 File Store、WAL 和 fencing。                                                                                                                      |
+| `pnpm acceptance:subagent:v2:offline`      | 创建唯一 evidenceRunId，按发布顺序编排静态、测试、process、pack、回归 demo 与 evidence 校验，输出当前平台 shard。                                                                      |
+| `pnpm validate:subagent:v2:manifest`       | 纯静态校验 manifest schema、全局唯一 caseId、requirement/layer/variant 完整性，并将所有测试源码中的 literal `acceptanceIt` 与 file/caseId/variant 精确双向核对；动态或未登记注册失败。 |
+| `pnpm validate:subagent:v2:evidence`       | 在测试完成后把本次 Vitest/process/pack/平台 reporter 产物与 manifest、git SHA 和构建版本对照，拒绝陈旧证据。                                                                           |
+| `pnpm validate:subagent:v2:legacy`         | 只扫描可执行源码并拒绝未 allowlist 的 v1 Subagent symbol/wire。                                                                                                                        |
+| `pnpm validate:subagent:v2:pack`           | 在唯一临时 consumer 中构建并验证 Core/Local 的 dry-run、真实 tarball、ESM/CJS/NodeNext 和负向文件清单。                                                                                |
+| `pnpm validate:subagent:v2:release-report` | 显式接收 Windows、Linux 与 Ark evidence 路径，校验同一 commit/manifest/package/lock 后合并 release report。                                                                            |
+| `pnpm demo:subagent:v2:ark:smoke`          | 复用当前综合 feature suite，运行两个跨协议、Skills/context compact 集成场景，硬上限 24 次 provider generate。                                                                          |
+| `pnpm demo:subagent:v2:ark:full`           | 包含 smoke 和全部模型可见/控制终态 v2 场景；要求 `--ack-provider-calls=112`，精确 110 次 SDK attempt，reservation 硬上限 112。                                                         |
 
 现有 `pnpm demo:features:ark` 应迁移到 v2 wire 并作为 smoke 的实现基线或兼容别名；复用其配置加载、Skill fixture、marker、Observed Model 思路和安全日志，不复用当前“每轮恰好一个 Tool call”的 sequence validator、按协议保存的进程级 evidence 或单 Model 实例调用计数。不能保留旧 `agentName/input/outputDescription` 的可执行路径。`pnpm demo:ark:subagent` 保留独立 smoke 的命令定位，但实现同样必须迁移到 v2 wire，且不计入 v2 full 通过证据。
 
@@ -838,7 +838,7 @@ pnpm demo:finance-news:smoke
 pnpm validate:subagent:v2:evidence
 ```
 
-`validate:subagent:v2:legacy` 使用 Node 校验脚本，只扫描 `packages/*/src`、`demo/src` 等可执行源码，对唯一允许的 compile-fail fixture 使用精确路径 allowlist；任一其他 `subAgents`、`AgentConstructor`、`RuntimeSubAgent`、`agentName` 或 `outputDescription` 命中都退出 1。README、plans 和迁移文档不进入扫描范围，不能用原始 `rg` 的命中退出码充当门禁。
+`validate:subagent:v2:legacy` 使用 Node 校验脚本，扫描整个 `packages` 与 `demo` 树中的可执行源码（包括各包测试），忽略 README、plans、声明文件和构建产物。C6 的 `--forbid-all` 门禁不保留例外；任一 `subAgents`、`AgentConstructor`、`AgentInstance`、`RuntimeSubAgent`、`agentName` 或 `outputDescription` 命中都退出 1，不能用原始 `rg` 的命中退出码充当门禁。
 
 `pnpm validate:subagent:v2:pack` 在唯一 OS 临时目录中为每个发布包分别执行 pack dry-run，并验证真实打包消费。其内部等价步骤为：
 

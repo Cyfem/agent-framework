@@ -14,6 +14,8 @@ import {
 } from '@manee/agent-framework';
 import { z } from 'zod';
 
+import { requireSucceededContext } from './run-outcome';
+
 const rawArguments = JSON.stringify({ payload: 'input-'.repeat(1_600) });
 const rawToolResult = 'result-'.repeat(3_000);
 
@@ -117,7 +119,10 @@ agent.tools.push({
 });
 
 agent.init();
-await agent.agent('运行离线 Chat context compact 示例。');
+requireSucceededContext(
+  await agent.agent('运行离线 Chat context compact 示例。'),
+  'Chat context compact Agent',
+);
 
 const rawCall = model
   .parseToolCalls(agent.getHistory())

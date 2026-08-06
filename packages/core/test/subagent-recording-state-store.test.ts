@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import { ManualClock, RecordingRuntimeStateStore, acceptanceIt } from '../../../testkit';
-import type { StateLease, StoredAgentRun, StoredTask, SubAgentTaskEvent } from '../src';
+import {
+  DEFAULT_SUBAGENT_LIMITS,
+  type StateLease,
+  type StoredAgentRun,
+  type StoredTask,
+  type SubAgentTaskEvent,
+} from '../src';
 
 function createRun(fencingToken: string, overrides: Partial<StoredAgentRun> = {}): StoredAgentRun {
   return {
@@ -30,6 +36,8 @@ function createRun(fencingToken: string, overrides: Partial<StoredAgentRun> = {}
     },
     modelIteration: 0,
     maxIterations: 10,
+    configurationHash: '0'.repeat(64),
+    limits: DEFAULT_SUBAGENT_LIMITS,
     budget: {
       descendantsCreated: 0,
       activeExecutions: 0,
@@ -59,6 +67,7 @@ function createTask(fencingToken: string, overrides: Partial<StoredTask> = {}): 
     input: { query: 'safe' },
     inputHash: 'sha256:input-1',
     projectedContext: [],
+    limits: DEFAULT_SUBAGENT_LIMITS,
     state: 'queued',
     revision: 0,
     fencingToken,
@@ -121,12 +130,14 @@ acceptanceIt('STATE-01', 'transaction-local-idempotency', async () => {
     const created = await transaction.createTask(task);
     const byRequest = await transaction.findTaskByIdempotencyKey('run-1', 'request-1');
     const bySession = await transaction.findTaskBySubAgentSession('child-session-1');
+    const byRun = await transaction.listTasksByRun('run-1');
     const replay = await transaction.createTask(structuredClone(task));
 
     expect(created.status).toBe('created');
     expect(replay.status).toBe('existing');
     expect(byRequest?.taskId).toBe('task-1');
     expect(bySession?.taskId).toBe('task-1');
+    expect(byRun.map(({ taskId }) => taskId)).toEqual(['task-1']);
   });
 
   await expect(
@@ -195,13 +206,20 @@ acceptanceIt('STATE-02', 'atomic-cas-events-rollback', async () => {
 
 describe('RecordingRuntimeStateStore', () => {
   it('isolates every lookup by owner session', async () => {
-    const { store } = await createLeaseAndRecords();
+    const { store, task } = await createLeaseAndRecords();
     expect(await store.loadRun('other-owner', 'run-1')).toBeUndefined();
     expect(await store.loadTask('other-owner', 'task-1')).toBeUndefined();
     expect(
       await store.findTaskByIdempotencyKey('other-owner', 'run-1', 'request-1'),
     ).toBeUndefined();
     expect(await store.findTaskBySubAgentSession('other-owner', 'child-session-1')).toBeUndefined();
+    expect(await store.listTasksByRun('other-owner', 'run-1')).toEqual([]);
+    expect((await store.listTasksByRun('owner-1', 'run-1')).map(({ taskId }) => taskId)).toEqual([
+      'task-1',
+    ]);
+    const loaded = await store.loadTask('owner-1', 'task-1');
+    expect(loaded?.limits).toEqual(task.limits);
+    expect(loaded?.limits).not.toBe(task.limits);
   });
 
   it('uses expiry boundary takeover and monotonically fenced leases', async () => {

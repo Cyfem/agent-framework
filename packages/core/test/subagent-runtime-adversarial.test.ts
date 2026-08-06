@@ -6,8 +6,10 @@ import {
   appendSafeTaskEvents,
   canonicalJsonSha256,
   createSubAgentRuntime,
+  DEFAULT_SUBAGENT_LIMITS,
   defineSubAgent,
   SubAgentRuntimeError,
+  submitSubAgentResult,
   transitionSubAgentTask,
   type ApprovalRequest,
   type ExecutorAvailabilityProbe,
@@ -74,6 +76,8 @@ function createRun(overrides: Partial<StoredAgentRun> = {}): StoredAgentRun {
     },
     modelIteration: 0,
     maxIterations: 10,
+    configurationHash: '0'.repeat(64),
+    limits: DEFAULT_SUBAGENT_LIMITS,
     budget: {
       descendantsCreated: 0,
       activeExecutions: 0,
@@ -183,6 +187,33 @@ function childCheckpoint() {
     },
     modelIteration: 1,
     maxIterations: 10,
+  };
+}
+
+function approvalCheckpoint(callId: string, toolName: string) {
+  const input = {};
+  return {
+    ...childCheckpoint(),
+    pendingBatch: {
+      version: '1' as const,
+      batchId: `approval-batch-${callId}`,
+      assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+      calls: [
+        {
+          version: '1' as const,
+          operationId: `approval-operation-${callId}`,
+          kind: 'tool' as const,
+          callId,
+          name: toolName,
+          input,
+          inputHash: canonicalJsonSha256(input),
+          status: 'in_flight' as const,
+          order: 0,
+        },
+      ],
+      endRequested: false,
+      createdAt: 1_001,
+    },
   };
 }
 
@@ -307,12 +338,15 @@ async function createPausedFixture() {
       throw new Error('An incomplete approval decision must not reach the Executor.');
     }
     await control.commitBinding('paused-binding', bindingForRequest(execution));
-    await control.commitCheckpoint('paused-checkpoint', childCheckpoint());
-    const directive = await control.authorizeTool('paused-approval', {
-      callId: 'approval-call-1',
-      toolName: 'dangerous-tool',
-      summary: 'Approve the first guarded operation.',
-    });
+    const directive = await control.authorizeTool(
+      'paused-approval',
+      {
+        callId: 'approval-call-1',
+        toolName: 'dangerous-tool',
+        summary: 'Approve the first guarded operation.',
+      },
+      approvalCheckpoint('approval-call-1', 'dangerous-tool'),
+    );
     if (directive.type !== 'suspend') throw new Error('expected an approval suspension');
     return {
       type: 'paused',
@@ -389,6 +423,7 @@ async function seedCrashWindowTask(
         input: { value: 'alpha' },
         inputHash: canonicalJsonSha256({ value: 'alpha' }),
         projectedContext: [],
+        limits: DEFAULT_SUBAGENT_LIMITS,
         state: 'queued',
         revision: 0,
         fencingToken: lease.fencingToken,
@@ -479,6 +514,47 @@ async function seedCrashWindowTask(
   }
 }
 
+async function seedResultSubmittedCrashTask(
+  store: RecordingRuntimeStateStore,
+): Promise<StoredTask> {
+  const running = await seedCrashWindowTask(store, 'running', true);
+  const lease = await store.acquireLease(`subagent-session:${SESSION_ID}`, 30_000);
+  try {
+    return await store.transaction(SESSION_ID, lease, async (transaction) => {
+      const current = await transaction.loadTask(running.taskId);
+      if (current === undefined) throw new Error('missing crash-window task');
+      const output = { answer: 'result-cas-crash-proof' };
+      const submitted = submitSubAgentResult(
+        {
+          ...current,
+          childCheckpoint: childCheckpoint(),
+          recoveryRequired: true,
+        },
+        {
+          callId: 'result-cas-call',
+          receiptId: 'result-cas-receipt',
+          submittedAt: current.updatedAt,
+          output,
+        },
+      );
+      const next = { ...submitted.task, fencingToken: lease.fencingToken } as StoredTask;
+      if (
+        !(await transaction.compareAndSetTask(
+          current.taskId,
+          current.revision,
+          lease.fencingToken,
+          next,
+        ))
+      ) {
+        throw new Error('failed to seed result-submitted crash window');
+      }
+      return next;
+    });
+  } finally {
+    await lease.release();
+  }
+}
+
 describe('SubAgentRuntime adversarial Oracles', () => {
   acceptanceIt('REC-01.l1.attempt-fencing', 'attempt-fencing', async () => {
     let oldControl: SubAgentExecutionControl | undefined;
@@ -488,12 +564,15 @@ describe('SubAgentRuntime adversarial Oracles', () => {
       if (execution.operation.type === 'create') {
         oldControl = control;
         await control.commitBinding('fencing-binding', bindingForRequest(execution));
-        await control.commitCheckpoint('fencing-checkpoint', childCheckpoint());
-        const directive = await control.authorizeTool('fencing-approval', {
-          callId: 'guarded-call',
-          toolName: 'guarded-tool',
-          summary: 'Pause before the guarded operation.',
-        });
+        const directive = await control.authorizeTool(
+          'fencing-approval',
+          {
+            callId: 'guarded-call',
+            toolName: 'guarded-tool',
+            summary: 'Pause before the guarded operation.',
+          },
+          approvalCheckpoint('guarded-call', 'guarded-tool'),
+        );
         if (directive.type !== 'suspend') throw new Error('expected approval suspension');
         return {
           type: 'paused',
@@ -553,7 +632,25 @@ describe('SubAgentRuntime adversarial Oracles', () => {
       .soft(
         await runtimeCode(runtime.reconnect(SESSION_ID, taskId).then((handle) => handle.wait())),
       )
-      .toBe('INVALID_STATE_TRANSITION');
+      .toBe('UNSUPPORTED_CAPABILITY');
+  });
+
+  acceptanceIt('REC-05.l1.external-terminal-reconnect', 'external-binding-terminal', async () => {
+    const executor = new AdversarialExecutor();
+    const { runtime, store } = await createFixture(executor);
+    const original = await runtime.execute(request());
+    const before = store.snapshot(SESSION_ID);
+    const taskId = before.tasks[0]!.taskId;
+
+    const handle = await runtime.reconnect(SESSION_ID, taskId);
+
+    await expect(handle.wait()).resolves.toEqual(original);
+    await expect(handle.snapshot()).resolves.toMatchObject({
+      taskId,
+      state: 'succeeded',
+    });
+    expect(executor.spawnCalls).toHaveLength(0);
+    expect(store.snapshot(SESSION_ID)).toEqual(before);
   });
 
   it('does not commit anything when approval decisions are missing', async () => {
@@ -627,6 +724,113 @@ describe('SubAgentRuntime adversarial Oracles', () => {
       state: 'failed',
       error: { code: 'EXECUTOR_FAILED', outcomeUnknown: true },
     });
+  });
+
+  acceptanceIt('RES-09.l1.result-then-failure-partial', 'authoritative-partial', async () => {
+    const secretSentinel = 'provider-body-secret-must-not-persist';
+    const executor = new AdversarialExecutor(async (execution, control) => {
+      await control.commitBinding('failure-binding', bindingForRequest(execution));
+      const partialOutput = { answer: 'durable-partial-proof' };
+      await control.completion.submitResult('failure-result', partialOutput);
+      const failure = {
+        status: 'failed' as const,
+        error: {
+          code: 'EXECUTOR_FAILED' as const,
+          message: secretSentinel,
+          retryable: false,
+          causeCode: secretSentinel,
+        },
+      };
+
+      const accepted = await control.completion.fail('failure-terminal', failure);
+      const replayed = await control.completion.fail('failure-terminal', failure);
+      expect(replayed).toEqual(accepted);
+      await expect(
+        control.completion.fail('failure-terminal', {
+          status: 'cancelled',
+          error: { code: 'CANCELLED', message: 'Conflicting replay.', retryable: false },
+        }),
+      ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+
+      // A raw Executor success candidate must never override the authoritative failure CAS.
+      return candidateOutcome(execution, { answer: 'untrusted-raw-success' });
+    });
+    const { runtime, store } = await createFixture(executor);
+
+    await expect(runtime.execute(request())).resolves.toMatchObject({
+      type: 'terminal',
+      result: {
+        status: 'failed',
+        partialOutput: { answer: 'durable-partial-proof' },
+        error: {
+          code: 'EXECUTOR_FAILED',
+          message: 'The subagent execution failed.',
+        },
+      },
+    });
+    const task = store.snapshot(SESSION_ID).tasks[0]!;
+    expect(task).toMatchObject({
+      state: 'failed',
+      partialOutput: { answer: 'durable-partial-proof' },
+      result: {
+        status: 'failed',
+        partialOutput: { answer: 'durable-partial-proof' },
+      },
+    });
+    expect(task).not.toHaveProperty('output');
+    expect(task.controlOperations.filter(({ kind }) => kind === 'failure')).toHaveLength(1);
+    expect(JSON.stringify(store.snapshot(SESSION_ID))).not.toContain(secretSentinel);
+  });
+
+  it('accepts an exact receipt-backed partial output for an authoritative control terminal', async () => {
+    const executor = new AdversarialExecutor(async (execution, control) => {
+      await control.commitBinding('timeout-binding', bindingForRequest(execution));
+      await control.completion.submitResult('timeout-result', {
+        answer: 'timeout-partial-proof',
+      });
+      await control.completion.fail('timeout-terminal', {
+        status: 'timed_out',
+        error: { code: 'TIMED_OUT', message: 'The trusted runner timed out.', retryable: false },
+        partialOutput: { answer: 'timeout-partial-proof' },
+      });
+      return candidateOutcome(execution, { answer: 'untrusted-raw-success' });
+    });
+    const { runtime } = await createFixture(executor);
+
+    await expect(runtime.execute(request())).resolves.toMatchObject({
+      type: 'terminal',
+      result: {
+        status: 'timed_out',
+        partialOutput: { answer: 'timeout-partial-proof' },
+        error: { code: 'TIMED_OUT' },
+      },
+    });
+  });
+
+  it('rejects failure partial output before agent-result establishes an authoritative receipt', async () => {
+    const executor = new AdversarialExecutor(async (execution, control) => {
+      await control.commitBinding('unreceipted-partial-binding', bindingForRequest(execution));
+      await expect(
+        control.completion.fail('unreceipted-partial', {
+          status: 'failed',
+          error: { code: 'EXECUTOR_FAILED', message: 'unsafe partial', retryable: false },
+          partialOutput: { answer: 'must-not-persist' },
+        }),
+      ).rejects.toMatchObject({ code: 'RESULT_REQUIRED' });
+      await control.completion.fail('unreceipted-terminal', {
+        status: 'failed',
+        error: { code: 'EXECUTOR_FAILED', message: 'terminal', retryable: false },
+      });
+      return candidateOutcome(execution, { answer: 'untrusted-raw-success' });
+    });
+    const { runtime, store } = await createFixture(executor);
+
+    await expect(runtime.execute(request())).resolves.toMatchObject({
+      type: 'terminal',
+      result: { status: 'failed' },
+    });
+    expect(store.snapshot(SESSION_ID).tasks[0]).not.toHaveProperty('partialOutput');
+    expect(JSON.stringify(store.snapshot(SESSION_ID))).not.toContain('must-not-persist');
   });
 
   it.each(['queued', 'running'] as const)(
@@ -703,5 +907,53 @@ describe('SubAgentRuntime adversarial Oracles', () => {
       runtime.reconnect(SESSION_ID, seeded.taskId).then((handle) => handle.wait()),
     );
     expect(code).toBe('BINDING_INVALID');
+  });
+
+  it('recovers a crash after result CAS without replaying result production', async () => {
+    const store = new RecordingRuntimeStateStore();
+    await store.createRun(
+      createRun({
+        budget: {
+          descendantsCreated: 1,
+          activeExecutions: 1,
+          providerCalls: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+        },
+      }),
+    );
+    const seeded = await seedResultSubmittedCrashTask(store);
+    const executor = new AdversarialExecutor(async (execution, control) => {
+      if (execution.operation.type !== 'resume') throw new Error('expected checkpoint resume');
+      expect(execution.operation.reason).toBe('checkpoint');
+      const proof = execution.operation.checkpoint.resultSubmission;
+      expect(proof).toEqual({
+        version: '1',
+        callId: 'result-cas-call',
+        output: { answer: 'result-cas-crash-proof' },
+        outputHash: canonicalJsonSha256({ answer: 'result-cas-crash-proof' }),
+      });
+      const replay = await control.completion.submitResult(proof!.callId, proof!.output);
+      expect(replay.status).toBe('replayed');
+      await control.completion.complete('result-cas-end', { isStandalone: true });
+      return candidateOutcome(execution, proof!.output);
+    });
+    const { runtime } = await createFixture(executor, { store, createRun: false });
+
+    await expect(runtime.resume(SESSION_ID, seeded.taskId, {})).resolves.toMatchObject({
+      type: 'terminal',
+      result: { status: 'succeeded', output: { answer: 'result-cas-crash-proof' } },
+    });
+    expect(executor.executeCalls).toHaveLength(1);
+    expect(store.snapshot(SESSION_ID).tasks[0]).toMatchObject({
+      state: 'succeeded',
+      attempt: 2,
+      childCheckpoint: {
+        resultSubmission: {
+          callId: 'result-cas-call',
+          output: { answer: 'result-cas-crash-proof' },
+        },
+      },
+    });
   });
 });

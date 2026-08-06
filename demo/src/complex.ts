@@ -4,12 +4,16 @@
  */
 import {
   Agent,
+  defineSubAgent,
   OpenAIResponsesModel,
   Tool,
   type OpenAIResponsesContext,
   type OpenAIResponsesProtocol,
 } from '@manee/agent-framework';
 import { z } from 'zod';
+
+import { requireSucceededContext } from './run-outcome';
+import { createDemoLocalSubAgentRuntime } from './local-subagent-runtime';
 
 type Priority = 'low' | 'medium' | 'high';
 
@@ -32,9 +36,6 @@ let memoryDescriptionBuilds = 0;
 
 /** 由父代理调度的质量复核子代理，用于验证 `agent-result` 汇报协议。 */
 class QualityReviewAgent extends Agent<OpenAIResponsesProtocol> {
-  static name = 'quality-reviewer';
-  static description = 'Reviews the parent agent demo state and returns a concise quality summary.';
-
   @Tool({
     name: 'review-checklist',
     description:
@@ -59,6 +60,19 @@ class QualityReviewAgent extends Agent<OpenAIResponsesProtocol> {
     };
   }
 }
+
+const qualityReviewDefinition = defineSubAgent({
+  name: 'quality-reviewer',
+  version: '2.0.0',
+  description: 'Review one ticket and return a concise structured quality summary.',
+  inputSchema: z.object({
+    ticketId: z.string().min(1),
+    checklist: z.array(z.string().min(1)).min(1),
+  }),
+  outputSchema: z.string().min(1),
+  executorPolicy: { allowedNames: ['local-quality-review'] },
+  delegation: { mode: 'none' },
+});
 
 /** 以内存工单为业务载体，集中暴露框架主要能力的父代理。 */
 class ArkComplexDemoAgent extends Agent<OpenAIResponsesProtocol> {
@@ -263,6 +277,26 @@ if (!apiKey) {
 async function runArkComplexDemo(apiKey: string): Promise<void> {
   const baseURL = process.env.ARK_BASE_URL ?? defaultArkBaseURL;
   const modelName = process.env.ARK_MODEL ?? defaultArkModel;
+  const sessionId = 'ark-complex-demo';
+  const { runtime } = await createDemoLocalSubAgentRuntime({
+    sessionId,
+    executorName: 'local-quality-review',
+    definition: qualityReviewDefinition,
+    registration: {
+      runnerId: 'quality-review-agent',
+      runnerVersion: '2.0.0',
+      createAgent: () =>
+        new QualityReviewAgent({
+          llm: new OpenAIResponsesModel({ apiKey, baseURL, model: modelName }),
+          maxIterations: 6,
+          systemPrompts: [
+            'Call review-checklist once, submit {"result":"a concise quality review"} with agent-result, then call end-agent alone.',
+          ],
+        }),
+      buildInput: ({ input }) =>
+        `Review ticket ${input.ticketId} against: ${input.checklist.join(', ')}.`,
+    },
+  });
   const toolErrors: string[] = [];
   const modelResponses: string[] = [];
   const calledTools = new Set<string>();
@@ -305,7 +339,8 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
     }),
     initContext: restoredContext,
     initRawContext: restoredHistory,
-    subAgents: [QualityReviewAgent],
+    subAgentRuntime: runtime,
+    sessionId,
     systemPrompts: [
       'You are running an automated integration demo for a Node.js agent framework through Ark Coding Plan.',
       [
@@ -318,7 +353,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
         '6. call search-memory with query "tool" and limit 3.',
         '7. call summarize-board.',
         '8. call runtime-state-report.',
-        '9. call agent with agentName "quality-reviewer", input asking it to review ticket T-1 and the framework demo coverage, and outputDescription "A concise quality review summary string."',
+        '9. call agent with subAgent "quality-reviewer", executor "local-quality-review", and input {"ticketId":"T-1","checklist":["ticket state","framework demo coverage"]}.',
         '10. call risky-operation with operation "delete-demo-state"; this is expected to be canceled.',
         '11. call unstable-tool with reason "intentional calling-stage failure"; this is expected to fail.',
         '12. call summarize-board again.',
@@ -508,12 +543,15 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
       .join(',')} sub=${QualityReviewAgent.toolsDefinition.map((tool) => tool.name).join(',')}`,
   );
 
-  const finalContext = await agent.agent(
-    [
-      'Run the complex Ark Coding Plan integration demo.',
-      'Please exercise the listed tools, the quality-reviewer sub-agent, runtime tool, restored context/history, and expected error paths.',
-      'When the scenario is complete, call end-agent alone.',
-    ].join('\n'),
+  const finalContext = requireSucceededContext(
+    await agent.agent(
+      [
+        'Run the complex Ark Coding Plan integration demo.',
+        'Please exercise the listed tools, the quality-reviewer sub-agent, runtime tool, restored context/history, and expected error paths.',
+        'When the scenario is complete, call end-agent alone.',
+      ].join('\n'),
+    ),
+    'Ark complex Agent',
   );
 
   await delay(20);
@@ -538,7 +576,7 @@ async function runArkComplexDemo(apiKey: string): Promise<void> {
 
 async function runExpectedAgentErrorDemo(agent: Agent<OpenAIResponsesProtocol>): Promise<void> {
   try {
-    await agent.agent('This streaming call should fail and emit onAgentError.', true);
+    await agent.agent('This streaming call should fail and emit onAgentError.', { stream: true });
   } catch (error) {
     console.log(`caught expected agent error: ${toErrorMessage(error)}`);
   }

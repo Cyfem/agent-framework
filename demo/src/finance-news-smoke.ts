@@ -14,6 +14,7 @@ import {
   type FinanceNewsTransport,
 } from './finance-news/agent';
 import { ResponsesMockModel } from './responses-mock-model';
+import { requireSucceededContext } from './run-outcome';
 
 const fixedNow = new Date('2026-05-22T12:00:00.000Z');
 const requiredTools = [
@@ -159,7 +160,10 @@ agent.onToolCallError((name, triggerType, error) => {
 
 agent.init();
 
-const finalContext = await agent.agent('Run the finance news smoke test.');
+const finalContext = requireSucceededContext(
+  await agent.agent('Run the finance news smoke test.'),
+  'Finance news smoke Agent',
+);
 
 for (const toolName of requiredTools) {
   assertSmoke(calledTools.includes(toolName), `Expected tool call: ${toolName}`);

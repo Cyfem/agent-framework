@@ -17,6 +17,8 @@ import {
   type OpenAIChatTool,
 } from '@manee/agent-framework';
 
+import { requireSucceededContext } from './run-outcome';
+
 const billingSkill: AgentSkill = {
   name: 'billing-reply',
   description: '当用户需要处理客户账单疑问时，先查客户资料，再计算可用补偿，最后生成回复。',
@@ -268,7 +270,10 @@ agent.onAgentStatusChanged('ended', (_history, context) => {
 });
 
 agent.init();
-const finalContext = await agent.agent('请处理客户 C-10086 的账单疑问，并给出回复草稿。');
+const finalContext = requireSucceededContext(
+  await agent.agent('请处理客户 C-10086 的账单疑问，并给出回复草稿。'),
+  'Chat demo Agent',
+);
 
 const parsedUsers = model.parseUserMessages(finalContext);
 const parsedAssistants = model.parseAssistantMessages(finalContext);

@@ -64,7 +64,10 @@ describe('Model request cancellation metadata', () => {
 
 describe('Agent cancellation and deadline propagation', () => {
   it('supports runtime controls on standalone toolCall()', async () => {
-    const agent = new Agent<TestProtocol>({ llm: new MockModel() });
+    const agent = new Agent<TestProtocol>({
+      llm: new MockModel(),
+      sessionId: 'session-standalone',
+    });
     const controller = new AbortController();
     const deadlineAt = Date.now() + 10_000;
     let seen: ToolRuntimeContext<TestProtocol> | undefined;
@@ -81,12 +84,11 @@ describe('Agent cancellation and deadline propagation', () => {
     await agent.toolCall(parsedCall('standalone-1', 'standalone-proof'), {
       signal: controller.signal,
       deadlineAt,
-      runtime: { sessionId: 'session-standalone', runId: 'run-standalone' },
     });
 
     expect(seen).toMatchObject({
       sessionId: 'session-standalone',
-      runId: 'run-standalone',
+      runId: expect.any(String),
       deadlineAt,
       call: { id: 'standalone-1' },
     });
@@ -97,7 +99,11 @@ describe('Agent cancellation and deadline propagation', () => {
       response(assistant('', [toolCall('proof-1', 'proof')])),
       endResponse(),
     ]);
-    const agent = new Agent<TestProtocol>({ llm: model, maxIterations: 2 });
+    const agent = new Agent<TestProtocol>({
+      llm: model,
+      maxIterations: 2,
+      sessionId: 'session-1',
+    });
     let seen: ToolRuntimeContext<TestProtocol> | undefined;
 
     agent.tools.push({
@@ -111,15 +117,13 @@ describe('Agent cancellation and deadline propagation', () => {
     agent.init();
 
     const deadlineAt = Date.now() + 10_000;
-    await agent.agent('run', {
-      deadlineAt,
-      runtime: { sessionId: 'session-1', runId: 'run-1', taskId: 'task-1' },
-    });
+    await agent.agent('run', { deadlineAt });
+
+    const runId = seen?.runId;
 
     expect(seen).toMatchObject({
       sessionId: 'session-1',
-      runId: 'run-1',
-      taskId: 'task-1',
+      runId: expect.any(String),
       deadlineAt,
       call: { id: 'proof-1', name: 'proof' },
     });
@@ -127,15 +131,13 @@ describe('Agent cancellation and deadline propagation', () => {
     expect(model.requests.map((request) => request.runtime)).toEqual([
       {
         sessionId: 'session-1',
-        runId: 'run-1',
-        taskId: 'task-1',
+        runId,
         iteration: 0,
         requestAttempt: 1,
       },
       {
         sessionId: 'session-1',
-        runId: 'run-1',
-        taskId: 'task-1',
+        runId,
         iteration: 1,
         requestAttempt: 1,
       },
@@ -157,10 +159,14 @@ describe('Agent cancellation and deadline propagation', () => {
       response(assistant('', [toolCall('decorated-1', 'decorated-proof')])),
       endResponse(),
     ]);
-    const agent = new DecoratedAgent({ llm: model, maxIterations: 2 });
+    const agent = new DecoratedAgent({
+      llm: model,
+      maxIterations: 2,
+      sessionId: 'session-decorated',
+    });
     agent.init();
 
-    await agent.agent('run', { runtime: { sessionId: 'session-decorated' } });
+    await agent.agent('run');
 
     expect(agent.seen?.sessionId).toBe('session-decorated');
     expect(agent.seen?.call.id).toBe('decorated-1');
@@ -182,7 +188,8 @@ describe('Agent cancellation and deadline propagation', () => {
     agent.tools.push({ name: 'never', description: 'must not run', handler });
     agent.init();
 
-    await expect(agent.agent('run', { signal: controller.signal })).rejects.toBe(reason);
+    const outcome = await agent.agent('run', { signal: controller.signal });
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } });
     expect(handler).not.toHaveBeenCalled();
     expect(model.requests).toHaveLength(1);
   });
@@ -209,7 +216,8 @@ describe('Agent cancellation and deadline propagation', () => {
     });
     agent.init();
 
-    await expect(agent.agent('run', { signal: controller.signal })).rejects.toBe(reason);
+    const outcome = await agent.agent('run', { signal: controller.signal });
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } });
     expect(prompt).not.toHaveBeenCalled();
     expect(model.requests).toHaveLength(0);
   });
@@ -229,7 +237,8 @@ describe('Agent cancellation and deadline propagation', () => {
     agent.onBeforeModelErrorRecovery(beforeRecovery);
     agent.init();
 
-    await expect(agent.agent('run', { signal: controller.signal })).rejects.toBe(reason);
+    const outcome = await agent.agent('run', { signal: controller.signal });
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } });
     expect(beforeRecovery).not.toHaveBeenCalled();
     expect(model.requests).toHaveLength(1);
   });
@@ -239,9 +248,8 @@ describe('Agent cancellation and deadline propagation', () => {
     const agent = new Agent<TestProtocol>({ llm: model });
     agent.init();
 
-    await expect(agent.agent('run', { deadlineAt: Date.now() - 1 })).rejects.toMatchObject({
-      name: 'TimeoutError',
-    });
+    const outcome = await agent.agent('run', { deadlineAt: Date.now() - 1 });
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } });
     expect(model.requests).toHaveLength(0);
     expect(agent.getHistory()).toHaveLength(0);
   });
@@ -253,24 +261,21 @@ describe('Agent cancellation and deadline propagation', () => {
     agent.onBeforeModelErrorRecovery(beforeRecovery);
     agent.init();
 
-    await expect(agent.agent('run', { deadlineAt: Date.now() + 20 })).rejects.toMatchObject({
-      name: 'TimeoutError',
-    });
+    const outcome = await agent.agent('run', { deadlineAt: Date.now() + 20 });
+    expect(outcome).toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } });
     expect(model.requests).toHaveLength(1);
     expect(beforeRecovery).not.toHaveBeenCalled();
   });
 
   it('increments requestAttempt metadata across an ordinary recovery retry', async () => {
     const model = new MockModel([new Error('transient'), endResponse()]);
-    const agent = new Agent<TestProtocol>({ llm: model });
+    const agent = new Agent<TestProtocol>({ llm: model, sessionId: 'session-retry' });
     agent.init();
 
-    await agent.agent('run', { runtime: { runId: 'run-retry' } });
+    await agent.agent('run');
 
     expect(model.requests.map((request) => request.runtime?.requestAttempt)).toEqual([1, 2]);
-    expect(model.requests.map((request) => request.runtime?.runId)).toEqual([
-      'run-retry',
-      'run-retry',
-    ]);
+    expect(model.requests[0]?.runtime?.sessionId).toBe('session-retry');
+    expect(model.requests[0]?.runtime?.runId).toEqual(model.requests[1]?.runtime?.runId);
   });
 });

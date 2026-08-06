@@ -33,6 +33,7 @@ import {
   findIdempotentTask,
   findSubagentSessionTask,
   insertRun,
+  listTasksByRun,
   readRun,
   readTask,
   readTaskEvents,
@@ -196,6 +197,10 @@ export class AtomicFileAgentRuntimeStateStore implements AgentRuntimeStateStore 
 
   async loadTask(ownerSessionId: string, taskId: string): Promise<StoredTask | undefined> {
     return readTask((await this.#readSession(ownerSessionId)).state, taskId);
+  }
+
+  async listTasksByRun(ownerSessionId: string, runId: string): Promise<readonly StoredTask[]> {
+    return listTasksByRun((await this.#readSession(ownerSessionId)).state, runId);
   }
 
   async findTaskByIdempotencyKey(

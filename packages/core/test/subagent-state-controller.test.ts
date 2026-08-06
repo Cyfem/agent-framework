@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import { ManualClock, RecordingRuntimeStateStore, acceptanceIt } from '../../../testkit';
-import type { StateLease, StoredAgentRun, StoredTask, SubAgentTaskEvent } from '../src';
+import {
+  DEFAULT_SUBAGENT_LIMITS,
+  type StateLease,
+  type StoredAgentRun,
+  type StoredTask,
+  type SubAgentTaskEvent,
+} from '../src';
 import {
   STATE_CAS_CONFLICT_CAUSE_CODE,
   STATE_FENCING_MISMATCH_CAUSE_CODE,
@@ -32,6 +38,8 @@ function createRun(fencingToken: string, overrides: Partial<StoredAgentRun> = {}
     },
     modelIteration: 0,
     maxIterations: 10,
+    configurationHash: '0'.repeat(64),
+    limits: DEFAULT_SUBAGENT_LIMITS,
     budget: {
       descendantsCreated: 1,
       activeExecutions: 0,
@@ -61,6 +69,7 @@ function createTask(fencingToken: string, overrides: Partial<StoredTask> = {}): 
     input: { query: 'safe' },
     inputHash: 'sha256:input-1',
     projectedContext: [],
+    limits: DEFAULT_SUBAGENT_LIMITS,
     state: 'queued',
     revision: 0,
     fencingToken,
@@ -168,6 +177,99 @@ acceptanceIt('STATE-04', 'cas-conflict-rolls-back-whole-mutation', async () => {
   expect((await store.loadTask('owner-1', 'task-1'))?.revision).toBe(0);
 });
 
+acceptanceIt(
+  'RUN-02.l1.atomic-staged-create-mutation',
+  'staged-create-parent-checkpoint-atomic',
+  async () => {
+    const store = new RecordingRuntimeStateStore();
+    const lease = await store.acquireLease(
+      `agent-run:${JSON.stringify(['owner-1', 'run-1'])}`,
+      10_000,
+    );
+    const run = createRun(lease.fencingToken);
+    await store.createRun(run);
+    const create = createTask(lease.fencingToken, {
+      taskId: 'staged-task',
+      subagentSessionId: 'staged-session',
+      requestId: 'staged-request',
+      idempotencyKey: 'staged-request',
+      path: ['staged-task'],
+    });
+    const queuedEvent: SubAgentTaskEvent = {
+      ...createEvent(),
+      eventId: 'staged-queued-event',
+      type: 'task.queued',
+      taskId: create.taskId,
+      path: create.path,
+      timestamp: 1_001,
+      data: { status: 'queued' },
+    };
+    const queued: StoredTask = {
+      ...create,
+      revision: 1,
+      eventSequence: 1,
+      updatedAt: 1_001,
+    };
+    const nextRun: StoredAgentRun = {
+      ...run,
+      revision: 1,
+      updatedAt: 1_001,
+      budget: {
+        ...run.budget,
+        descendantsCreated: run.budget.descendantsCreated + 1,
+      },
+      pendingBatch: {
+        batchId: 'staged-parent-batch',
+        iteration: 1,
+        assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+        calls: [
+          {
+            operationId: 'staged-call-operation',
+            callId: 'staged-call',
+            name: 'agent',
+            order: 0,
+            kind: 'agent',
+            input: { subAgent: 'researcher', executor: 'local', input: { query: 'safe' } },
+            inputHash: 'staged-input-hash',
+            status: 'running',
+            taskId: create.taskId,
+          },
+        ],
+        endRequested: false,
+        createdAt: 1_001,
+      },
+    };
+
+    // Crash before the atomic commit exposes neither side of the association.
+    expect(await store.loadTask('owner-1', create.taskId)).toBeUndefined();
+    expect((await store.loadRun('owner-1', run.runId))?.pendingBatch).toBeUndefined();
+
+    await commitRuntimeStateMutation(store, 'owner-1', lease, {
+      run: { previous: run, next: nextRun },
+      tasks: [{ create, next: queued, events: [queuedEvent] }],
+    });
+
+    expect(await store.loadRun('owner-1', run.runId)).toEqual(nextRun);
+    expect(await store.loadTask('owner-1', create.taskId)).toEqual(queued);
+    expect(await store.readEvents('owner-1', create.taskId)).toEqual([queuedEvent]);
+    expect(store.snapshot('owner-1').tasks).toHaveLength(1);
+
+    // A second recovery cannot create another identity or advance either revision.
+    await expect(
+      commitRuntimeStateMutation(store, 'owner-1', lease, {
+        run: { previous: run, next: nextRun },
+        tasks: [{ create, next: queued, events: [queuedEvent] }],
+      }),
+    ).rejects.toMatchObject({
+      code: 'INVALID_STATE_TRANSITION',
+      descriptor: { causeCode: STATE_CAS_CONFLICT_CAUSE_CODE },
+    });
+    expect((await store.loadRun('owner-1', run.runId))?.revision).toBe(1);
+    expect((await store.loadTask('owner-1', create.taskId))?.revision).toBe(1);
+    expect(store.snapshot('owner-1').tasks).toHaveLength(1);
+  },
+);
+
 describe('runtime state controller validation', () => {
   it('closes the final task-create race with transaction-local idempotency', async () => {
     const { store, lease, task } = await createFixture();
@@ -241,6 +343,64 @@ describe('runtime state controller validation', () => {
     expect((await store.loadRun('owner-1', 'run-1'))?.fencingToken).toBe('2');
   });
 
+  it('allows only adjacent immutable Model operation transitions', async () => {
+    const { store, lease, run } = await createFixture();
+    const prepared = {
+      version: '1' as const,
+      operationId: 'model-operation-1',
+      iteration: 0,
+      purpose: 'agent' as const,
+      requestHash: 'a'.repeat(64),
+      phase: 'prepared' as const,
+      preparedAt: 1_001,
+      updatedAt: 1_001,
+    };
+    const withPrepared = {
+      ...run,
+      revision: 1,
+      updatedAt: 1_001,
+      modelOperation: prepared,
+    } satisfies StoredAgentRun;
+    await commitRuntimeStateMutation(store, 'owner-1', lease, {
+      run: { previous: run, next: withPrepared },
+    });
+
+    const skipped = {
+      ...withPrepared,
+      revision: 2,
+      updatedAt: 1_002,
+      modelOperation: {
+        ...prepared,
+        phase: 'result_ready' as const,
+        updatedAt: 1_002,
+        result: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+      },
+    } satisfies StoredAgentRun;
+    await expect(
+      commitRuntimeStateMutation(store, 'owner-1', lease, {
+        run: { previous: withPrepared, next: skipped },
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
+
+    const changedIdentity = {
+      ...withPrepared,
+      revision: 2,
+      updatedAt: 1_002,
+      modelOperation: {
+        ...prepared,
+        requestHash: 'b'.repeat(64),
+        phase: 'in_flight' as const,
+        updatedAt: 1_002,
+      },
+    } satisfies StoredAgentRun;
+    await expect(
+      commitRuntimeStateMutation(store, 'owner-1', lease, {
+        run: { previous: withPrepared, next: changedIdentity },
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
+    expect(await store.loadRun('owner-1', 'run-1')).toEqual(withPrepared);
+  });
+
   it('rejects immutable identity changes, terminal writes and event gaps', async () => {
     const { store, lease, task } = await createFixture();
     await expect(
@@ -249,6 +409,21 @@ describe('runtime state controller validation', () => {
           {
             previous: task,
             next: { ...task, taskId: 'changed', revision: 1 },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
+
+    await expect(
+      commitRuntimeStateMutation(store, 'owner-1', lease, {
+        tasks: [
+          {
+            previous: task,
+            next: {
+              ...task,
+              revision: 1,
+              limits: { ...task.limits, maxTurns: task.limits.maxTurns + 1 },
+            },
           },
         ],
       }),

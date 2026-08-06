@@ -83,10 +83,16 @@ async function selfTest() {
   const root = await mkdtemp(path.join(tmpdir(), 'manee-legacy-source-'));
   try {
     await mkdir(path.join(root, 'packages', 'core', 'src'), { recursive: true });
+    await mkdir(path.join(root, 'packages', 'executor-local', 'src'), { recursive: true });
     await mkdir(path.join(root, 'demo', 'src'), { recursive: true });
     await writeFile(
       path.join(root, 'packages', 'core', 'src', 'legacy.ts'),
-      'type Old = AgentConstructor<unknown>;\nconst options = { subAgents: [] };\n',
+      'type Old = AgentConstructor<unknown>;\nconst options = { subAgents: [] };\nclass OldAgent { static description = "legacy"; }\n',
+      'utf8',
+    );
+    await writeFile(
+      path.join(root, 'packages', 'executor-local', 'src', 'legacy.ts'),
+      'type OldLocalRunner = AgentInstance;\n',
       'utf8',
     );
     await writeFile(
@@ -96,8 +102,8 @@ async function selfTest() {
     );
     const initial = await scanLegacySource({ rootDirectory: root });
     assert(
-      initial.length === 2,
-      `self-test expected two initial legacy hits, got ${initial.length}`,
+      initial.length === 4,
+      `self-test expected four initial legacy hits, got ${initial.length}`,
     );
     const baseline = createLegacyBaseline(initial);
     assert(

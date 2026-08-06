@@ -7,6 +7,8 @@
 
 本仓库是框架源码和示例所在的 pnpm workspace。可发布的核心包位于 [`packages/core`](./packages/core)，完整 API 文档见 [`packages/core/README.md`](./packages/core/README.md)。
 
+> **发布状态**：当前 checkout 中 Core 与 Local Executor 的 package manifest 都是待发布的 `2.0.0`，但 npm registry 上 Core 的 `latest` 仍是 `1.0.0`，Local Executor 尚未发布。本文的 v2 API 与 npm 安装示例面向 `2.0.0` 发布物；在正式发布前，请在本仓库通过 workspace 命令构建和验收，不能用 manifest 版本推断 npm 已发布。
+
 ## 核心能力
 
 - **协议解耦**：`Agent<P>` 负责编排，`Model<P>` 负责协议消息、工具声明、工具调用解析和模型请求。
@@ -15,14 +17,14 @@
 - **上下文与历史**：分别维护模型使用的 active context 和完整 raw history，并保留 provider 原始字段。
 - **事件系统**：可观察模型响应、工具调用前后、工具异常、Agent 状态和 Agent 错误。
 - **渐进式 Skills**：首轮只暴露 `name + description`，模型通过内置 `skill` 工具按需加载 instructions、读取文本资源或运行显式启用的脚本。
-- **子代理调度**：通过内置 `agent` 工具调度同协议子代理，并使用 `agent-result` 汇报结果。
+- **Subagent v2**：通过 typed `SubAgentDefinition`、模型可见 `{ subAgent, executor, input }` wire 和独立 Executor 调度隔离 child Agent；支持跨协议 placement、审批暂停/恢复、嵌套委派、持久 checkpoint、取消与 typed result。
 - **上下文压缩与恢复**：支持 active-only 工具 payload 裁剪、外部摘要事务和 context-length 错误恢复；raw history 始终保留原文。
 - **多模态上下文**：Responses 支持文件上传和图片、文件、视频、音频内容块；Chat 支持图片、音频和文件内容块。
 - **扩展 Model**：可继承 `Model<P>` 接入其他消息协议或 OpenAI-compatible 服务。
 
 ## 快速开始
 
-### 安装 npm 包
+### 安装 npm 包（`2.0.0` 发布后）
 
 ```bash
 npm install @ruixutong.manee/maneeagent-framework zod
@@ -74,11 +76,16 @@ const agent = new NotesAgent({
 
 agent.init();
 
-const context = await agent.agent('请保存一条笔记：今天完成 README。');
-console.log(context);
+const outcome = await agent.agent('请保存一条笔记：今天完成 README。');
+
+if (outcome.status === 'succeeded') {
+  console.log(outcome.context);
+} else {
+  console.log(outcome.status, outcome.runId);
+}
 ```
 
-`init()` 是显式配置校验入口。调用 `agent()` 或 `toolCall()` 前必须先调用它；修改 `tools` 或 `subAgents` 后也需要再次调用。`maxIterations` 用于限制模型循环次数，避免模型没有按要求调用 `end-agent` 时持续请求。
+`init()` 是显式配置校验入口。调用 `agent()` 或 `toolCall()` 前必须先调用它；修改 Tools、system prompts、Skills/`skillRuntime`、context compact 或模型错误恢复等运行语义配置后也需要再次调用。`agent()` 返回 `succeeded`、`waiting_approval`、`cancelled` 或 `failed` outcome；配置、初始化和编程错误仍会抛异常。`maxIterations` 用于限制模型循环次数，避免模型没有按要求调用 `end-agent` 时持续请求。
 
 使用 `@Tool` 时，应用构建链需要支持 2023-11 decorators；不使用装饰器的 JavaScript/TypeScript 项目可以通过 `agent.tools.push()` 注册运行时工具。更多用法见 [核心包文档](./packages/core/README.md)。
 
@@ -86,13 +93,13 @@ console.log(context);
 
 | 路径                      | 说明                                                                   |
 | ------------------------- | ---------------------------------------------------------------------- |
-| `packages/core`           | 发布到 npm 的核心库，输出 ESM、CJS 和 TypeScript 声明。                |
-| `packages/executor-local` | 官方本地 Executor 与 Memory/Atomic File StateStore，独立发布。         |
+| `packages/core`           | Core `2.0.0` 待发布源码，输出 ESM、CJS 和 TypeScript 声明。            |
+| `packages/executor-local` | Local Executor 与 Memory/Atomic File StateStore 的 `2.0.0` 待发布包。  |
 | `demo/src`                | CLI 示例、离线回归、真实方舟调用、金融新闻和 Windows 工具。            |
 | `demo/electron-weixin`    | Windows Electron 微信消息示例。                                        |
 | `plans`                   | Subagent v2 的目标架构与验收方案；已实现范围以源码和各包 README 为准。 |
 
-核心包没有 `bin` CLI；下文命令都是本仓库的 pnpm workspace scripts。demo 源码中的 `@manee/agent-framework` 是 pnpm workspace alias，实际指向发布包 `@ruixutong.manee/maneeagent-framework`；它只是 demo 的本地 import 名，不是另一个 npm 包。
+两个包都没有 `bin` CLI；下文命令都是本仓库的 pnpm workspace scripts。demo 源码中的 `@manee/agent-framework` 与 `@manee/agent-executor-local` 是 workspace alias，分别指向待发布包 `@ruixutong.manee/maneeagent-framework` 与 `@ruixutong.manee/maneeagent-executor-local`；它们只是仓库内 import 名，不是另外两个 npm 包。
 
 ## 本地开发
 
@@ -110,7 +117,7 @@ pnpm demo
 
 正式验收证据使用固定的 Node.js 22 和 `pnpm@11.1.3`。Windows 上可运行 `pnpm toolchain:node22`，脚本会把便携工具链安装到被忽略的 `.tools/` 目录，并在解压前核对 Node.js 官方 SHA-256；日常开发可继续使用满足版本要求的本机工具链。
 
-Subagent v2 实施期间可运行 `pnpm validate:subagent:v2:manifest`、`pnpm validate:subagent:v2:legacy` 和 `pnpm validate:subagent:v2:pack` 校验需求追踪、旧 wire 基线与 Core/Local 两个发布包的内容；`validate:subagent:v2:evidence` 还需通过 `--evidence=<repo-relative.json>` 显式指定本次证据 shard。这些是仓库验收命令，不是 npm 包 CLI。
+Subagent v2 实施期间可运行 `pnpm validate:subagent:v2:manifest`、`pnpm validate:subagent:v2:legacy` 和 `pnpm validate:subagent:v2:pack` 校验需求追踪、旧 API/wire 零残留与 Core/Local 两个待发布包的内容。manifest 门禁会静态核对所有测试源码中的 literal `acceptanceIt(caseId, variant, fn)` 与清单记录，拒绝动态、重复、错文件或未登记 case；legacy 门禁以 `--forbid-all` 扫描整个 `packages` 与 `demo` 可执行源码树。`validate:subagent:v2:evidence` 还需通过 `--evidence=<repo-relative.json>` 显式指定本次证据 shard。这些是仓库验收命令，不是 npm 包 CLI。
 
 ## Skills
 
@@ -124,11 +131,11 @@ Skill script 是宿主显式信任的本地代码。框架使用 `shell: false` 
 
 这些命令使用固定 mock 或 fixture，不请求真实模型，也不需要 API key。
 
-| 命令                           | 覆盖内容                                                             |
-| ------------------------------ | -------------------------------------------------------------------- |
-| `pnpm demo`                    | Responses/Chat、工具、Skills、事件、上下文、子代理、错误和并发保护。 |
-| `pnpm demo:chat`               | Chat `tool_calls[]` / `tool` role 工具闭环。                         |
-| `pnpm demo:finance-news:smoke` | 固定 RSS fixture、筛选、排序、笔记和金融简报工具链。                 |
+| 命令                           | 覆盖内容                                                                  |
+| ------------------------------ | ------------------------------------------------------------------------- |
+| `pnpm demo`                    | Responses/Chat、工具、Skills、事件、上下文、Subagent v2、错误和并发保护。 |
+| `pnpm demo:chat`               | Chat `tool_calls[]` / `tool` role 工具闭环。                              |
+| `pnpm demo:finance-news:smoke` | 固定 RSS fixture、筛选、排序、笔记和金融简报工具链。                      |
 
 ### 真实模型与网络
 
@@ -187,18 +194,20 @@ pnpm lint
 pnpm format:check
 ```
 
-`pnpm test` 显式组合 Core 与 Local Executor 的 Vitest 测试，不需要模型凭据或网络访问，也不会递归触发真实模型命令；`pnpm demo`、`pnpm demo:chat` 和 `pnpm demo:finance-news:smoke` 是额外的离线回归入口。
+`pnpm test` 显式组合 Core、Local Executor 和专用跨进程恢复测试，不需要模型凭据或网络访问，也不会递归触发真实模型命令；`pnpm demo`、`pnpm demo:chat` 和 `pnpm demo:finance-news:smoke` 是额外的离线回归入口。
 
 ## 当前限制
 
-- 当前只支持非流式 `generate()`；`agent(input, true)` 会抛错。
+- 当前只支持非流式 `generate()`；`agent(input, { stream: true })` 会在创建 run/task 前抛出 `STREAMING_UNSUPPORTED`。
 - Agent 必须通过内置 `end-agent` 工具正常结束，且该工具需要单独调用。
 - `maxIterations` 默认不设上限，真实模型场景建议显式配置。
 - 同一个 Agent 实例不能并发执行多个 `agent()` 调用。
-- 父子代理必须使用同一个协议规格。
+- 父 Agent 与 child Agent 可以使用不同协议；child 的 Model、Tools、Skills、system prompts、compact 与错误恢复配置由受信任 Executor factory 独立提供，不从父 Agent 隐式继承。
+- durable root resume 和跨进程 child resume 需要 ready `SubAgentRuntime`、持久 StateStore 以及兼容的版本化 checkpoint codec。无 codec 自定义协议仅限宿主提供、Catalog 明确声明 `same_process` 的 placement：同一 Agent 实例可以保留进程内 checkpoint 并恢复根审批；替换实例、跨进程恢复和无 codec child 自身产生的 durable 审批仍会被拒绝。官方 Local Executor 声明的是 `checkpoint`，不是 `same_process`。
+- 当前 checkout 已实现宿主进程内 Local Executor 与单机 Memory/Atomic File StateStore；Worker、Process、HTTP 和分布式生产适配器属于后续 C7–C9，且当前 Local 包尚未发布到 npm。
 - `@Tool` 需要应用构建链支持 2023-11 decorators。
 
-`agent()` 和独立 `toolCall()` 支持传入 `AbortSignal` 与绝对 `deadlineAt`。取消信号会贯穿 Model、Tool、摘要、payload compactor 和模型错误恢复；Chat/Responses 适配器只把 `signal` 作为 SDK request option 传递，不会把截止时间或运行时身份写入 provider body。取消是协作式的，第三方 Model、Tool 或 callback 仍需主动遵守收到的 signal。
+`agent()` 和独立 `toolCall()` 支持传入 `AbortSignal` 与绝对 `deadlineAt`。取消信号会贯穿 Model、Tool、摘要、payload compactor 和模型错误恢复；Chat/Responses 适配器只把 `signal` 作为 SDK request option 传递，不会把截止时间或运行时身份写入 provider body。取消是协作式的，第三方 Model、Tool 或 callback 仍需主动遵守收到的 signal。对 durable provider operation，SDK dispatch 前收到取消会得到 `cancelled`；请求 intent 已持久化为 `in_flight` 后再发生 abort、超时或连接结果不确定，则 run/task 固定为 `failed + outcomeUnknown`，不会自动重发可能已经执行的请求。
 
 ## Context compact
 
@@ -236,4 +245,4 @@ const agent = new Agent({
 
 核心 API、事件、上下文、Skills、子代理、Responses/Chat 适配和自定义 Model 的完整说明见 [`packages/core/README.md`](./packages/core/README.md)。
 
-Subagent v2 正按上述计划分批实施。当前公开包已进入 `2.0.0` 开发线：C2–C4 已完成 contracts、持久状态域、Catalog/Router 和可执行的 `createSubAgentRuntime()`；C5 已加入固定 fencing 的父 run checkpoint controller、可恢复 Tool batch 基础，以及独立发布的官方 Local Executor、Memory Store 和单机 Atomic File Store。`Agent` 公共 loop 仍使用迁移前路径，必须等 C6 在同一提交中原子切换，不能把 C5 的内部 controller 当成已接线的 Agent API。实际能力和文件存储边界见 [`packages/core/README.md`](./packages/core/README.md) 与 [`packages/executor-local/README.md`](./packages/executor-local/README.md)。
+Subagent v2 正按三阶段计划分批实施。当前 checkout 的 Core/Local manifest 为 `2.0.0`，C2–C6 源码已完成 Core contracts、持久状态域、Catalog/Router、公开 `Agent` durable loop、v1 原子删除、跨协议 Local placement、审批/嵌套审批恢复、context compact 崩溃窗口恢复，以及 Memory/Atomic File StateStore。C7 的 Worker/Process/HTTP placement 和 C8–C9 的分布式适配器、Compose、完整 evidence/release report 尚未交付；npm 发布状态也独立于这些 manifest。实际 API 与本地存储边界见 [`packages/core/README.md`](./packages/core/README.md) 与 [`packages/executor-local/README.md`](./packages/executor-local/README.md)。

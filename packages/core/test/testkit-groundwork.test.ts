@@ -113,28 +113,37 @@ describe('Subagent v2 testkit groundwork', () => {
   });
 
   it('blocks and restores fetch, HTTP, DNS, and raw sockets without making requests', () => {
-    const originalFetch = globalThis.fetch;
-    const originalHttpGet = http.get;
-    const originalLookup = dns.lookup;
-    const originalConnect = net.connect;
-    const guard = new NetworkDenyGuard();
-
-    guard.install();
+    const suiteGuard = Reflect.get(
+      globalThis,
+      Symbol.for('maneeagent.testkit.network-deny-owner.v1'),
+    ) as NetworkDenyGuard | undefined;
+    suiteGuard?.restore();
     try {
-      expect(() => globalThis.fetch('http://example.invalid')).toThrow(NetworkAccessDeniedError);
-      expect(() => http.get('http://example.invalid')).toThrow(NetworkAccessDeniedError);
-      expect(() => dns.lookup('example.invalid', () => undefined)).toThrow(
-        NetworkAccessDeniedError,
-      );
-      expect(() => net.connect(80, '127.0.0.1')).toThrow(NetworkAccessDeniedError);
-    } finally {
-      guard.restore();
-    }
+      const originalFetch = globalThis.fetch;
+      const originalHttpGet = http.get;
+      const originalLookup = dns.lookup;
+      const originalConnect = net.connect;
+      const guard = new NetworkDenyGuard();
 
-    expect(globalThis.fetch).toBe(originalFetch);
-    expect(http.get).toBe(originalHttpGet);
-    expect(dns.lookup).toBe(originalLookup);
-    expect(net.connect).toBe(originalConnect);
-    expect(guard.restore()).toBe(false);
+      guard.install();
+      try {
+        expect(() => globalThis.fetch('http://example.invalid')).toThrow(NetworkAccessDeniedError);
+        expect(() => http.get('http://example.invalid')).toThrow(NetworkAccessDeniedError);
+        expect(() => dns.lookup('example.invalid', () => undefined)).toThrow(
+          NetworkAccessDeniedError,
+        );
+        expect(() => net.connect(80, '127.0.0.1')).toThrow(NetworkAccessDeniedError);
+      } finally {
+        guard.restore();
+      }
+
+      expect(globalThis.fetch).toBe(originalFetch);
+      expect(http.get).toBe(originalHttpGet);
+      expect(dns.lookup).toBe(originalLookup);
+      expect(net.connect).toBe(originalConnect);
+      expect(guard.restore()).toBe(false);
+    } finally {
+      suiteGuard?.install();
+    }
   });
 });

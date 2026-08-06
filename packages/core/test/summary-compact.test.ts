@@ -288,9 +288,8 @@ describe('Agent summary validation and atomicity', () => {
     });
     agent.init();
 
-    await expect(agent.agent(current.content)).rejects.toThrow(
-      'failure must include a string reason',
-    );
+    const outcome = await agent.agent(current.content);
+    expect(outcome).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } });
     expect(agent.getContext()).toEqual([seed, current]);
   });
 
@@ -325,7 +324,8 @@ describe('Agent summary validation and atomicity', () => {
 
     agent.init();
 
-    await expect(agent.agent(current.content)).rejects.toThrow(fixture.message);
+    const outcome = await agent.agent(current.content);
+    expect(outcome).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } });
     expect(agent.getContext()).toEqual([seed, current]);
     expect(agent.getHistory()).toEqual([seed, current]);
   });
@@ -357,10 +357,8 @@ describe('Agent summary validation and atomicity', () => {
     state.agent = agent;
     agent.init();
 
-    await expect(agent.agent(current.content)).rejects.toMatchObject({
-      name: 'ContextStoreError',
-      code: 'concurrent_context_mutation',
-    });
+    const outcome = await agent.agent(current.content);
+    expect(outcome).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } });
     expect(agent.getContext()).toEqual([seed, current, concurrent]);
     expect(agent.getHistory()).toEqual([seed, current, concurrent]);
   });

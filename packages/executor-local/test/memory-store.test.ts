@@ -20,6 +20,7 @@ describe('MemoryAgentRuntimeStateStore', () => {
       await expect(
         transaction.findTaskBySubAgentSession(task.subagentSessionId),
       ).resolves.toMatchObject({ taskId: task.taskId });
+      await expect(transaction.listTasksByRun(RUN_ID)).resolves.toEqual([task]);
     });
 
     const event = {
@@ -52,6 +53,8 @@ describe('MemoryAgentRuntimeStateStore', () => {
     });
 
     await expect(store.loadTask(SESSION_ID, task.taskId)).resolves.toEqual(running);
+    await expect(store.listTasksByRun(SESSION_ID, RUN_ID)).resolves.toEqual([running]);
+    await expect(store.listTasksByRun('another-session', RUN_ID)).resolves.toEqual([]);
     await expect(store.readEvents(SESSION_ID, task.taskId, 0)).resolves.toEqual([event]);
   });
 

@@ -4,6 +4,7 @@
  */
 import {
   Agent,
+  defineSubAgent,
   OpenAIChatModel,
   Tool,
   type ModelGenerateRequest,
@@ -16,6 +17,8 @@ import {
 import { z } from 'zod';
 
 import { ResponsesMockModel } from './responses-mock-model';
+import { requireSucceededContext } from './run-outcome';
+import { createDemoLocalSubAgentRuntime } from './local-subagent-runtime';
 
 /** 按固定轮次产生工具调用，并验证提供方 output 字段在下一轮请求中未丢失。 */
 class MockModel extends ResponsesMockModel {
@@ -133,9 +136,9 @@ class SubAgentDemoModel extends ResponsesMockModel {
 
     if (this.#parentRound === 1) {
       return toolResponse('call_dispatch_agent', 'agent', {
-        agentName: 'worker',
-        input: 'Ask the worker agent to prepare a short report.',
-        outputDescription: 'A short report string for the parent agent.',
+        subAgent: 'worker',
+        executor: 'local',
+        input: { task: 'prepare sub-agent report' },
       });
     }
 
@@ -295,11 +298,8 @@ class ChatDemoAgent extends Agent<OpenAIChatProtocol> {
   }
 }
 
-/** 供内置 `agent` 工具调度的最小子代理。 */
+/** 由 Local Executor 工厂为每个 task 新建的最小子代理。 */
 class WorkerAgent extends Agent<OpenAIResponsesProtocol> {
-  static name = 'worker';
-  static description = 'A small worker agent used by the local sub-agent demo.';
-
   @Tool({
     name: 'worker-echo',
     description: 'Echo the worker task so the demo can verify private tool execution.',
@@ -312,6 +312,16 @@ class WorkerAgent extends Agent<OpenAIResponsesProtocol> {
     return `worker accepted:${task}`;
   }
 }
+
+const workerDefinition = defineSubAgent({
+  name: 'worker',
+  version: '2.0.0',
+  description: 'Prepare a small structured report in an isolated local child Agent.',
+  inputSchema: z.object({ task: z.string().min(1) }),
+  outputSchema: z.string().min(1),
+  executorPolicy: { allowedNames: ['local'] },
+  delegation: { mode: 'none' },
+});
 
 // 先恢复一段包含响应元数据的历史，后续轮次会验证其透传行为。
 const restoredHistory: OpenAIResponsesContext[] = [
@@ -353,8 +363,12 @@ agent.tools.push({
 try {
   const invalidAgent = new Agent({
     llm: new MockModel(),
-    subAgents: [WorkerAgent, WorkerAgent],
   });
+
+  invalidAgent.tools.push(
+    { name: 'duplicate', description: 'first duplicate', handler: () => 'first' },
+    { name: 'duplicate', description: 'second duplicate', handler: () => 'second' },
+  );
 
   invalidAgent.init();
 } catch (error) {
@@ -480,20 +494,45 @@ agent.onAgentStatusChanged('ended', (rawContext, context) => {
 
 agent.init();
 
-const finalContext = await agent.agent('Run the demo task.');
+const finalContext = requireSucceededContext(
+  await agent.agent('Run the demo task.'),
+  'Responses demo Agent',
+);
 
 console.log(`Demo ready: final context messages=${finalContext.length}`);
 
 // 独立执行子代理调度流程，避免与主场景的上下文互相影响。
+const subAgentModel = new SubAgentDemoModel();
+const { runtime: subAgentRuntime } = await createDemoLocalSubAgentRuntime({
+  sessionId: 'demo-subagent-session',
+  definition: workerDefinition,
+  registration: {
+    runnerId: 'worker-agent',
+    runnerVersion: '2.0.0',
+    createAgent: () =>
+      new WorkerAgent({
+        llm: subAgentModel,
+        maxIterations: 6,
+        systemPrompts: [
+          'Call worker-echo once, submit {"result":"worker report ready"} with agent-result, then call end-agent alone.',
+        ],
+      }),
+    buildInput: ({ input }) => `Prepare the worker report for task: ${input.task}`,
+  },
+});
 const subAgentDemo = new Agent({
-  llm: new SubAgentDemoModel(),
-  subAgents: [WorkerAgent],
+  llm: subAgentModel,
+  subAgentRuntime,
+  sessionId: 'demo-subagent-session',
   maxIterations: 6,
 });
 
 subAgentDemo.init();
 
-const subAgentContext = await subAgentDemo.agent('Run the sub-agent demo task.');
+const subAgentContext = requireSucceededContext(
+  await subAgentDemo.agent('Run the sub-agent demo task.'),
+  'Local subagent demo parent',
+);
 
 console.log(`Sub-agent demo ready: final context messages=${subAgentContext.length}`);
 
@@ -544,7 +583,10 @@ assertDemo(
 
 concurrentModel.release();
 
-const concurrentContext = await firstConcurrentRun;
+const concurrentContext = requireSucceededContext(
+  await firstConcurrentRun,
+  'Concurrent demo Agent',
+);
 
 assertDemo(concurrentEndedStatuses === 1, 'Expected first concurrent agent run to end.');
 
@@ -557,7 +599,10 @@ const chatAgent = new ChatDemoAgent({
 
 chatAgent.init();
 
-const chatContext = await chatAgent.agent('Run the Chat protocol demo.');
+const chatContext = requireSucceededContext(
+  await chatAgent.agent('Run the Chat protocol demo.'),
+  'Chat demo Agent',
+);
 const chatToolResults = chatContext.filter((message) => message.role === 'tool');
 
 assertDemo(chatToolResults.length === 3, 'Expected two Chat tool results plus end-agent result.');
@@ -567,22 +612,12 @@ const emptyChatModel = new EmptyChatDemoModel();
 const emptyChatAgent = new Agent<OpenAIChatProtocol>({
   llm: emptyChatModel,
 });
-let emptyChatError = '';
-
 emptyChatAgent.init();
+const emptyChatOutcome = await emptyChatAgent.agent('Return no Chat choices.');
 
-try {
-  await emptyChatAgent.agent('Return no Chat choices.');
-} catch (error) {
-  emptyChatError = error instanceof Error ? error.message : String(error);
-}
-
-assertDemo(
-  emptyChatError === 'Model returned no messages after 4 attempt(s).',
-  'Expected empty Chat responses to fail after three retries.',
-);
+assertDemo(emptyChatOutcome.status === 'failed', 'Expected empty Chat responses to fail.');
 assertDemo(emptyChatModel.calls === 4, 'Expected one Chat request plus three retries.');
-console.log('Chat empty-response retry demo ready.');
+console.log(`Chat empty-response retry demo ready: status=${emptyChatOutcome.status}.`);
 
 function toolResponse(
   id: string,

@@ -6,6 +6,7 @@ import type {
 
 export interface LocalSubAgentRunnerFactoryContext {
   readonly request: SubAgentChildRunRequest;
+  readonly executorName: string;
 }
 
 export interface LocalSubAgentRunnerRegistration {
@@ -38,7 +39,7 @@ export class LocalSubAgentRunnerRegistry {
   register(registration: LocalSubAgentRunnerRegistration): this {
     if (this.#sealed) throw new Error('The Local Subagent runner registry is sealed.');
     assertDefinition(registration.definition);
-    assertRunnerId(registration.runnerId);
+    assertIdentifier('runnerId', registration.runnerId);
     assertVersion('runnerVersion', registration.runnerVersion);
     const childCheckpointVersions = validateVersions(registration.childCheckpointVersions);
     if (typeof registration.create !== 'function') {
@@ -72,7 +73,10 @@ export class LocalSubAgentRunnerRegistry {
     this.#registrations.set(
       key,
       Object.freeze({
-        definition: Object.freeze({ ...registration.definition }),
+        definition: Object.freeze({
+          name: registration.definition.name,
+          version: registration.definition.version,
+        }),
         runnerId: registration.runnerId,
         runnerVersion: registration.runnerVersion,
         childCheckpointVersions,
@@ -98,7 +102,9 @@ export class LocalSubAgentRunnerRegistry {
   list(): readonly SubAgentDefinitionRef[] {
     return Object.freeze(
       [...this.#registrations.values()]
-        .map(({ definition }) => Object.freeze({ ...definition }))
+        .map(({ definition }) =>
+          Object.freeze({ name: definition.name, version: definition.version }),
+        )
         .sort((left, right) => definitionKey(left).localeCompare(definitionKey(right))),
     );
   }
@@ -133,12 +139,16 @@ export class LocalSubAgentRunnerRegistry {
     );
   }
 
-  async create(request: SubAgentChildRunRequest): Promise<SubAgentChildRunner> {
+  async create(
+    request: SubAgentChildRunRequest,
+    executorName: string,
+  ): Promise<SubAgentChildRunner> {
+    assertIdentifier('executorName', executorName);
     const registration = this.#registrations.get(definitionKey(request.definition));
     if (registration === undefined) {
       throw new Error('No Local Subagent runner is registered for the exact definition version.');
     }
-    const runner = await registration.create({ request });
+    const runner = await registration.create({ request, executorName });
     if (typeof runner !== 'object' || runner === null || typeof runner.run !== 'function') {
       throw new TypeError('A Local Subagent factory must return a SubAgentChildRunner.');
     }
@@ -163,14 +173,14 @@ function assertDefinition(definition: SubAgentDefinitionRef): void {
   }
 }
 
-function assertRunnerId(value: string): void {
+function assertIdentifier(label: 'runnerId' | 'executorName', value: string): void {
   if (
     typeof value !== 'string' ||
     value.length > 128 ||
     value !== value.trim() ||
     !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value)
   ) {
-    throw new TypeError('A Local Subagent registration requires a valid runnerId.');
+    throw new TypeError(`A Local Subagent registration requires a valid ${label}.`);
   }
 }
 

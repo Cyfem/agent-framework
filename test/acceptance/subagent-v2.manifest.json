@@ -56,17 +56,17 @@
       "status": "implemented",
       "phase": "phase-1",
       "requiredLayers": ["L1"],
-      "requiredVariants": ["testkit"],
+      "requiredVariants": ["deferred-barrier"],
       "cases": [
         {
           "caseId": "TST-GROUND-01",
-          "variant": "testkit",
+          "variant": "deferred-barrier",
           "phase": "phase-1",
           "layer": "L1",
           "evidenceSource": {
             "type": "vitest",
             "file": "packages/core/test/testkit-groundwork.test.ts",
-            "testName": "[acceptance:TST-GROUND-01][variant:testkit]"
+            "testName": "[acceptance:TST-GROUND-01][variant:deferred-barrier]"
           }
         }
       ]
@@ -116,7 +116,7 @@
       "status": "implemented",
       "phase": "phase-1",
       "requiredLayers": ["L0", "L1"],
-      "requiredVariants": ["contracts", "public-api"],
+      "requiredVariants": ["contracts", "public-api", "legacy-forbid-all", "public-class-shape"],
       "cases": [
         {
           "caseId": "CON-01.l1.runtime-contracts",
@@ -138,6 +138,28 @@
             "type": "vitest",
             "file": "packages/core/test/subagent-public-api.test.ts",
             "testName": "[acceptance:API-02.l0.public-contracts][variant:public-api]"
+          }
+        },
+        {
+          "caseId": "API-01.l0.legacy-cutover",
+          "variant": "legacy-forbid-all",
+          "phase": "phase-1",
+          "layer": "L0",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/legacy-validator.test.ts",
+            "testName": "[acceptance:API-01.l0.legacy-cutover][variant:legacy-forbid-all]"
+          }
+        },
+        {
+          "caseId": "API-01.l1.agent-static-description-removed",
+          "variant": "public-class-shape",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:API-01.l1.agent-static-description-removed][variant:public-class-shape]"
           }
         }
       ]
@@ -167,50 +189,56 @@
       "status": "implemented",
       "phase": "phase-1",
       "requiredLayers": ["L1"],
-      "requiredVariants": ["recording-store", "state-controller", "task-state-machine"],
+      "requiredVariants": [
+        "transaction-local-idempotency",
+        "atomic-cas-events-rollback",
+        "declarative-atomic-runtime-commit",
+        "cas-conflict-rolls-back-whole-mutation",
+        "task-state-machine"
+      ],
       "cases": [
         {
           "caseId": "STATE-01",
-          "variant": "recording-store",
+          "variant": "transaction-local-idempotency",
           "phase": "phase-1",
           "layer": "L1",
           "evidenceSource": {
             "type": "vitest",
             "file": "packages/core/test/subagent-recording-state-store.test.ts",
-            "testName": "[acceptance:STATE-01][variant:recording-store]"
+            "testName": "[acceptance:STATE-01][variant:transaction-local-idempotency]"
           }
         },
         {
           "caseId": "STATE-02",
-          "variant": "recording-store",
+          "variant": "atomic-cas-events-rollback",
           "phase": "phase-1",
           "layer": "L1",
           "evidenceSource": {
             "type": "vitest",
             "file": "packages/core/test/subagent-recording-state-store.test.ts",
-            "testName": "[acceptance:STATE-02][variant:recording-store]"
+            "testName": "[acceptance:STATE-02][variant:atomic-cas-events-rollback]"
           }
         },
         {
           "caseId": "STATE-03",
-          "variant": "state-controller",
+          "variant": "declarative-atomic-runtime-commit",
           "phase": "phase-1",
           "layer": "L1",
           "evidenceSource": {
             "type": "vitest",
             "file": "packages/core/test/subagent-state-controller.test.ts",
-            "testName": "[acceptance:STATE-03][variant:state-controller]"
+            "testName": "[acceptance:STATE-03][variant:declarative-atomic-runtime-commit]"
           }
         },
         {
           "caseId": "STATE-04",
-          "variant": "state-controller",
+          "variant": "cas-conflict-rolls-back-whole-mutation",
           "phase": "phase-1",
           "layer": "L1",
           "evidenceSource": {
             "type": "vitest",
             "file": "packages/core/test/subagent-state-controller.test.ts",
-            "testName": "[acceptance:STATE-04][variant:state-controller]"
+            "testName": "[acceptance:STATE-04][variant:cas-conflict-rolls-back-whole-mutation]"
           }
         },
         {
@@ -231,7 +259,12 @@
       "status": "implemented",
       "phase": "phase-1",
       "requiredLayers": ["L1"],
-      "requiredVariants": ["active-recovery", "catalog-refresh", "oneof-zod"],
+      "requiredVariants": [
+        "active-recovery",
+        "catalog-refresh",
+        "oneof-zod",
+        "catalog-revision-request-snapshot"
+      ],
       "cases": [
         {
           "caseId": "DEF-02.l1.catalog",
@@ -265,6 +298,17 @@
             "file": "packages/core/test/subagent-model-tool-schema.test.ts",
             "testName": "[acceptance:API-02.l1.dynamic-wire][variant:oneof-zod]"
           }
+        },
+        {
+          "caseId": "API-02.l1.dynamic-wire-refresh",
+          "variant": "catalog-revision-request-snapshot",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:API-02.l1.dynamic-wire-refresh][variant:catalog-revision-request-snapshot]"
+          }
         }
       ]
     },
@@ -273,7 +317,19 @@
       "status": "implemented",
       "phase": "phase-1",
       "requiredLayers": ["L1"],
-      "requiredVariants": ["typed-result", "approval-resume", "attempt-fencing", "outcome-unknown"],
+      "requiredVariants": [
+        "typed-result",
+        "cancel-run-tree",
+        "approval-resume",
+        "multi-leaf-partial",
+        "attempt-fencing",
+        "external-binding-terminal",
+        "outcome-unknown",
+        "authoritative-partial",
+        "stable-error-matrix",
+        "staged-create-parent-checkpoint-atomic",
+        "expired-execution-lease-fenced-checkpoint-adoption"
+      ],
       "cases": [
         {
           "caseId": "RUNTIME-01.l1.execute",
@@ -284,6 +340,17 @@
             "type": "vitest",
             "file": "packages/core/test/subagent-runtime.test.ts",
             "testName": "[acceptance:RUNTIME-01.l1.execute][variant:typed-result]"
+          }
+        },
+        {
+          "caseId": "RUNTIME-02.l1.cancel-run-tree",
+          "variant": "cancel-run-tree",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime.test.ts",
+            "testName": "[acceptance:RUNTIME-02.l1.cancel-run-tree][variant:cancel-run-tree]"
           }
         },
         {
@@ -298,6 +365,17 @@
           }
         },
         {
+          "caseId": "APP-05.l1.nested-delegation-approval",
+          "variant": "multi-leaf-partial",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime.test.ts",
+            "testName": "[acceptance:APP-05.l1.nested-delegation-approval][variant:multi-leaf-partial]"
+          }
+        },
+        {
           "caseId": "REC-01.l1.attempt-fencing",
           "variant": "attempt-fencing",
           "phase": "phase-1",
@@ -306,6 +384,17 @@
             "type": "vitest",
             "file": "packages/core/test/subagent-runtime-adversarial.test.ts",
             "testName": "[acceptance:REC-01.l1.attempt-fencing][variant:attempt-fencing]"
+          }
+        },
+        {
+          "caseId": "REC-05.l1.external-terminal-reconnect",
+          "variant": "external-binding-terminal",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime-adversarial.test.ts",
+            "testName": "[acceptance:REC-05.l1.external-terminal-reconnect][variant:external-binding-terminal]"
           }
         },
         {
@@ -318,6 +407,50 @@
             "file": "packages/core/test/subagent-runtime-adversarial.test.ts",
             "testName": "[acceptance:ERR-01.l1.outcome-unknown][variant:outcome-unknown]"
           }
+        },
+        {
+          "caseId": "RES-09.l1.result-then-failure-partial",
+          "variant": "authoritative-partial",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime-adversarial.test.ts",
+            "testName": "[acceptance:RES-09.l1.result-then-failure-partial][variant:authoritative-partial]"
+          }
+        },
+        {
+          "caseId": "ERR-02.l1.stable-error-matrix",
+          "variant": "stable-error-matrix",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime.test.ts",
+            "testName": "[acceptance:ERR-02.l1.stable-error-matrix][variant:stable-error-matrix]"
+          }
+        },
+        {
+          "caseId": "RUN-02.l1.atomic-staged-create-mutation",
+          "variant": "staged-create-parent-checkpoint-atomic",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-state-controller.test.ts",
+            "testName": "[acceptance:RUN-02.l1.atomic-staged-create-mutation][variant:staged-create-parent-checkpoint-atomic]"
+          }
+        },
+        {
+          "caseId": "REC-02.l1.checkpoint-orphan-adoption",
+          "variant": "expired-execution-lease-fenced-checkpoint-adoption",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime.test.ts",
+            "testName": "[acceptance:REC-02.l1.checkpoint-orphan-adoption][variant:expired-execution-lease-fenced-checkpoint-adoption]"
+          }
         }
       ]
     },
@@ -325,8 +458,36 @@
       "requirementId": "C5-RUN",
       "status": "implemented",
       "phase": "phase-1",
-      "requiredLayers": ["L1"],
-      "requiredVariants": ["approval-checkpoint", "parent-child-cas"],
+      "requiredLayers": ["L1", "L3", "L4"],
+      "requiredVariants": [
+        "approval-checkpoint",
+        "model-operation",
+        "chat-resume-status",
+        "prepared-result-ready",
+        "prepared-result-ready-in-flight",
+        "parent-child-cas",
+        "aggregate-limit-rolls-back-entire-batch",
+        "atomic-clear-and-idempotent-replay",
+        "transaction-rollback-cas-recompute-terminal-immutable",
+        "stale-owner-cannot-terminalize",
+        "abort-after-provider-dispatch",
+        "atomic-root-task-before-adapter-cleanup",
+        "stale-agent-cannot-cancel-or-terminalize",
+        "mid-settlement-takeover-no-drift",
+        "root-child-exact-limit-and-idempotent-ledger",
+        "same-config-provider-excluded-and-drift-rejected",
+        "memory-root-approval-resume-and-instance-boundary",
+        "same-process-intent-budget-and-no-replay",
+        "explicit-rejection-summary-and-retry",
+        "atomic-stage-commit-dispatch-failpoints",
+        "atomic-root-batch",
+        "expired-execution-lease-checkpoint-adoption",
+        "chat-chat-approval-resume",
+        "chat-chat-chat",
+        "local-agent-child-exact-limit",
+        "explicit-400-summary-hook-safe-retry",
+        "in-flight-abort-fails-without-recovery-progress"
+      ],
       "cases": [
         {
           "caseId": "RUN-01.l1.approval-checkpoint",
@@ -340,6 +501,50 @@
           }
         },
         {
+          "caseId": "RUN-03.l1.model-operation",
+          "variant": "model-operation",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-run-controller.test.ts",
+            "testName": "[acceptance:RUN-03.l1.model-operation][variant:model-operation]"
+          }
+        },
+        {
+          "caseId": "RUN-07.l1.root-model-outcome-unknown",
+          "variant": "chat-resume-status",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:RUN-07.l1.root-model-outcome-unknown][variant:chat-resume-status]"
+          }
+        },
+        {
+          "caseId": "RUN-06.l1.summary-compact-crash-windows",
+          "variant": "prepared-result-ready",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:RUN-06.l1.summary-compact-crash-windows][variant:prepared-result-ready]"
+          }
+        },
+        {
+          "caseId": "RUN-06.l1.tool-payload-compact-crash-windows",
+          "variant": "prepared-result-ready-in-flight",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:RUN-06.l1.tool-payload-compact-crash-windows][variant:prepared-result-ready-in-flight]"
+          }
+        },
+        {
           "caseId": "RUN-02.l1.parent-child-cas",
           "variant": "parent-child-cas",
           "phase": "phase-1",
@@ -349,6 +554,237 @@
             "file": "packages/core/test/agent-run-controller.test.ts",
             "testName": "[acceptance:RUN-02.l1.parent-child-cas][variant:parent-child-cas]"
           }
+        },
+        {
+          "caseId": "RUN-02.l1.staged-batch-descendant-limit",
+          "variant": "aggregate-limit-rolls-back-entire-batch",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-run-controller.test.ts",
+            "testName": "[acceptance:RUN-02.l1.staged-batch-descendant-limit][variant:aggregate-limit-rolls-back-entire-batch]"
+          }
+        },
+        {
+          "caseId": "RUN-07.l1.root-terminalization",
+          "variant": "atomic-clear-and-idempotent-replay",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-run-controller.test.ts",
+            "testName": "[acceptance:RUN-07.l1.root-terminalization][variant:atomic-clear-and-idempotent-replay]"
+          }
+        },
+        {
+          "caseId": "RUN-07.l1.root-descendant-cancellation",
+          "variant": "transaction-rollback-cas-recompute-terminal-immutable",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-run-controller.test.ts",
+            "testName": "[acceptance:RUN-07.l1.root-descendant-cancellation][variant:transaction-rollback-cas-recompute-terminal-immutable]"
+          }
+        },
+        {
+          "caseId": "REC-01.l1.root-lease-loss-fencing",
+          "variant": "stale-owner-cannot-terminalize",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-run-controller.test.ts",
+            "testName": "[acceptance:REC-01.l1.root-lease-loss-fencing][variant:stale-owner-cannot-terminalize]"
+          }
+        },
+        {
+          "caseId": "RUN-07.l1.root-provider-abort-outcome-unknown",
+          "variant": "abort-after-provider-dispatch",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:RUN-07.l1.root-provider-abort-outcome-unknown][variant:abort-after-provider-dispatch]"
+          }
+        },
+        {
+          "caseId": "RUN-07.l1.root-caller-cancel-outcome",
+          "variant": "atomic-root-task-before-adapter-cleanup",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:RUN-07.l1.root-caller-cancel-outcome][variant:atomic-root-task-before-adapter-cleanup]"
+          }
+        },
+        {
+          "caseId": "REC-01.l1.root-agent-lease-takeover",
+          "variant": "stale-agent-cannot-cancel-or-terminalize",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:REC-01.l1.root-agent-lease-takeover][variant:stale-agent-cannot-cancel-or-terminalize]"
+          }
+        },
+        {
+          "caseId": "REC-01.l1.root-settlement-lease-takeover",
+          "variant": "mid-settlement-takeover-no-drift",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:REC-01.l1.root-settlement-lease-takeover][variant:mid-settlement-takeover-no-drift]"
+          }
+        },
+        {
+          "caseId": "ARK-12A.l1.shared-provider-budget",
+          "variant": "root-child-exact-limit-and-idempotent-ledger",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:ARK-12A.l1.shared-provider-budget][variant:root-child-exact-limit-and-idempotent-ledger]"
+          }
+        },
+        {
+          "caseId": "RUN-05.l1.root-configuration-identity",
+          "variant": "same-config-provider-excluded-and-drift-rejected",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:RUN-05.l1.root-configuration-identity][variant:same-config-provider-excluded-and-drift-rejected]"
+          }
+        },
+        {
+          "caseId": "API-02.l1.no-codec-same-process-root",
+          "variant": "memory-root-approval-resume-and-instance-boundary",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:API-02.l1.no-codec-same-process-root][variant:memory-root-approval-resume-and-instance-boundary]"
+          }
+        },
+        {
+          "caseId": "RUN-07.l1.no-codec-root-provider-abort",
+          "variant": "same-process-intent-budget-and-no-replay",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:RUN-07.l1.no-codec-root-provider-abort][variant:same-process-intent-budget-and-no-replay]"
+          }
+        },
+        {
+          "caseId": "RUN-03.l1.durable-context-length-recovery",
+          "variant": "explicit-rejection-summary-and-retry",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:RUN-03.l1.durable-context-length-recovery][variant:explicit-rejection-summary-and-retry]"
+          }
+        },
+        {
+          "caseId": "RUN-02.l3.parent-child-dispatch-crash-windows",
+          "variant": "atomic-stage-commit-dispatch-failpoints",
+          "phase": "phase-1",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "process",
+            "file": "packages/executor-local/test/parent-dispatch-crash.process.test.ts",
+            "testName": "[acceptance:RUN-02.l3.parent-child-dispatch-crash-windows][variant:atomic-stage-commit-dispatch-failpoints]"
+          }
+        },
+        {
+          "caseId": "RUN-04.l3.root-batch-process-recovery",
+          "variant": "atomic-root-batch",
+          "phase": "phase-1",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "process",
+            "file": "packages/executor-local/test/agent-batch-recovery.process.test.ts",
+            "testName": "[acceptance:RUN-04.l3.root-batch-process-recovery][variant:atomic-root-batch]"
+          }
+        },
+        {
+          "caseId": "RUN-04.l3.root-running-child-process-recovery",
+          "variant": "expired-execution-lease-checkpoint-adoption",
+          "phase": "phase-1",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "process",
+            "file": "packages/executor-local/test/running-child-process-recovery.process.test.ts",
+            "testName": "[acceptance:RUN-04.l3.root-running-child-process-recovery][variant:expired-execution-lease-checkpoint-adoption]"
+          }
+        },
+        {
+          "caseId": "RUN-03.l4.root-approval-resume.local",
+          "variant": "chat-chat-approval-resume",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/agent-resume-run.test.ts",
+            "testName": "[acceptance:RUN-03.l4.root-approval-resume.local][variant:chat-chat-approval-resume]"
+          }
+        },
+        {
+          "caseId": "APP-05.l4.nested-agent-resume.local",
+          "variant": "chat-chat-chat",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/agent-resume-run.test.ts",
+            "testName": "[acceptance:APP-05.l4.nested-agent-resume.local][variant:chat-chat-chat]"
+          }
+        },
+        {
+          "caseId": "ARK-12A.l4.shared-provider-budget.local",
+          "variant": "local-agent-child-exact-limit",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/agent-provider-controls.test.ts",
+            "testName": "[acceptance:ARK-12A.l4.shared-provider-budget.local][variant:local-agent-child-exact-limit]"
+          }
+        },
+        {
+          "caseId": "RUN-03.l4.child-context-length-recovery.local",
+          "variant": "explicit-400-summary-hook-safe-retry",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/agent-provider-controls.test.ts",
+            "testName": "[acceptance:RUN-03.l4.child-context-length-recovery.local][variant:explicit-400-summary-hook-safe-retry]"
+          }
+        },
+        {
+          "caseId": "RUN-07.l4.child-provider-abort-outcome-unknown.local",
+          "variant": "in-flight-abort-fails-without-recovery-progress",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/agent-provider-controls.test.ts",
+            "testName": "[acceptance:RUN-07.l4.child-provider-abort-outcome-unknown.local][variant:in-flight-abort-fails-without-recovery-progress]"
+          }
         }
       ]
     },
@@ -356,8 +792,14 @@
       "requirementId": "C5-BATCH",
       "status": "implemented",
       "phase": "phase-1",
-      "requiredLayers": ["L1"],
-      "requiredVariants": ["two-phase-approval", "ordered-resume"],
+      "requiredLayers": ["L1", "L4"],
+      "requiredVariants": [
+        "two-phase-approval",
+        "ordered-resume",
+        "multi-round-authoritative-sibling-reconcile",
+        "chat-local-multi-round-authoritative-resume",
+        "chat-chat-two-leaf-multi-round-resume"
+      ],
       "cases": [
         {
           "caseId": "BATCH-01.l1.two-phase-approval",
@@ -379,6 +821,39 @@
             "type": "vitest",
             "file": "packages/core/test/tool-batch.test.ts",
             "testName": "[acceptance:BATCH-02.l1.ordered-resume][variant:ordered-resume]"
+          }
+        },
+        {
+          "caseId": "BATCH-01.l1.staggered-sibling-reconcile",
+          "variant": "multi-round-authoritative-sibling-reconcile",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/tool-batch.test.ts",
+            "testName": "[acceptance:BATCH-01.l1.staggered-sibling-reconcile][variant:multi-round-authoritative-sibling-reconcile]"
+          }
+        },
+        {
+          "caseId": "BATCH-01.l4.staggered-sibling-approval.local",
+          "variant": "chat-local-multi-round-authoritative-resume",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/agent-resume-run.test.ts",
+            "testName": "[acceptance:BATCH-01.l4.staggered-sibling-approval.local][variant:chat-local-multi-round-authoritative-resume]"
+          }
+        },
+        {
+          "caseId": "APP-05.l4.staggered-nested-approval.local",
+          "variant": "chat-chat-two-leaf-multi-round-resume",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/agent-resume-run.test.ts",
+            "testName": "[acceptance:APP-05.l4.staggered-nested-approval.local][variant:chat-chat-two-leaf-multi-round-resume]"
           }
         }
       ]
@@ -407,8 +882,8 @@
       "requirementId": "C5-LOCAL-STORE",
       "status": "implemented",
       "phase": "phase-1",
-      "requiredLayers": ["L2"],
-      "requiredVariants": ["atomic-recovery", "lock-race", "filesystem-boundary"],
+      "requiredLayers": ["L2", "L3"],
+      "requiredVariants": ["atomic-recovery", "lock-race", "filesystem-boundary", "atomic-process"],
       "cases": [
         {
           "caseId": "STORE-LOCAL-01.l2.atomic-recovery",
@@ -441,6 +916,99 @@
             "type": "vitest",
             "file": "packages/executor-local/test/atomic-file-store.test.ts",
             "testName": "[acceptance:STORE-LOCAL-03.l2.filesystem-boundary][variant:filesystem-boundary]"
+          }
+        },
+        {
+          "caseId": "STORE-LOCAL-04.l3.process-recovery",
+          "variant": "atomic-process",
+          "phase": "phase-1",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "process",
+            "file": "packages/executor-local/test/atomic-file-recovery.process.test.ts",
+            "testName": "[acceptance:STORE-LOCAL-04.l3.process-recovery][variant:atomic-process]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C6-PROTOCOL-MATRIX",
+      "status": "implemented",
+      "phase": "phase-1",
+      "requiredLayers": ["L1", "L3", "L4"],
+      "requiredVariants": [
+        "custom-no-codec-checkpoint-external-rejected",
+        "chat-parent.chat-child",
+        "chat-parent.responses-child",
+        "responses-parent.chat-child",
+        "responses-parent.responses-child",
+        "bidirectional-approval-atomic-file"
+      ],
+      "cases": [
+        {
+          "caseId": "PRO-05.l1.no-codec-durable-rejected",
+          "variant": "custom-no-codec-checkpoint-external-rejected",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-v2-recovery.test.ts",
+            "testName": "[acceptance:PRO-05.l1.no-codec-durable-rejected][variant:custom-no-codec-checkpoint-external-rejected]"
+          }
+        },
+        {
+          "caseId": "PRO-01.l4.chat-chat.local",
+          "variant": "chat-parent.chat-child",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/protocol-matrix.test.ts",
+            "testName": "[acceptance:PRO-01.l4.chat-chat.local][variant:chat-parent.chat-child]"
+          }
+        },
+        {
+          "caseId": "PRO-02.l4.chat-responses.local",
+          "variant": "chat-parent.responses-child",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/protocol-matrix.test.ts",
+            "testName": "[acceptance:PRO-02.l4.chat-responses.local][variant:chat-parent.responses-child]"
+          }
+        },
+        {
+          "caseId": "PRO-03.l4.responses-chat.local",
+          "variant": "responses-parent.chat-child",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/protocol-matrix.test.ts",
+            "testName": "[acceptance:PRO-03.l4.responses-chat.local][variant:responses-parent.chat-child]"
+          }
+        },
+        {
+          "caseId": "PRO-04.l4.responses-responses.local",
+          "variant": "responses-parent.responses-child",
+          "phase": "phase-1",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-local/test/protocol-matrix.test.ts",
+            "testName": "[acceptance:PRO-04.l4.responses-responses.local][variant:responses-parent.responses-child]"
+          }
+        },
+        {
+          "caseId": "PRO-05.l3.cross-protocol-process-recovery",
+          "variant": "bidirectional-approval-atomic-file",
+          "phase": "phase-1",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "process",
+            "file": "packages/executor-local/test/cross-protocol-process-recovery.process.test.ts",
+            "testName": "[acceptance:PRO-05.l3.cross-protocol-process-recovery][variant:bidirectional-approval-atomic-file]"
           }
         }
       ]

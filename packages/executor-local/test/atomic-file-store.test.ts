@@ -66,6 +66,8 @@ describe('AtomicFileAgentRuntimeStateStore', () => {
     await expect(
       restarted.findTaskBySubAgentSession(SESSION_ID, task.subagentSessionId),
     ).resolves.toMatchObject({ taskId: task.taskId });
+    await expect(restarted.listTasksByRun(SESSION_ID, RUN_ID)).resolves.toEqual([task]);
+    await expect(restarted.listTasksByRun('another-session', RUN_ID)).resolves.toEqual([]);
 
     const nextLease = await restarted.acquireLease(`subagent-session:${SESSION_ID}`, 30_000);
     expect(nextLease.fencingToken).toBe('2');

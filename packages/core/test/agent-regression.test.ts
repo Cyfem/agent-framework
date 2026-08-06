@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { describe, expect, it, vi } from 'vitest';
 
 import { Agent } from '../src';
-import type { ToolCallErrorTrigger, ToolRuntimeDefinition } from '../src';
+import type { AgentRunOutcome, ToolCallErrorTrigger, ToolRuntimeDefinition } from '../src';
 import {
   assistant,
   endResponse,
@@ -26,6 +26,14 @@ function runtimeTool(
     parameters,
     handler,
   };
+}
+
+function succeededContext(outcome: AgentRunOutcome<TestProtocol>): readonly TestContext[] {
+  expect(outcome.status).toBe('succeeded');
+  if (outcome.status !== 'succeeded') {
+    throw new Error(`Expected a succeeded Agent run, received ${outcome.status}.`);
+  }
+  return outcome.context;
 }
 
 describe('Agent context and event regressions', () => {
@@ -262,7 +270,7 @@ describe('Agent tool execution regressions', () => {
     );
     agent.init();
 
-    const active = await agent.agent('start');
+    const active = succeededContext(await agent.agent('start'));
 
     expect(executionOrder).toEqual(['first:1', 'second:2']);
     expect(active.map((message) => message.kind)).toEqual([
@@ -327,7 +335,8 @@ describe('Agent retry and concurrency regressions', () => {
     agent.onAgentStatusChanged('failed', failed);
     agent.init();
 
-    await expect(agent.agent('empty')).rejects.toThrow('after 4 attempt(s)');
+    const outcome = await agent.agent('empty');
+    expect(outcome).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } });
 
     expect(model.requests).toHaveLength(4);
     expect(model.requests.every((request) => !('purpose' in request))).toBe(true);
@@ -355,7 +364,9 @@ describe('Agent retry and concurrency regressions', () => {
 
     await expect(firstAgent.agent('must not append')).rejects.toThrow('already running');
     releaseFirst();
-    const [firstResult, secondResult] = await Promise.all([firstRun, secondRun]);
+    const [firstOutcome, secondOutcome] = await Promise.all([firstRun, secondRun]);
+    const firstResult = succeededContext(firstOutcome);
+    const secondResult = succeededContext(secondOutcome);
 
     expect(firstResult[0]).toEqual({ kind: 'user', content: 'first input' });
     expect(secondResult[0]).toEqual({ kind: 'user', content: 'second input' });

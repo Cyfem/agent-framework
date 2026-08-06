@@ -1,4 +1,7 @@
+import { Buffer } from 'node:buffer';
+import { opendir, readFile } from 'node:fs/promises';
 import path from 'node:path';
+import ts from 'typescript';
 import {
   assert,
   assertArray,
@@ -32,6 +35,158 @@ const LAYERS = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5', 'L6'];
 const ID_PATTERN = /^[A-Z0-9][A-Z0-9._-]*$/u;
 const CASE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const VARIANT_PATTERN = /^[a-z0-9][a-z0-9._-]*$/u;
+const ACCEPTANCE_SOURCE_ROOTS = Object.freeze(['packages', 'demo', 'test', 'testkit']);
+const ACCEPTANCE_SOURCE_PATTERN = /\.test\.(?:[cm]?[jt]sx?)$/u;
+const MAX_ACCEPTANCE_SOURCE_BYTES = 4 * 1024 * 1024;
+
+function toPortablePath(value) {
+  return value.split(path.sep).join('/');
+}
+
+async function collectAcceptanceSourceFiles(repoRoot, manifest) {
+  const files = new Set();
+
+  async function visit(directory) {
+    const handle = await opendir(directory);
+    for await (const entry of handle) {
+      if (entry.isSymbolicLink()) continue;
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (!['node_modules', 'dist', 'coverage', '.git', '.tools'].includes(entry.name)) {
+          await visit(entryPath);
+        }
+        continue;
+      }
+      if (entry.isFile() && ACCEPTANCE_SOURCE_PATTERN.test(entry.name)) {
+        files.add(toPortablePath(path.relative(repoRoot, entryPath)));
+      }
+    }
+  }
+
+  for (const relativeRoot of ACCEPTANCE_SOURCE_ROOTS) {
+    const absoluteRoot = path.join(repoRoot, relativeRoot);
+    await visit(absoluteRoot).catch((error) => {
+      if (error?.code !== 'ENOENT') throw error;
+    });
+  }
+
+  for (const requirement of manifest.requirements) {
+    for (const entry of requirement.cases) {
+      if (
+        ['vitest', 'process'].includes(entry.evidenceSource.type) &&
+        entry.evidenceSource.file !== undefined
+      ) {
+        files.add(entry.evidenceSource.file);
+      }
+    }
+  }
+
+  return [...files].sort((left, right) => left.localeCompare(right, 'en'));
+}
+
+export function parseAcceptanceRegistrationsSource(source, relativeFile) {
+  assert(
+    Buffer.byteLength(source, 'utf8') <= MAX_ACCEPTANCE_SOURCE_BYTES,
+    `acceptance source exceeds 4 MiB: ${relativeFile}`,
+  );
+  const sourceFile = ts.createSourceFile(
+    relativeFile,
+    source.replace(/^\uFEFF/u, ''),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const registrations = [];
+
+  function visit(node) {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+      if (node.expression.text === 'acceptanceIt') {
+        const [caseIdNode, variantNode] = node.arguments;
+        const location = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+        const diagnostic = `${relativeFile}:${location.line + 1}`;
+        assert(
+          node.arguments.length >= 3 &&
+            ts.isStringLiteral(caseIdNode) &&
+            ts.isStringLiteral(variantNode),
+          `${diagnostic} acceptanceIt must use literal caseId and variant arguments`,
+        );
+        registrations.push({
+          caseId: caseIdNode.text,
+          variant: variantNode.text,
+          file: relativeFile,
+          line: location.line + 1,
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return registrations;
+}
+
+async function parseAcceptanceRegistrations(repoRoot, relativeFile) {
+  const absoluteFile = path.resolve(repoRoot, relativeFile);
+  return parseAcceptanceRegistrationsSource(await readFile(absoluteFile, 'utf8'), relativeFile);
+}
+
+async function validateAcceptanceRegistrations(manifest, repoRoot) {
+  const runtimeCases = [];
+  for (const requirement of manifest.requirements) {
+    for (const entry of requirement.cases) {
+      if (!['vitest', 'process'].includes(entry.evidenceSource.type)) continue;
+      assert(
+        entry.evidenceSource.file !== undefined,
+        `${entry.caseId} ${entry.evidenceSource.type} evidence requires a file`,
+      );
+      assert(
+        entry.evidenceSource.testName === `[acceptance:${entry.caseId}][variant:${entry.variant}]`,
+        `${entry.caseId} evidenceSource.testName must exactly match its acceptance registration`,
+      );
+      runtimeCases.push(entry);
+    }
+  }
+
+  const registrations = [];
+  for (const relativeFile of await collectAcceptanceSourceFiles(repoRoot, manifest)) {
+    registrations.push(...(await parseAcceptanceRegistrations(repoRoot, relativeFile)));
+  }
+
+  const registrationsById = new Map();
+  for (const registration of registrations) {
+    const previous = registrationsById.get(registration.caseId);
+    assert(
+      previous === undefined,
+      `acceptance case ${registration.caseId} is registered more than once: ${previous?.file}:${previous?.line} and ${registration.file}:${registration.line}`,
+    );
+    registrationsById.set(registration.caseId, registration);
+  }
+
+  const manifestCasesById = new Map(runtimeCases.map((entry) => [entry.caseId, entry]));
+  for (const entry of runtimeCases) {
+    const registration = registrationsById.get(entry.caseId);
+    assert(registration !== undefined, `${entry.caseId} has no literal acceptanceIt registration`);
+    assert(
+      registration.variant === entry.variant,
+      `${entry.caseId} variant mismatch: manifest=${entry.variant}, source=${registration.variant}`,
+    );
+    assert(
+      registration.file === entry.evidenceSource.file,
+      `${entry.caseId} source mismatch: manifest=${entry.evidenceSource.file}, source=${registration.file}`,
+    );
+  }
+
+  for (const registration of registrations) {
+    const entry = manifestCasesById.get(registration.caseId);
+    assert(
+      entry !== undefined,
+      `${registration.file}:${registration.line} acceptance case ${registration.caseId} is not registered in the manifest`,
+    );
+    assert(
+      entry.variant === registration.variant,
+      `${registration.file}:${registration.line} acceptance case ${registration.caseId} has unregistered variant ${registration.variant}`,
+    );
+  }
+}
 
 function validateProviderProfiles(manifest) {
   assertArray(manifest.providerProfiles, 'providerProfiles');
@@ -172,6 +327,7 @@ export async function loadAndValidateManifest(manifestPath, repoRoot) {
   }
   assertUnique(requirementIds, 'requirements.requirementId');
   assertUnique(caseIds, 'requirements.cases.caseId');
+  await validateAcceptanceRegistrations(manifest, repoRoot);
   return {
     manifest,
     digest: await sha256File(manifestPath),

@@ -11,6 +11,8 @@ import {
   type OpenAIResponsesProtocol,
 } from '@manee/agent-framework';
 
+import { requireSucceededContext } from './run-outcome';
+
 class OfflineSummaryResponsesModel extends OpenAIResponsesModel {
   summaryRequests = 0;
   agentRequests = 0;
@@ -107,7 +109,10 @@ const agent = new Agent<OpenAIResponsesProtocol>({
 });
 
 agent.init();
-await agent.agent('保留当前任务，同时压缩更早的 seed context。');
+requireSucceededContext(
+  await agent.agent('保留当前任务，同时压缩更早的 seed context。'),
+  'Responses context compact Agent',
+);
 
 assertDemo(model.summaryRequests === 1, 'Expected one proactive summary request.');
 assertDemo(model.agentRequests === 1, 'Expected one normal Agent request.');

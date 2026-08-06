@@ -11,6 +11,7 @@ import {
 
 import {
   createSubAgentRuntime,
+  canonicalJsonSha256,
   defineSubAgent,
   type JsonValue,
   type SubAgentChildRunner,
@@ -48,6 +49,7 @@ function candidate(taskId: string, output: JsonValue): SubAgentExecutionOutcome 
 async function createRuntime(
   runnerFactory: () => SubAgentChildRunner,
   store?: MemoryAgentRuntimeStateStore,
+  runnerVersion = '1',
 ) {
   const stateStore = store ?? new MemoryAgentRuntimeStateStore();
   if ((await stateStore.loadRun(SESSION_ID, RUN_ID)) === undefined) {
@@ -57,7 +59,7 @@ async function createRuntime(
     {
       definition,
       runnerId: 'researcher-runner',
-      runnerVersion: '1',
+      runnerVersion,
       childCheckpointVersions: ['1'],
       create: runnerFactory,
     },
@@ -83,7 +85,8 @@ function request(requestId = 'local-executor-request') {
   };
 }
 
-function childCheckpoint() {
+function childCheckpoint(callId = 'local-approval-call', toolName = 'local-sensitive-tool') {
+  const input = {};
   return {
     version: '1' as const,
     runnerId: 'researcher-runner',
@@ -102,6 +105,26 @@ function childCheckpoint() {
     },
     modelIteration: 1,
     maxIterations: 10,
+    pendingBatch: {
+      version: '1' as const,
+      batchId: `batch-${callId}`,
+      assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+      calls: [
+        {
+          version: '1' as const,
+          operationId: `operation-${callId}`,
+          kind: 'tool' as const,
+          callId,
+          name: toolName,
+          input,
+          inputHash: canonicalJsonSha256(input),
+          status: 'in_flight' as const,
+          order: 0,
+        },
+      ],
+      endRequested: false,
+      createdAt: 1,
+    },
   };
 }
 
@@ -134,12 +157,15 @@ function createConformanceSubject(
           }
 
           if (scenario === 'approval-resume' && child.checkpoint === undefined) {
-            await control.commitCheckpoint('conformance-checkpoint', checkpoint);
-            const directive = await control.authorizeTool('conformance-approval', {
-              callId: 'conformance-sensitive-call',
-              toolName: 'conformance-sensitive-tool',
-              summary: 'Approve the deterministic Executor conformance action.',
-            });
+            const directive = await control.authorizeTool(
+              'conformance-approval',
+              {
+                callId: 'conformance-sensitive-call',
+                toolName: 'conformance-sensitive-tool',
+                summary: 'Approve the deterministic Executor conformance action.',
+              },
+              checkpoint,
+            );
             if (directive.type !== 'suspend') {
               throw new Error('The first approval conformance run must suspend.');
             }
@@ -153,7 +179,19 @@ function createConformanceSubject(
           }
 
           if (scenario === 'approval-resume') {
-            expect(child.checkpoint).toEqual(checkpoint);
+            expect(child.checkpoint).toEqual({
+              ...checkpoint,
+              pendingBatch: {
+                ...checkpoint.pendingBatch,
+                calls: [
+                  {
+                    ...checkpoint.pendingBatch?.calls[0],
+                    status: 'waiting_approval',
+                    approvals: [`approval:${child.taskId}:conformance-sensitive-call`],
+                  },
+                ],
+              },
+            });
           }
           const output = { answer: `conformance:${scenario}` };
           await control.completion.submitResult(`conformance-result:${scenario}`, output);
@@ -218,12 +256,15 @@ describe('MemorySubAgentExecutor', () => {
     const { runtime, executor, store } = await createRuntime(() => ({
       async run(child, control) {
         runs += 1;
-        await control.commitCheckpoint(`local-checkpoint-${runs}`, childCheckpoint());
-        const directive = await control.authorizeTool(`local-approval-operation-${runs}`, {
-          callId: 'local-approval-call',
-          toolName: 'local-sensitive-tool',
-          summary: 'Allow the local deterministic action.',
-        });
+        const directive = await control.authorizeTool(
+          `local-approval-operation-${runs}`,
+          {
+            callId: 'local-approval-call',
+            toolName: 'local-sensitive-tool',
+            summary: 'Allow the local deterministic action.',
+          },
+          child.checkpoint ?? childCheckpoint(),
+        );
         if (directive.type === 'suspend') {
           return {
             type: 'paused',
@@ -273,12 +314,15 @@ describe('MemorySubAgentExecutor', () => {
       async run(child, control) {
         runs += 1;
         if (runs === 2) reconstructedCheckpoint = child.checkpoint;
-        await control.commitCheckpoint(`lost-checkpoint-operation-${runs}`, childCheckpoint());
-        const directive = await control.authorizeTool(`lost-approval-operation-${runs}`, {
-          callId: 'lost-call',
-          toolName: 'lost-tool',
-          summary: 'Pause before replacing the Executor instance.',
-        });
+        const directive = await control.authorizeTool(
+          `lost-approval-operation-${runs}`,
+          {
+            callId: 'lost-call',
+            toolName: 'lost-tool',
+            summary: 'Pause before replacing the Executor instance.',
+          },
+          child.checkpoint ?? childCheckpoint('lost-call', 'lost-tool'),
+        );
         if (directive.type === 'suspend') {
           return {
             type: 'paused',
@@ -315,11 +359,65 @@ describe('MemorySubAgentExecutor', () => {
       result: { status: 'succeeded', output: { answer: 'resumed-from-checkpoint' } },
     });
     expect(runs).toBe(2);
-    expect(reconstructedCheckpoint).toEqual(childCheckpoint());
+    expect(reconstructedCheckpoint).toMatchObject({
+      ...childCheckpoint('lost-call', 'lost-tool'),
+      pendingBatch: {
+        calls: [
+          {
+            callId: 'lost-call',
+            name: 'lost-tool',
+            status: 'waiting_approval',
+            approvals: [paused.approvals[0]!.approvalId],
+          },
+        ],
+      },
+    });
     expect(replacement.executor.descriptor.capabilities.recovery).toEqual({
       resume: 'checkpoint',
       reconnect: 'none',
     });
+  });
+
+  it('rejects checkpoint recovery when the persisted runner version is unavailable', async () => {
+    const store = new MemoryAgentRuntimeStateStore();
+    const pausingRunner = (): SubAgentChildRunner => ({
+      async run(child, control) {
+        const directive = await control.authorizeTool(
+          'runner-mismatch-approval',
+          {
+            callId: 'runner-mismatch-call',
+            toolName: 'runner-mismatch-tool',
+            summary: 'Pause before changing the trusted runner version.',
+          },
+          childCheckpoint('runner-mismatch-call', 'runner-mismatch-tool'),
+        );
+        if (directive.type !== 'suspend') throw new Error('expected approval suspension');
+        return {
+          type: 'paused',
+          reason: 'approval',
+          task: { taskId: child.taskId, subAgent: child.definition },
+          approvals: [directive.request],
+          checkpointRevision: directive.checkpointRevision,
+        };
+      },
+    });
+    const first = await createRuntime(pausingRunner, store);
+    const paused = await first.runtime.execute(request('runner-mismatch-request'));
+    if (paused.type !== 'paused') throw new Error('expected approval pause');
+    const replacement = await createRuntime(pausingRunner, store, '2');
+    const approval = paused.approvals[0]!;
+
+    await expect(
+      replacement.runtime.resume(SESSION_ID, paused.task.taskId, {
+        decisions: [
+          {
+            approvalId: approval.approvalId,
+            decision: 'approved',
+            expectedRevision: approval.revision,
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: 'CHECKPOINT_VERSION_MISMATCH' });
   });
 
   it('propagates host cancellation to the child signal and releases the runtime slot', async () => {

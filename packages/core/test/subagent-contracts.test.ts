@@ -15,6 +15,11 @@ import {
   type ExecutorTaskHandle,
   type ModelSubAgentRequest,
   type StoredAgentRun,
+  type StoredTask,
+  type SubAgentChildCheckpoint,
+  type SubAgentCompletionController,
+  type SubAgentDelegationClient,
+  type SubAgentExecutionControl,
   type SubAgentExecutionOutcome,
   type SubAgentExecutorOperation,
   type SubAgentRuntime,
@@ -52,6 +57,28 @@ type _ArtifactKeys = Assert<
   Equal<keyof ArtifactReference, 'version' | 'id' | 'mediaType' | 'size' | 'sha256'>
 >;
 type _RunMaxIterations = Assert<Equal<StoredAgentRun['maxIterations'], number | null>>;
+type _RunConfigurationHash = Assert<Equal<StoredAgentRun['configurationHash'], string>>;
+type _ChildResultSubmissionKeys = Assert<
+  Equal<
+    keyof NonNullable<SubAgentChildCheckpoint['resultSubmission']>,
+    'version' | 'callId' | 'output' | 'outputHash'
+  >
+>;
+type _StoredTaskHasFrozenLimits = Assert<
+  Equal<StoredTask['limits'], Readonly<StoredTask['limits']>>
+>;
+type _AuthoritativeFailureResult = Assert<
+  Equal<Awaited<ReturnType<SubAgentCompletionController['fail']>>, SubAgentTaskResult>
+>;
+type _DelegationPauseReceiptHasApprovals = Assert<
+  Equal<
+    keyof Awaited<ReturnType<SubAgentExecutionControl['pauseDelegation']>>,
+    'checkpointRevision' | 'approvals'
+  >
+>;
+type _DelegationResumeReturnsHostHandle = Assert<
+  Equal<Awaited<ReturnType<SubAgentDelegationClient['resumeTool']>>, SubAgentTaskHandle>
+>;
 type ContractAssertions = [
   _ModelWireKeys,
   _StateLookupScope,
@@ -61,6 +88,12 @@ type ContractAssertions = [
   _RawHandleHasBinding,
   _ArtifactKeys,
   _RunMaxIterations,
+  _RunConfigurationHash,
+  _ChildResultSubmissionKeys,
+  _StoredTaskHasFrozenLimits,
+  _AuthoritativeFailureResult,
+  _DelegationPauseReceiptHasApprovals,
+  _DelegationResumeReturnsHostHandle,
 ];
 
 void (undefined as ContractAssertions | undefined);

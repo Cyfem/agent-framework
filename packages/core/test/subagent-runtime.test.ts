@@ -3,10 +3,14 @@ import { setImmediate as waitImmediate } from 'node:timers/promises';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
-import { Deferred, RecordingRuntimeStateStore, acceptanceIt } from '../../../testkit';
+import { Deferred, ManualClock, RecordingRuntimeStateStore, acceptanceIt } from '../../../testkit';
 import {
   createSubAgentRuntime,
+  canonicalJsonSha256,
+  commitRuntimeStateMutation,
+  DEFAULT_SUBAGENT_LIMITS,
   defineSubAgent,
+  resolveSubAgentLimits,
   SubAgentRuntimeError,
   measureCanonicalJsonBytes,
   type ExecutorAvailabilityProbe,
@@ -14,18 +18,47 @@ import {
   type JsonValue,
   type ArtifactStore,
   type AgentCheckpointMigrator,
+  type AgentRunStateOwnership,
   type StoredAgentRun,
+  type SubAgentChildCheckpoint,
   type SubAgentDefinition,
   type SubAgentExecutionControl,
   type SubAgentExecutionOutcome,
+  type SubAgentErrorDescriptor,
   type SubAgentExecutionRequest,
   type SubAgentExecutor,
   type SubAgentExecutorBinding,
   type SubAgentExecutorDescriptor,
+  type SubAgentRuntimeOptions,
 } from '../src';
 
 const SESSION_ID = 'runtime-test-session';
 const RUN_ID = 'runtime-test-run';
+
+async function withRunOwnership<T>(
+  store: RecordingRuntimeStateStore,
+  runId: string,
+  work: (ownership: AgentRunStateOwnership) => Promise<T>,
+): Promise<T> {
+  const lease = await store.acquireLease(
+    `agent-run:${JSON.stringify([SESSION_ID, runId])}`,
+    30_000,
+  );
+  const controller = new AbortController();
+  const ownership: AgentRunStateOwnership = {
+    ownerSessionId: SESSION_ID,
+    runId,
+    fencingToken: lease.fencingToken,
+    signal: controller.signal,
+    useStateLease: (operation) => operation(lease),
+  };
+  try {
+    return await work(ownership);
+  } finally {
+    controller.abort();
+    await lease.release();
+  }
+}
 
 type ExecuteHandler = (
   request: SubAgentExecutionRequest,
@@ -56,6 +89,8 @@ function createRun(overrides: Partial<StoredAgentRun> = {}): StoredAgentRun {
     },
     modelIteration: 0,
     maxIterations: 10,
+    configurationHash: '0'.repeat(64),
+    limits: DEFAULT_SUBAGENT_LIMITS,
     budget: {
       descendantsCreated: 0,
       activeExecutions: 0,
@@ -179,7 +214,11 @@ class RuntimeTestExecutor implements SubAgentExecutor {
     };
   }
 
-  async cancel(binding: SubAgentExecutorBinding): Promise<void> {
+  async cancel(
+    binding: SubAgentExecutorBinding,
+    _options: Parameters<SubAgentExecutor['cancel']>[1],
+  ): Promise<void> {
+    void _options;
     this.rawCancelCalls += 1;
     this.cancelledBindings.push(binding);
   }
@@ -243,6 +282,73 @@ function childCheckpoint(runnerVersion = '1') {
   };
 }
 
+function approvalCheckpoint(callId: string, toolName: string, runnerVersion = '1') {
+  const input = {};
+  return {
+    ...childCheckpoint(runnerVersion),
+    pendingBatch: {
+      version: '1' as const,
+      batchId: `approval-batch-${callId}`,
+      assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+      calls: [
+        {
+          version: '1' as const,
+          operationId: `approval-operation-${callId}`,
+          kind: 'tool' as const,
+          callId,
+          name: toolName,
+          input,
+          inputHash: canonicalJsonSha256(input),
+          status: 'in_flight' as const,
+          order: 0,
+        },
+      ],
+      endRequested: false,
+      createdAt: 1_001,
+    },
+  };
+}
+
+function childModelCheckpoint(
+  phase: 'prepared' | 'in_flight' | 'result_ready',
+): SubAgentChildCheckpoint {
+  const updatedAt = phase === 'prepared' ? 1_001 : phase === 'in_flight' ? 1_002 : 1_003;
+  return {
+    ...childCheckpoint(),
+    modelOperation: {
+      version: '1',
+      operationId: 'child-model-operation',
+      iteration: 1,
+      purpose: 'agent',
+      requestHash: 'a'.repeat(64),
+      phase,
+      ...(phase === 'result_ready'
+        ? {
+            result: {
+              protocol: 'openai-chat',
+              codecVersion: '1',
+              value: [],
+            },
+          }
+        : {}),
+      preparedAt: 1_001,
+      updatedAt,
+    },
+  };
+}
+
+function childResultCheckpoint(callId: string, output: JsonValue): SubAgentChildCheckpoint {
+  return {
+    ...childCheckpoint(),
+    resultSubmission: {
+      version: '1',
+      callId,
+      output,
+      outputHash: canonicalJsonSha256(output),
+    },
+  };
+}
+
 async function successfulExecution(
   request: SubAgentExecutionRequest,
   control: SubAgentExecutionControl,
@@ -256,21 +362,34 @@ async function successfulExecution(
 
 async function createFixture(options: {
   readonly definition?: SubAgentDefinition;
+  readonly activeDefinitions?: readonly SubAgentDefinition[];
+  readonly recoveryDefinitions?: readonly SubAgentDefinition[];
   readonly executors?: readonly RuntimeTestExecutor[];
   readonly store?: RecordingRuntimeStateStore;
   readonly artifactStore?: ArtifactStore;
   readonly checkpointMigrators?: readonly AgentCheckpointMigrator[];
   readonly executionLeaseTtlMs?: number;
+  readonly limits?: SubAgentRuntimeOptions['limits'];
   readonly initializeRun?: boolean;
 }) {
   const store = options.store ?? new RecordingRuntimeStateStore();
-  if (options.initializeRun !== false) await store.createRun(createRun());
+  if (options.initializeRun !== false) {
+    await store.createRun(
+      createRun({
+        limits: resolveSubAgentLimits(options.limits),
+      }),
+    );
+  }
   const executors = options.executors ?? [new RuntimeTestExecutor()];
   const runtime = createSubAgentRuntime({
     sessionId: SESSION_ID,
-    activeDefinitions: [options.definition ?? createDefinition()],
+    activeDefinitions: options.activeDefinitions ?? [options.definition ?? createDefinition()],
+    ...(options.recoveryDefinitions === undefined
+      ? {}
+      : { recoveryDefinitions: options.recoveryDefinitions }),
     executors,
     stateStore: store,
+    ...(options.limits === undefined ? {} : { limits: options.limits }),
     ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
     ...(options.checkpointMigrators === undefined
       ? {}
@@ -332,12 +451,15 @@ async function createPausedAdapterV2Fixture(): Promise<{
     'local',
     async (execution, control) => {
       await control.commitBinding('binding-v2', createBinding(execution, 'local', '1', '2'));
-      await control.commitCheckpoint('checkpoint-v2', childCheckpoint());
-      const directive = await control.authorizeTool('approval-v2', {
-        callId: 'adapter-migration-call',
-        toolName: 'adapter-migration-tool',
-        summary: 'Pause so the persisted binding can be upgraded.',
-      });
+      const directive = await control.authorizeTool(
+        'approval-v2',
+        {
+          callId: 'adapter-migration-call',
+          toolName: 'adapter-migration-tool',
+          summary: 'Pause so the persisted binding can be upgraded.',
+        },
+        approvalCheckpoint('adapter-migration-call', 'adapter-migration-tool'),
+      );
       if (directive.type !== 'suspend') throw new Error('expected approval suspension');
       return {
         type: 'paused',
@@ -362,6 +484,249 @@ async function createPausedAdapterV2Fixture(): Promise<{
     approvalId: approval.approvalId,
     approvalRevision: approval.revision,
   };
+}
+
+async function captureRejectedRuntimeDescriptor(
+  operation: () => Promise<unknown>,
+): Promise<Readonly<SubAgentErrorDescriptor>> {
+  try {
+    await operation();
+  } catch (error) {
+    if (error instanceof SubAgentRuntimeError) return error.descriptor;
+    throw error;
+  }
+  throw new Error('expected a SubAgentRuntimeError rejection');
+}
+
+function terminalErrorDescriptor(
+  outcome: SubAgentExecutionOutcome,
+): Readonly<SubAgentErrorDescriptor> {
+  if (outcome.type !== 'terminal' || outcome.result.status === 'succeeded') {
+    throw new Error('expected a non-success terminal subagent outcome');
+  }
+  return outcome.result.error;
+}
+
+async function triggerDefinitionVersionMismatch(
+  secret: string,
+): Promise<Readonly<SubAgentErrorDescriptor>> {
+  const parent = createDefinition({
+    ...createDefinition(),
+    name: 'stable-error-parent',
+    delegation: { mode: 'allowlist', definitions: ['researcher'] },
+  });
+  const child = createDefinition();
+  const executor = new RuntimeTestExecutor();
+  const initial = await createFixture({
+    activeDefinitions: [parent, child],
+    executors: [executor],
+  });
+  const parentOutcome = await initial.runtime.execute(
+    executeRequest({
+      requestId: 'stable-error-parent-version',
+      subAgent: parent.name,
+      input: { value: 'parent' },
+    }),
+  );
+  if (parentOutcome.type !== 'terminal') throw new Error('expected a terminal parent task');
+
+  const replacement = await createFixture({
+    activeDefinitions: [child],
+    executors: [executor],
+    store: initial.store,
+    initializeRun: false,
+  });
+  return captureRejectedRuntimeDescriptor(() =>
+    replacement.runtime.execute(
+      executeRequest({
+        requestId: 'stable-error-definition-version',
+        parentTaskId: parentOutcome.result.task.taskId,
+        input: { value: secret },
+      }),
+    ),
+  );
+}
+
+async function triggerInvalidInput(secret: string): Promise<Readonly<SubAgentErrorDescriptor>> {
+  const { runtime } = await createFixture({});
+  return captureRejectedRuntimeDescriptor(() =>
+    runtime.execute(
+      executeRequest({
+        requestId: 'stable-error-invalid-input',
+        input: { value: secret, mode: 'not-an-allowed-mode' },
+      }),
+    ),
+  );
+}
+
+async function triggerContextProjectionFailure(
+  secret: string,
+): Promise<Readonly<SubAgentErrorDescriptor>> {
+  const definition = createDefinition({
+    contextProjector: () => {
+      throw new Error(secret);
+    },
+  });
+  const { runtime } = await createFixture({ definition });
+  return captureRejectedRuntimeDescriptor(() =>
+    runtime.execute(
+      executeRequest({
+        requestId: 'stable-error-context-projector',
+        input: { value: secret },
+      }),
+    ),
+  );
+}
+
+async function triggerAdapterStateVersionMismatch(
+  secret: string,
+): Promise<Readonly<SubAgentErrorDescriptor>> {
+  const fixture = await createPausedAdapterV2Fixture();
+  const current = fixture.store.snapshot(SESSION_ID).tasks[0]!;
+  await replacePersistedBinding(fixture.store, fixture.taskId, {
+    ...current.binding!,
+    adapterStateVersion: '1',
+    recoveryData: { token: secret },
+  });
+  const executor = new RuntimeTestExecutor(
+    'local',
+    async () => {
+      throw new Error('executor must not run without a binding migration path');
+    },
+    COMPLETE_CAPABILITIES,
+    64 * 1024,
+    '1',
+    '2',
+  );
+  const { runtime } = await createFixture({
+    store: fixture.store,
+    executors: [executor],
+    initializeRun: false,
+  });
+  return captureRejectedRuntimeDescriptor(() =>
+    runtime.resume(SESSION_ID, fixture.taskId, {
+      decisions: [
+        {
+          approvalId: fixture.approvalId,
+          decision: 'approved',
+          expectedRevision: fixture.approvalRevision,
+        },
+      ],
+    }),
+  );
+}
+
+async function triggerApprovalRejected(secret: string): Promise<Readonly<SubAgentErrorDescriptor>> {
+  const fixture = await createPausedAdapterV2Fixture();
+  const executor = new RuntimeTestExecutor(
+    'local',
+    async () => {
+      throw new Error('executor must not run after a rejected approval');
+    },
+    COMPLETE_CAPABILITIES,
+    64 * 1024,
+    '1',
+    '2',
+  );
+  const { runtime } = await createFixture({
+    store: fixture.store,
+    executors: [executor],
+    initializeRun: false,
+  });
+  const outcome = await runtime.resume(SESSION_ID, fixture.taskId, {
+    decisions: [
+      {
+        approvalId: fixture.approvalId,
+        decision: 'rejected',
+        reason: secret,
+        expectedRevision: fixture.approvalRevision,
+      },
+    ],
+  });
+  return terminalErrorDescriptor(outcome);
+}
+
+async function triggerChildDefinitionDisallowed(
+  secret: string,
+): Promise<Readonly<SubAgentErrorDescriptor>> {
+  const parent = createDefinition({
+    ...createDefinition(),
+    name: 'stable-error-nondelegating-parent',
+    delegation: { mode: 'none' },
+  });
+  const child = createDefinition();
+  const { runtime } = await createFixture({ activeDefinitions: [parent, child] });
+  const parentOutcome = await runtime.execute(
+    executeRequest({
+      requestId: 'stable-error-nondelegating-parent',
+      subAgent: parent.name,
+      input: { value: 'parent' },
+    }),
+  );
+  if (parentOutcome.type !== 'terminal') throw new Error('expected a terminal parent task');
+  return captureRejectedRuntimeDescriptor(() =>
+    runtime.execute(
+      executeRequest({
+        requestId: 'stable-error-child-disallowed',
+        parentTaskId: parentOutcome.result.task.taskId,
+        input: { value: secret },
+      }),
+    ),
+  );
+}
+
+async function triggerRecoveryUnsupported(
+  secret: string,
+): Promise<Readonly<SubAgentErrorDescriptor>> {
+  const fixture = await createPausedAdapterV2Fixture();
+  const current = fixture.store.snapshot(SESSION_ID).tasks[0]!;
+  await replacePersistedBinding(fixture.store, fixture.taskId, {
+    ...current.binding!,
+    recoveryData: { token: secret },
+  });
+  const executor = new RuntimeTestExecutor(
+    'local',
+    async () => {
+      throw new Error('executor must not run when resume recovery is disabled');
+    },
+    {
+      ...COMPLETE_CAPABILITIES,
+      approval: false,
+      recovery: { resume: 'none', reconnect: 'external_binding' },
+    },
+    64 * 1024,
+    '1',
+    '2',
+  );
+  const { runtime } = await createFixture({
+    store: fixture.store,
+    executors: [executor],
+    initializeRun: false,
+  });
+  return captureRejectedRuntimeDescriptor(() =>
+    runtime.resume(SESSION_ID, fixture.taskId, {
+      decisions: [
+        {
+          approvalId: fixture.approvalId,
+          decision: 'approved',
+          expectedRevision: fixture.approvalRevision,
+        },
+      ],
+    }),
+  );
+}
+
+async function triggerTimedOut(secret: string): Promise<Readonly<SubAgentErrorDescriptor>> {
+  const { runtime } = await createFixture({});
+  return captureRejectedRuntimeDescriptor(() =>
+    runtime.execute(
+      executeRequest({
+        requestId: 'stable-error-timed-out',
+        input: { value: secret },
+        deadlineAt: Date.now() - 1,
+      }),
+    ),
+  );
 }
 
 describe('SubAgentRuntime execution contract', () => {
@@ -412,6 +777,81 @@ describe('SubAgentRuntime execution contract', () => {
       result: { status: 'failed', error: { code: 'END_AGENT_MUST_BE_STANDALONE' } },
     });
   });
+
+  acceptanceIt(
+    'REC-02.l1.checkpoint-orphan-adoption',
+    'expired-execution-lease-fenced-checkpoint-adoption',
+    async () => {
+      const clock = new ManualClock(Date.now());
+      const store = new RecordingRuntimeStateStore({ now: clock.now });
+      const firstEntered = new Deferred<void>();
+      const firstExecutor = new RuntimeTestExecutor('local', async (request, control) => {
+        await control.commitBinding('orphan-binding', createBinding(request));
+        await control.commitCheckpoint('orphan-checkpoint', childCheckpoint());
+        firstEntered.resolve(undefined);
+        return new Promise<never>((_resolve, reject) => {
+          if (control.signal.aborted) reject(control.signal.reason);
+          else
+            control.signal.addEventListener('abort', () => reject(control.signal.reason), {
+              once: true,
+            });
+        });
+      });
+      const first = await createFixture({
+        store,
+        executors: [firstExecutor],
+        executionLeaseTtlMs: 30,
+      });
+      const original = first.runtime.execute(
+        executeRequest({ requestId: 'running-orphan-adoption' }),
+      );
+      original.catch(() => undefined);
+      await firstEntered.promise;
+      const before = store.snapshot(SESSION_ID).tasks[0]!;
+      expect(before).toMatchObject({
+        state: 'running',
+        attempt: 1,
+        recoveryRequired: false,
+        childCheckpoint: { version: '1' },
+      });
+      const firstFence = before.executionFencingToken;
+
+      const recoveredExecutor = new RuntimeTestExecutor('local', async (request, control) => {
+        expect(request.operation).toMatchObject({ type: 'resume', reason: 'checkpoint' });
+        const output = { answer: 'adopted-proof' };
+        await control.completion.submitResult('adopted-result', output);
+        await control.completion.complete('adopted-end', { isStandalone: true });
+        return candidateOutcome(request, output);
+      });
+      const replacement = await createFixture({
+        store,
+        executors: [recoveredExecutor],
+        executionLeaseTtlMs: 30,
+        initializeRun: false,
+      });
+      clock.advanceBy(31);
+      const recoveredHandle = await replacement.runtime.recover(SESSION_ID, before.taskId);
+      await expect(recoveredHandle.wait()).resolves.toMatchObject({
+        type: 'terminal',
+        result: { status: 'succeeded', output: { answer: 'adopted-proof' } },
+      });
+
+      const terminal = store.snapshot(SESSION_ID).tasks[0]!;
+      expect(terminal).toMatchObject({ state: 'succeeded', attempt: 2 });
+      expect(terminal.executionFencingToken).not.toBe(firstFence);
+      expect(firstExecutor.executeCalls).toHaveLength(1);
+      expect(recoveredExecutor.executeCalls).toHaveLength(1);
+      const terminalRevision = terminal.revision;
+
+      const secondRecovery = await replacement.runtime.recover(SESSION_ID, before.taskId);
+      await expect(secondRecovery.wait()).resolves.toMatchObject({
+        type: 'terminal',
+        result: { status: 'succeeded' },
+      });
+      expect(recoveredExecutor.executeCalls).toHaveLength(1);
+      expect(store.snapshot(SESSION_ID).tasks[0]?.revision).toBe(terminalRevision);
+    },
+  );
 
   it('rejects nested delegation after the parent result phase closes', async () => {
     const parentDefinition = createDefinition({
@@ -587,6 +1027,214 @@ describe('SubAgentRuntime execution contract', () => {
     expect(store.snapshot(SESSION_ID).runs[0]?.budget.activeExecutions).toBe(0);
   });
 
+  acceptanceIt('RUNTIME-02.l1.cancel-run-tree', 'cancel-run-tree', async () => {
+    const executor = new RuntimeTestExecutor();
+    const recursiveDefinition = createDefinition({
+      delegation: { mode: 'allowlist', definitions: ['researcher'], allowSelf: true },
+    });
+    const store = new RecordingRuntimeStateStore();
+    await store.createRun(createRun());
+    await store.createRun(createRun({ runId: 'other-run' }));
+    const { runtime } = await createFixture({
+      definition: recursiveDefinition,
+      executors: [executor],
+      store,
+      initializeRun: false,
+    });
+
+    const parent = await runtime.spawn(executeRequest({ requestId: 'tree-parent' }));
+    await vi.waitFor(() => expect(executor.spawnCalls).toHaveLength(1));
+    const child = await runtime.spawn(
+      executeRequest({
+        requestId: 'tree-child',
+        parentTaskId: parent.taskId,
+        input: { value: 'child' },
+      }),
+    );
+    await vi.waitFor(() => expect(executor.spawnCalls).toHaveLength(2));
+    const grandchild = await runtime.spawn(
+      executeRequest({
+        requestId: 'tree-grandchild',
+        parentTaskId: child.taskId,
+        input: { value: 'grandchild' },
+      }),
+    );
+    const isolated = await runtime.spawn(
+      executeRequest({
+        runId: 'other-run',
+        requestId: 'isolated-task',
+        input: { value: 'isolated' },
+      }),
+    );
+    await vi.waitFor(() => expect(executor.spawnCalls).toHaveLength(4));
+
+    const cancelled = await withRunOwnership(store, RUN_ID, (ownership) =>
+      runtime.cancelRunDescendants(SESSION_ID, RUN_ID, ownership, 'root run cancelled', {
+        operationId: 'cancel-root-run-1',
+      }),
+    );
+    expect(new Map(cancelled.map(({ taskId, state }) => [taskId, state]))).toEqual(
+      new Map([
+        [parent.taskId, 'cancelled'],
+        [child.taskId, 'cancelled'],
+        [grandchild.taskId, 'cancelled'],
+      ]),
+    );
+    expect((await isolated.snapshot()).state).toBe('running');
+
+    const persisted = store.snapshot(SESSION_ID).tasks;
+    expect(
+      persisted
+        .filter(({ runId }) => runId === RUN_ID)
+        .map(({ depth, state, controlOperations }) => ({
+          depth,
+          state,
+          operationId: controlOperations.at(-1)?.operationId,
+        }))
+        .sort((left, right) => left.depth - right.depth),
+    ).toEqual([
+      { depth: 1, state: 'cancelled', operationId: `cancel-root-run-1:${parent.taskId}` },
+      { depth: 2, state: 'cancelled', operationId: `cancel-root-run-1:${child.taskId}` },
+      { depth: 3, state: 'cancelled', operationId: `cancel-root-run-1:${grandchild.taskId}` },
+    ]);
+
+    const rawCancelCalls = executor.rawCancelCalls;
+    await expect(
+      withRunOwnership(store, RUN_ID, (ownership) =>
+        runtime.cancelRunDescendants(SESSION_ID, RUN_ID, ownership, 'root run cancelled', {
+          operationId: 'cancel-root-run-1',
+        }),
+      ),
+    ).resolves.toHaveLength(3);
+    expect(executor.rawCancelCalls).toBe(rawCancelCalls);
+    for (const lookup of [
+      withRunOwnership(store, RUN_ID, (ownership) =>
+        runtime.cancelRunDescendants('another-session', RUN_ID, ownership),
+      ),
+      withRunOwnership(store, 'unknown-run', (ownership) =>
+        runtime.cancelRunDescendants(SESSION_ID, 'unknown-run', ownership),
+      ),
+    ]) {
+      await expect(lookup).rejects.toMatchObject({ code: 'RESOURCE_NOT_FOUND' });
+    }
+
+    await withRunOwnership(store, 'other-run', (ownership) =>
+      runtime.cancelRunDescendants(SESSION_ID, 'other-run', ownership, 'test cleanup'),
+    );
+    await Promise.all([parent.wait(), child.wait(), grandchild.wait(), isolated.wait()]);
+  });
+
+  it('retries terminal-run adapter cancellation with the same stable operation', async () => {
+    const executor = new RuntimeTestExecutor();
+    const adapterCancel = vi
+      .spyOn(executor, 'cancel')
+      .mockRejectedValueOnce(new Error('adapter unavailable on first cleanup attempt'))
+      .mockResolvedValueOnce(undefined);
+    const { runtime, store } = await createFixture({ executors: [executor] });
+    const handle = await runtime.spawn(executeRequest({ requestId: 'retry-adapter-cleanup' }));
+    await vi.waitFor(() =>
+      expect(store.snapshot(SESSION_ID).tasks).toMatchObject([
+        { taskId: handle.taskId, state: 'running', binding: { executorName: 'local' } },
+      ]),
+    );
+
+    await withRunOwnership(store, RUN_ID, async (ownership) => {
+      await expect(
+        runtime.cancelRunDescendants(SESSION_ID, RUN_ID, ownership, 'retry cleanup', {
+          operationId: 'stable-root-cancel',
+        }),
+      ).resolves.toHaveLength(1);
+      expect(adapterCancel).toHaveBeenCalledOnce();
+      const taskAfterFirstAttempt = store.snapshot(SESSION_ID).tasks[0]!;
+
+      await ownership.useStateLease(async (lease) => {
+        const current = (await store.loadRun(SESSION_ID, RUN_ID))!;
+        const terminal: StoredAgentRun = Object.freeze({
+          ...current,
+          status: 'cancelled',
+          revision: current.revision + 1,
+          fencingToken: lease.fencingToken,
+          error: Object.freeze({
+            code: 'CANCELLED',
+            message: 'The root run was cancelled.',
+            retryable: false,
+          }),
+          updatedAt: Math.max(Date.now(), current.updatedAt),
+        });
+        await commitRuntimeStateMutation(store, SESSION_ID, lease, {
+          run: { previous: current, next: terminal },
+        });
+      });
+
+      await expect(
+        runtime.cancelRunDescendants(SESSION_ID, RUN_ID, ownership, 'retry cleanup', {
+          operationId: 'stable-root-cancel',
+        }),
+      ).resolves.toHaveLength(1);
+      expect(adapterCancel).toHaveBeenCalledTimes(2);
+      expect(adapterCancel.mock.calls[0]?.[1].operationId).toBe(
+        `stable-root-cancel:${handle.taskId}`,
+      );
+      expect(adapterCancel.mock.calls[1]?.[1].operationId).toBe(
+        adapterCancel.mock.calls[0]?.[1].operationId,
+      );
+      expect(store.snapshot(SESSION_ID).tasks[0]).toEqual(taskAfterFirstAttempt);
+    });
+
+    await expect(handle.wait()).resolves.toMatchObject({
+      type: 'terminal',
+      result: { status: 'cancelled' },
+    });
+  });
+
+  it('keeps a terminal task irreversible when completion races run-descendant cancellation', async () => {
+    const finish = new Deferred<void>();
+    const executor = new RuntimeTestExecutor('local', async (request, control) => {
+      await finish.promise;
+      const output = { answer: 'racing completion' };
+      await control.completion.submitResult('race-result', output);
+      await control.completion.complete('race-end', { isStandalone: true });
+      return candidateOutcome(request, output);
+    });
+    const { runtime, store } = await createFixture({ executors: [executor] });
+    const handle = await runtime.submitTool(
+      { subAgent: 'researcher', executor: 'local', input: { value: 'race' } },
+      {
+        ownerSessionId: SESSION_ID,
+        runId: RUN_ID,
+        requestId: 'race-request',
+        parentContext: [],
+        parentRawHistory: [],
+        signal: new AbortController().signal,
+      },
+    );
+    await vi.waitFor(() => expect(executor.executeCalls).toHaveLength(1));
+
+    const cancellation = withRunOwnership(store, RUN_ID, (ownership) =>
+      runtime.cancelRunDescendants(SESSION_ID, RUN_ID, ownership, 'race cancellation', {
+        operationId: 'race-cancel',
+      }),
+    );
+    finish.resolve(undefined);
+    const [cancelled, outcome] = await Promise.all([cancellation, handle.wait()]);
+    expect(cancelled).toHaveLength(1);
+    expect(outcome.type).toBe('terminal');
+    const terminal = store.snapshot(SESSION_ID).tasks[0]!;
+    expect(['succeeded', 'cancelled']).toContain(terminal.state);
+    const revision = terminal.revision;
+
+    await withRunOwnership(store, RUN_ID, (ownership) =>
+      runtime.cancelRunDescendants(SESSION_ID, RUN_ID, ownership, 'race cancellation', {
+        operationId: 'race-cancel',
+      }),
+    );
+    expect(store.snapshot(SESSION_ID).tasks[0]).toMatchObject({
+      state: terminal.state,
+      revision,
+    });
+    expect(store.snapshot(SESSION_ID).runs[0]?.budget.activeExecutions).toBe(0);
+  });
+
   it('deduplicates replayed control operations and scopes artifacts to the task', async () => {
     const artifactScopes: Array<{ ownerSessionId: string; taskId: string }> = [];
     const bytes = new Uint8Array([1, 2, 3]);
@@ -702,6 +1350,215 @@ describe('SubAgentRuntime execution contract', () => {
     });
   });
 
+  it('persists child Model crash-window phases and rejects a skipped transition', async () => {
+    const store = new RecordingRuntimeStateStore();
+    const persistedPhases: Array<string | undefined> = [];
+    const executor = new RuntimeTestExecutor('local', async (execution, control) => {
+      await control.commitBinding('child-model-binding', createBinding(execution));
+
+      const prepared = childModelCheckpoint('prepared');
+      await control.commitCheckpoint('child-model-prepared', prepared);
+      persistedPhases.push(
+        store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint?.modelOperation?.phase,
+      );
+
+      await expect(
+        control.commitCheckpoint('child-model-invalid-skip', childModelCheckpoint('result_ready')),
+      ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
+      persistedPhases.push(
+        store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint?.modelOperation?.phase,
+      );
+
+      await control.commitCheckpoint('child-model-in-flight', childModelCheckpoint('in_flight'));
+      persistedPhases.push(
+        store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint?.modelOperation?.phase,
+      );
+
+      await control.commitCheckpoint(
+        'child-model-result-ready',
+        childModelCheckpoint('result_ready'),
+      );
+      persistedPhases.push(
+        store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint?.modelOperation?.phase,
+      );
+
+      await control.commitCheckpoint('child-model-applied', childCheckpoint());
+      persistedPhases.push(
+        store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint?.modelOperation?.phase,
+      );
+
+      const output = { answer: 'durable-child-model' };
+      await control.completion.submitResult('child-model-result', output);
+      await control.completion.complete('child-model-end', { isStandalone: true });
+      return candidateOutcome(execution, output);
+    });
+    const { runtime } = await createFixture({ executors: [executor], store });
+
+    await expect(
+      runtime.execute(executeRequest({ requestId: 'child-model-crash-windows' })),
+    ).resolves.toMatchObject({
+      type: 'terminal',
+      result: { status: 'succeeded', output: { answer: 'durable-child-model' } },
+    });
+    expect(persistedPhases).toEqual([
+      'prepared',
+      'prepared',
+      'in_flight',
+      'result_ready',
+      undefined,
+    ]);
+    expect(store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint).toEqual(childCheckpoint());
+  });
+
+  it('accepts only the size-bounded child result proof matching the authoritative result CAS', async () => {
+    const output = { answer: 'authoritative-result-proof' };
+    const executor = new RuntimeTestExecutor('local', async (execution, control) => {
+      await control.commitBinding('result-proof-binding', createBinding(execution));
+      await control.completion.submitResult('result-proof-call', output);
+
+      await expect(
+        control.commitCheckpoint('result-proof-missing', childCheckpoint()),
+      ).rejects.toMatchObject({ code: 'RESULT_REQUIRED' });
+      await expect(
+        control.commitCheckpoint(
+          'result-proof-conflict',
+          childResultCheckpoint('result-proof-call', { answer: 'conflicting-result' }),
+        ),
+      ).rejects.toMatchObject({ code: 'RESULT_REPLAY_CONFLICT' });
+      const staleInput = { result: output, extra: true };
+      await expect(
+        control.commitCheckpoint('result-proof-stale-call', {
+          ...childResultCheckpoint('result-proof-call', output),
+          pendingBatch: {
+            version: '1',
+            batchId: 'result-proof-stale-batch',
+            assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+            calls: [
+              {
+                version: '1',
+                operationId: 'result-proof-stale-operation',
+                kind: 'tool',
+                callId: 'result-proof-call',
+                name: 'agent-result',
+                input: staleInput,
+                inputHash: canonicalJsonSha256(staleInput),
+                status: 'in_flight',
+                order: 0,
+              },
+            ],
+            endRequested: false,
+            createdAt: 1_001,
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'CHECKPOINT_MIGRATION_FAILED' });
+      const linkedInput = { result: output };
+      await expect(
+        control.commitCheckpoint('result-proof-stale-tool-output', {
+          ...childResultCheckpoint('result-proof-call', output),
+          pendingBatch: {
+            version: '1',
+            batchId: 'result-proof-stale-output-batch',
+            assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+            calls: [
+              {
+                version: '1',
+                operationId: 'result-proof-stale-output-operation',
+                kind: 'tool',
+                callId: 'result-proof-call',
+                name: 'agent-result',
+                input: linkedInput,
+                inputHash: canonicalJsonSha256(linkedInput),
+                status: 'result_submitted',
+                result: JSON.stringify({
+                  ok: true,
+                  status: 'accepted',
+                  outputHash: 'b'.repeat(64),
+                }),
+                order: 0,
+              },
+            ],
+            endRequested: false,
+            createdAt: 1_001,
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'CHECKPOINT_MIGRATION_FAILED' });
+      const unrelatedInput = {};
+      await expect(
+        control.commitCheckpoint('result-proof-unrelated-tool', {
+          ...childResultCheckpoint('result-proof-call', output),
+          pendingBatch: {
+            version: '1',
+            batchId: 'result-proof-unrelated-batch',
+            assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+            calls: [
+              {
+                version: '1',
+                operationId: 'result-proof-unrelated-operation',
+                kind: 'tool',
+                callId: 'unrelated-call',
+                name: 'unrelated-tool',
+                input: unrelatedInput,
+                inputHash: canonicalJsonSha256(unrelatedInput),
+                status: 'in_flight',
+                order: 0,
+              },
+            ],
+            endRequested: false,
+            createdAt: 1_001,
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'CHECKPOINT_MIGRATION_FAILED' });
+      const oversized = { answer: 'x'.repeat(256 * 1024) };
+      await expect(
+        control.commitCheckpoint(
+          'result-proof-oversized',
+          childResultCheckpoint('result-proof-call', oversized),
+        ),
+      ).rejects.toMatchObject({ code: 'CHECKPOINT_MIGRATION_FAILED' });
+
+      const endInput = {};
+      await control.commitCheckpoint('result-proof-valid', {
+        ...childResultCheckpoint('result-proof-call', output),
+        pendingBatch: {
+          version: '1',
+          batchId: 'result-proof-end-batch',
+          assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+          calls: [
+            {
+              version: '1',
+              operationId: 'result-proof-end-operation',
+              kind: 'end-agent',
+              callId: 'result-proof-end-call',
+              name: 'end-agent',
+              input: endInput,
+              inputHash: canonicalJsonSha256(endInput),
+              status: 'in_flight',
+              order: 0,
+            },
+          ],
+          endRequested: false,
+          createdAt: 1_002,
+        },
+      });
+      await control.completion.complete('result-proof-end', { isStandalone: true });
+      return candidateOutcome(execution, output);
+    });
+    const { runtime, store } = await createFixture({ executors: [executor] });
+
+    await expect(
+      runtime.execute(executeRequest({ requestId: 'result-proof-validation' })),
+    ).resolves.toMatchObject({
+      type: 'terminal',
+      result: { status: 'succeeded', output },
+    });
+    expect(store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint?.resultSubmission).toEqual({
+      version: '1',
+      callId: 'result-proof-call',
+      output,
+      outputHash: canonicalJsonSha256(output),
+    });
+  });
+
   it('applies only a runner-scoped copy-on-write child checkpoint migrator', async () => {
     const legacy = {
       ...childCheckpoint(),
@@ -739,7 +1596,8 @@ describe('SubAgentRuntime execution contract', () => {
       runtime.execute(executeRequest({ requestId: 'checkpoint-migrator' })),
     ).resolves.toMatchObject({ type: 'terminal', result: { status: 'succeeded' } });
     expect(legacy).toEqual(original);
-    expect(store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint).toMatchObject({
+    const pausedTask = store.snapshot(SESSION_ID).tasks[0]!;
+    expect(pausedTask.childCheckpoint).toMatchObject({
       version: '1',
       runnerId: 'test-runner',
       runnerVersion: '1',
@@ -890,11 +1748,16 @@ describe('SubAgentRuntime execution contract', () => {
     const executor = new RuntimeTestExecutor(
       'local',
       async (execution, control) => {
-        const approval = await control.authorizeTool('adapter-resume-approval', {
-          callId: 'adapter-migration-call',
-          toolName: 'adapter-migration-tool',
-          summary: 'Pause so the persisted binding can be upgraded.',
-        });
+        if (execution.operation.type !== 'resume') throw new Error('expected resume operation');
+        const approval = await control.authorizeTool(
+          'adapter-resume-approval',
+          {
+            callId: 'adapter-migration-call',
+            toolName: 'adapter-migration-tool',
+            summary: 'Pause so the persisted binding can be upgraded.',
+          },
+          execution.operation.checkpoint,
+        );
         if (approval.type !== 'approved') throw new Error('expected approval decision');
         const output = { answer: 'adapter-v2' };
         await control.completion.submitResult('adapter-result', output);
@@ -1011,11 +1874,33 @@ describe('SubAgentRuntime execution contract', () => {
       );
       if (request.operation.type === 'create') {
         await control.commitBinding('approval-binding', createBinding(request));
-        await control.commitCheckpoint('approval-checkpoint', childCheckpoint());
-        const directive = await control.authorizeTool('approval-request', {
+        const approvalInput = {
           callId: 'dangerous-call',
           toolName: 'dangerous-tool',
           summary: 'Permit the deterministic test operation.',
+        };
+        const checkpoint = approvalCheckpoint('dangerous-call', 'dangerous-tool');
+        const conflictingCheckpoint = {
+          ...structuredClone(checkpoint),
+          pendingBatch: {
+            ...structuredClone(checkpoint.pendingBatch),
+            batchId: 'conflicting-approval-batch',
+          },
+        };
+        const [first, second, conflicting] = await Promise.allSettled([
+          control.authorizeTool('approval-request', approvalInput, checkpoint),
+          control.authorizeTool('approval-request', approvalInput, structuredClone(checkpoint)),
+          control.authorizeTool('approval-request', approvalInput, conflictingCheckpoint),
+        ]);
+        if (first.status !== 'fulfilled' || second.status !== 'fulfilled') {
+          throw new Error('expected exact approval operation replay');
+        }
+        const directive = first.value;
+        const replay = second.value;
+        expect(replay).toEqual(directive);
+        expect(conflicting).toMatchObject({
+          status: 'rejected',
+          reason: { code: 'IDEMPOTENCY_CONFLICT' },
         });
         if (directive.type !== 'suspend') throw new Error('expected approval suspension');
         return {
@@ -1027,11 +1912,16 @@ describe('SubAgentRuntime execution contract', () => {
         };
       }
 
-      const directive = await control.authorizeTool('approval-resume', {
-        callId: 'dangerous-call',
-        toolName: 'dangerous-tool',
-        summary: 'Permit the deterministic test operation.',
-      });
+      if (request.operation.type !== 'resume') throw new Error('expected resume operation');
+      const directive = await control.authorizeTool(
+        'approval-resume',
+        {
+          callId: 'dangerous-call',
+          toolName: 'dangerous-tool',
+          summary: 'Permit the deterministic test operation.',
+        },
+        request.operation.checkpoint,
+      );
       if (directive.type !== 'approved') throw new Error('expected committed approval');
       const output = { answer: 'approved-proof' };
       await control.completion.submitResult('approved-result', output);
@@ -1044,6 +1934,20 @@ describe('SubAgentRuntime execution contract', () => {
     expect(paused).toMatchObject({ type: 'paused', reason: 'approval' });
     if (paused.type !== 'paused') throw new Error('expected paused outcome');
     const approval = paused.approvals[0]!;
+    const pausedTask = store.snapshot(SESSION_ID).tasks[0]!;
+    expect(pausedTask.childCheckpoint).toMatchObject({
+      pendingBatch: {
+        calls: [
+          {
+            callId: 'dangerous-call',
+            status: 'waiting_approval',
+            approvals: [approval.approvalId],
+          },
+        ],
+      },
+    });
+    expect(pausedTask.approvals).toHaveLength(1);
+    expect(pausedTask.controlOperations.filter(({ kind }) => kind === 'approval')).toHaveLength(1);
     const resumed = await runtime.resume(SESSION_ID, paused.task.taskId, {
       decisions: [
         {
@@ -1065,6 +1969,274 @@ describe('SubAgentRuntime execution contract', () => {
       approvals: [],
       approvalDecisions: [{ approvalId: approval.approvalId, decision: 'approved' }],
     });
+  });
+
+  acceptanceIt('APP-05.l1.nested-delegation-approval', 'multi-leaf-partial', async () => {
+    const parentDefinition = createDefinition({
+      name: 'coordinator',
+      delegation: { mode: 'allowlist', definitions: ['approval-worker'] },
+    });
+    const workerDefinition = defineSubAgent({
+      name: 'approval-worker',
+      version: '1',
+      description: 'Pause on one guarded operation before returning a typed proof.',
+      inputSchema: z.object({ lane: z.enum(['first', 'second']) }),
+      outputSchema: z.object({ answer: z.string() }),
+    });
+    const workerResumes: string[] = [];
+    const parentTaskIds: string[] = [];
+    const executor = new RuntimeTestExecutor('local', async (request, control) => {
+      await control.commitBinding(`binding:${request.taskId}`, createBinding(request));
+      if (request.definition.name === workerDefinition.name) {
+        const lane = (request.input as { lane: 'first' | 'second' }).lane;
+        const toolCallId = `guarded-${lane}`;
+        if (request.operation.type === 'create') {
+          const directive = await control.authorizeTool(
+            `approval:${lane}`,
+            {
+              callId: toolCallId,
+              toolName: 'guarded-worker-tool',
+              summary: `Approve ${lane} worker operation.`,
+            },
+            approvalCheckpoint(toolCallId, 'guarded-worker-tool'),
+          );
+          if (directive.type !== 'suspend') throw new Error('expected leaf approval pause');
+          return {
+            type: 'paused',
+            reason: 'approval',
+            task: { taskId: request.taskId, subAgent: request.definition },
+            approvals: [directive.request],
+            checkpointRevision: directive.checkpointRevision,
+          };
+        }
+        workerResumes.push(lane);
+        if (request.operation.type !== 'resume') throw new Error('expected worker resume');
+        const directive = await control.authorizeTool(
+          `approval-resume:${lane}`,
+          {
+            callId: toolCallId,
+            toolName: 'guarded-worker-tool',
+            summary: `Approve ${lane} worker operation.`,
+          },
+          request.operation.checkpoint,
+        );
+        if (directive.type !== 'approved') throw new Error('expected durable approval decision');
+        const output = { answer: `worker-proof:${lane}` };
+        await control.completion.submitResult(`result:${lane}`, output);
+        await control.completion.complete(`end:${lane}`, { isStandalone: true });
+        return candidateOutcome(request, output);
+      }
+
+      parentTaskIds.push(request.taskId);
+      if (request.operation.type === 'create') {
+        const leafOutcomes = await Promise.all(
+          (['first', 'second'] as const).map((lane) =>
+            control.delegation.execute({
+              requestId: `nested:${lane}`,
+              subAgent: workerDefinition.name,
+              executor: 'local',
+              input: { lane },
+            }),
+          ),
+        );
+        if (leafOutcomes.some((outcome) => outcome.type !== 'paused')) {
+          throw new Error('expected both delegated leaves to pause');
+        }
+        const pausedLeaves = leafOutcomes.map((outcome, index) => {
+          if (outcome.type !== 'paused') throw new Error('expected paused leaf');
+          return {
+            lane: (['first', 'second'] as const)[index]!,
+            taskId: outcome.task.taskId,
+            approvals: outcome.approvals,
+          };
+        });
+        const pendingCalls = pausedLeaves.map((leaf, order) => {
+          const input = {
+            subAgent: workerDefinition.name,
+            executor: 'local',
+            input: { lane: leaf.lane },
+          };
+          return {
+            version: '1' as const,
+            operationId: `delegate-operation:${leaf.lane}`,
+            kind: 'agent' as const,
+            callId: `delegate:${leaf.lane}`,
+            name: 'agent',
+            input,
+            inputHash: canonicalJsonSha256(input),
+            status: 'waiting_approval' as const,
+            order,
+            taskId: leaf.taskId,
+            approvals: leaf.approvals.map(({ approvalId }) => approvalId),
+          };
+        });
+        const checkpoint: SubAgentChildCheckpoint = {
+          ...childCheckpoint(),
+          pendingBatch: {
+            version: '1',
+            batchId: 'delegated-approval-batch',
+            assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+            calls: pendingCalls,
+            endRequested: false,
+            createdAt: 1_002,
+          },
+        };
+        const pauseInput = {
+          checkpoint,
+          calls: pausedLeaves.map((leaf) => ({
+            callId: `delegate:${leaf.lane}`,
+            childTaskId: leaf.taskId,
+            approvals: leaf.approvals,
+          })),
+        };
+        const receipt = await control.pauseDelegation('delegation-pause', pauseInput);
+        expect(await control.pauseDelegation('delegation-pause', pauseInput)).toEqual(receipt);
+        return {
+          type: 'paused',
+          reason: 'approval',
+          task: { taskId: request.taskId, subAgent: request.definition },
+          approvals: receipt.approvals,
+          checkpointRevision: receipt.checkpointRevision,
+        };
+      }
+
+      if (request.operation.type !== 'resume') throw new Error('expected parent resume');
+      const calls = request.operation.checkpoint.pendingBatch?.calls ?? [];
+      const handles = await Promise.all(
+        calls.map((call) => control.delegation.resumeTool(call.taskId!)),
+      );
+      const outcomes = await Promise.all(handles.map((handle) => handle.wait()));
+      expect(
+        outcomes.map((outcome) => outcome.type === 'terminal' && outcome.result.status),
+      ).toEqual(['succeeded', 'failed']);
+      const output = { answer: 'parent-observed-approved-and-rejected-leaves' };
+      await control.completion.submitResult('parent-result', output);
+      await control.completion.complete('parent-end', { isStandalone: true });
+      return candidateOutcome(request, output);
+    });
+    const { runtime, store } = await createFixture({
+      activeDefinitions: [parentDefinition, workerDefinition as unknown as SubAgentDefinition],
+      executors: [executor],
+    });
+
+    const paused = await runtime.execute(
+      executeRequest({ subAgent: parentDefinition.name, requestId: 'nested-parent' }),
+    );
+    if (paused.type !== 'paused') throw new Error('expected parent delegation pause');
+    expect(paused.approvals).toHaveLength(2);
+    expect(new Set(paused.approvals.map(({ taskId }) => taskId)).size).toBe(2);
+    const [firstApproval, secondApproval] = paused.approvals;
+
+    const partial = await runtime.resume(SESSION_ID, paused.task.taskId, {
+      decisions: [
+        {
+          approvalId: firstApproval!.approvalId,
+          expectedRevision: firstApproval!.revision,
+          decision: 'approved',
+        },
+      ],
+    });
+    expect(partial).toMatchObject({
+      type: 'paused',
+      approvals: [{ approvalId: secondApproval!.approvalId }],
+    });
+    await expect(runtime.wait(SESSION_ID, firstApproval!.taskId)).resolves.toMatchObject({
+      type: 'terminal',
+      result: { status: 'succeeded' },
+    });
+    expect(workerResumes).toEqual(['first']);
+    expect(parentTaskIds).toHaveLength(1);
+
+    const resumed = await runtime.resume(SESSION_ID, paused.task.taskId, {
+      decisions: [
+        {
+          approvalId: secondApproval!.approvalId,
+          expectedRevision: secondApproval!.revision,
+          decision: 'rejected',
+        },
+      ],
+    });
+    expect(resumed).toMatchObject({
+      type: 'terminal',
+      result: {
+        status: 'succeeded',
+        output: { answer: 'parent-observed-approved-and-rejected-leaves' },
+      },
+    });
+    expect(workerResumes).toEqual(['first']);
+    expect(parentTaskIds).toHaveLength(2);
+    const tasks = store.snapshot(SESSION_ID).tasks;
+    expect(tasks).toHaveLength(3);
+    expect(tasks.find(({ input }) => (input as { lane?: string }).lane === 'first')).toMatchObject({
+      state: 'succeeded',
+      attempt: 2,
+    });
+    expect(tasks.find(({ input }) => (input as { lane?: string }).lane === 'second')).toMatchObject(
+      {
+        state: 'failed',
+        error: { code: 'APPROVAL_REJECTED' },
+      },
+    );
+  });
+
+  it('rejects a recovery runtime configured with different persisted limits before advancing state', async () => {
+    const executor = new RuntimeTestExecutor('local', async (request, control) => {
+      if (request.operation.type === 'create') {
+        await control.commitBinding('frozen-limits-binding', createBinding(request));
+        const directive = await control.authorizeTool(
+          'frozen-limits-approval',
+          {
+            callId: 'frozen-limits-call',
+            toolName: 'frozen-limits-tool',
+            summary: 'Pause before testing the persisted task budget.',
+          },
+          approvalCheckpoint('frozen-limits-call', 'frozen-limits-tool'),
+        );
+        if (directive.type !== 'suspend') throw new Error('expected approval suspension');
+        return {
+          type: 'paused',
+          reason: 'approval',
+          task: { taskId: request.taskId, subAgent: request.definition },
+          approvals: [directive.request],
+          checkpointRevision: directive.checkpointRevision,
+        };
+      }
+
+      throw new Error('A mismatched recovery runtime must not dispatch the Executor.');
+    });
+    const store = new RecordingRuntimeStateStore();
+    const initial = await createFixture({
+      store,
+      executors: [executor],
+      limits: { maxTurns: 1 },
+    });
+    const paused = await initial.runtime.execute(
+      executeRequest({ requestId: 'frozen-limits-task' }),
+    );
+    if (paused.type !== 'paused') throw new Error('expected paused task');
+    expect(store.snapshot(SESSION_ID).tasks[0]?.limits.maxTurns).toBe(1);
+    const beforeRecovery = store.snapshot(SESSION_ID);
+    expect(executor.executeCalls).toHaveLength(1);
+
+    const replacement = await createFixture({
+      store,
+      executors: [executor],
+      limits: { maxTurns: 99 },
+      initializeRun: false,
+    });
+    await expect(
+      replacement.runtime.resume(SESSION_ID, paused.task.taskId, {
+        decisions: [
+          {
+            approvalId: paused.approvals[0]!.approvalId,
+            decision: 'approved',
+            expectedRevision: paused.approvals[0]!.revision,
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: 'CHECKPOINT_VERSION_MISMATCH' });
+    expect(executor.executeCalls).toHaveLength(1);
+    expect(store.snapshot(SESSION_ID)).toEqual(beforeRecovery);
   });
 
   it('allows only a host retry of a same-version non-success terminal task', async () => {
@@ -1111,5 +2283,66 @@ describe('SubAgentRuntime execution contract', () => {
         }),
       ),
     ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
+  });
+
+  acceptanceIt('ERR-02.l1.stable-error-matrix', 'stable-error-matrix', async () => {
+    const secret = 'provider-secret-body-must-not-enter-stable-errors';
+    const scenarios: readonly {
+      readonly code: SubAgentErrorDescriptor['code'];
+      readonly message: string;
+      readonly run: (secretValue: string) => Promise<Readonly<SubAgentErrorDescriptor>>;
+    }[] = [
+      {
+        code: 'DEFINITION_VERSION_MISMATCH',
+        message: 'The parent subagent definition version is unavailable.',
+        run: triggerDefinitionVersionMismatch,
+      },
+      {
+        code: 'INVALID_INPUT',
+        message: 'The subagent input failed schema validation.',
+        run: triggerInvalidInput,
+      },
+      {
+        code: 'CONTEXT_PROJECTION_FAILED',
+        message: 'The subagent context projector failed.',
+        run: triggerContextProjectionFailure,
+      },
+      {
+        code: 'ADAPTER_STATE_VERSION_MISMATCH',
+        message: 'No Executor binding migration path is registered.',
+        run: triggerAdapterStateVersionMismatch,
+      },
+      {
+        code: 'APPROVAL_REJECTED',
+        message: 'The approval request was rejected by the host.',
+        run: triggerApprovalRejected,
+      },
+      {
+        code: 'CHILD_DEFINITION_DISALLOWED',
+        message: 'The parent task does not allow this child definition.',
+        run: triggerChildDefinitionDisallowed,
+      },
+      {
+        code: 'RECOVERY_UNSUPPORTED',
+        message: 'The persisted Executor does not support resume.',
+        run: triggerRecoveryUnsupported,
+      },
+      {
+        code: 'TIMED_OUT',
+        message: 'The subagent operation timed out.',
+        run: triggerTimedOut,
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const descriptor = await scenario.run(secret);
+      expect.soft(descriptor, scenario.code).toStrictEqual({
+        code: scenario.code,
+        message: scenario.message,
+        retryable: false,
+      });
+      expect.soft(JSON.stringify(descriptor), `${scenario.code} redaction`).not.toContain(secret);
+      expect.soft(Object.hasOwn(descriptor, 'causeCode'), `${scenario.code} causeCode`).toBe(false);
+    }
   });
 });

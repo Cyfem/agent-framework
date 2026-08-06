@@ -31,6 +31,8 @@ import * as koffi from 'koffi';
 import { PNG } from 'pngjs';
 import { z } from 'zod';
 
+import { requireSucceededContext } from './run-outcome';
+
 const execFileAsync = promisify(execFile);
 
 const defaultArkBaseURL = 'https://ark.cn-beijing.volces.com/api/v3';
@@ -1236,7 +1238,7 @@ export async function runWindowsDemo(apiKey: string): Promise<void> {
     .filter((line) => line.length > 0)
     .join('\n');
 
-  const finalContext = await agent.agent(task);
+  const finalContext = requireSucceededContext(await agent.agent(task), 'Windows Agent');
 
   console.log(`windows demo complete: messages=${finalContext.length}`);
 }

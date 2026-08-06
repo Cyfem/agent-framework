@@ -5,6 +5,7 @@ import type {
   ModelGenerateRequest,
   ModelGenerateResult,
 } from '../llm/base/types';
+import { SubAgentRuntimeError } from '../subagent/errors';
 import type {
   AfterModelErrorRecoveryCallback,
   AfterModelErrorRecoveryDecision,
@@ -52,6 +53,11 @@ interface RecoveryHandlerContext<P extends AgentProtocol> {
 
 export interface GenerateWithModelErrorRecoveryOptions<P extends AgentProtocol> {
   readonly model: Model<P>;
+  /**
+   * Optional durable single-attempt transport. The recovery state machine still owns
+   * requestAttempt and retry policy; callers can fence each provider dispatch around it.
+   */
+  readonly generate?: (request: ModelGenerateRequest<P>) => Promise<ModelGenerateResult<P>>;
   readonly purpose: ModelGeneratePurpose;
   readonly buildRequest: () => ModelGenerateRequest<P>;
   readonly limits: Readonly<ResolvedModelErrorRecoveryLimits>;
@@ -179,8 +185,24 @@ export async function generateWithModelErrorRecovery<P extends AgentProtocol>(
     throwIfAborted(request.signal, request.deadlineAt);
 
     try {
-      return await awaitWithAbort(options.model.generate(request), request.signal);
+      // A durable attempt owns its dispatch fence and must finish classifying/persisting an
+      // aborted transport before this recovery layer observes the result. Racing it with a
+      // second abort wrapper could surface caller cancellation while the durable callback has
+      // already committed MODEL_OUTCOME_UNKNOWN.
+      return options.generate === undefined
+        ? await awaitWithAbort(options.model.generate(request), request.signal)
+        : await options.generate(request);
     } catch (cause) {
+      // A request which may already have reached the provider is never eligible for a
+      // framework retry. Retrying here could duplicate an externally visible operation.
+      if (
+        cause instanceof SubAgentRuntimeError &&
+        (cause.descriptor.outcomeUnknown === true ||
+          cause.descriptor.code === 'BUDGET_EXCEEDED' ||
+          cause.descriptor.code === 'RECOVERY_TARGET_LOST')
+      ) {
+        throw cause;
+      }
       if (isAbortError(cause, request.signal)) {
         throwIfAborted(request.signal, request.deadlineAt);
         throw cause;

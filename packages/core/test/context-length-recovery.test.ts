@@ -77,17 +77,6 @@ function summaryPolicy(overrides?: {
   };
 }
 
-async function captureRecoveryError(promise: Promise<unknown>): Promise<ModelErrorRecoveryError> {
-  try {
-    await promise;
-  } catch (error) {
-    expect(error).toBeInstanceOf(ModelErrorRecoveryError);
-    return error as ModelErrorRecoveryError;
-  }
-
-  throw new Error('Expected ModelErrorRecoveryError.');
-}
-
 describe('Agent context-length recovery integration', () => {
   it('summarizes the entire boundary in emergency mode, retries with compacted context, and exposes complete hook events', async () => {
     const seed = user('seed history');
@@ -244,6 +233,7 @@ describe('Agent context-length recovery integration', () => {
     });
     const beforeEvents: BeforeModelErrorRecoveryEvent<TestProtocol>[] = [];
     const afterEvents: AfterModelErrorRecoveryEvent<TestProtocol>[] = [];
+    let observedError: Error | undefined;
 
     agent.onBeforeModelErrorRecovery((event) => {
       if (event.purpose === 'agent') beforeEvents.push(event);
@@ -251,9 +241,15 @@ describe('Agent context-length recovery integration', () => {
     agent.onAfterModelErrorRecovery((event) => {
       if (event.purpose === 'agent') afterEvents.push(event);
     });
+    agent.onAgentError((error) => {
+      observedError = error;
+    });
     agent.init();
 
-    const error = await captureRecoveryError(agent.agent(current.content));
+    const outcome = await agent.agent(current.content);
+    expect(outcome).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } });
+    expect(observedError).toBeInstanceOf(ModelErrorRecoveryError);
+    const error = observedError as ModelErrorRecoveryError;
 
     expect(model.requests.map((request) => request.purpose)).toEqual([
       undefined,

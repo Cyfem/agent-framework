@@ -1,3 +1,4 @@
+export * from './agent-runner';
 export * from './local-runner-registry';
 export * from './memory-executor';
 export * from './state/atomic-file-store';

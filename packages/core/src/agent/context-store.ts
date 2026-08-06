@@ -241,6 +241,17 @@ export class ContextStore<P extends AgentProtocol> {
       try {
         context = codec.decode(cloneJsonValue(value, label));
       } catch (error) {
+        // Transient same-process codecs intentionally signal that their opaque
+        // payload is unavailable to a replacement Agent instance. Preserve the
+        // stable control-plane error so callers can distinguish that boundary
+        // from a corrupt durable checkpoint.
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          Reflect.get(error, 'code') === 'RECOVERY_UNSUPPORTED'
+        ) {
+          throw error;
+        }
         throw new ContextStoreError(
           'invalid_context_checkpoint',
           `${label} could not be decoded by ${codec.protocol}@${codec.version}: ${errorMessage(error)}`,
