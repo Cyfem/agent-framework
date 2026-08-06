@@ -2,12 +2,14 @@
 
 ## 1. 文档状态
 
-- 设计状态：已确认总体方向，待按 Phase 1 开始实现。
+- 设计状态：总体方向与 Phase 1 Oracle 已冻结；当前 checkout 已完成 C0～C6，正在实施 C7 Phase 2 transport/placement。
 - 目标版本：Core 与所有公开 Executor/State/Artifact/Observability 包统一首发 `2.0.0`。
 - 实施范围：Phase 1 Core/Local、Phase 2 Worker/Process/HTTP Remote、Phase 3 PostgreSQL/BullMQ/Docker/S3/OTel、Compose、测试、demo 与文档迁移。
 - 明确排除：conversation handoff、active-agent 所有权转移、Core 内置云 transport 或认证系统。
 
 本文件细化 [PLAN.md](./PLAN.md) 中已经确认的设计。接口名称是实施基线；文件名可以在不改变职责边界和公共语义的前提下微调。分层测试、故障注入与真实方舟 Agent Plan 的逐项发布门禁见 [TEST_ACCEPTANCE_PLAN.md](./TEST_ACCEPTANCE_PLAN.md)。
+
+当前实现边界以源码与包 README 为准：Core v2、官方 Local、Memory/Atomic File StateStore、公开 Agent durable loop、跨协议/跨进程 Phase 1 恢复和离线验收已经落地；Worker、Process、HTTP 与 Phase 3 适配器仍按后续章节实施。真实方舟与 Docker live gate 未执行时不得标记为通过。
 
 ## 2. 设计目标与硬性不变量
 
@@ -1100,6 +1102,8 @@ export interface StateLease {
 }
 ```
 
+`StateLease.expiresAt` 属于签发该 lease 的 StateStore logical clock domain，不能与另一个进程或节点的 wall clock 直接比较。Core 对 live execution owner 另行维护宿主单调时钟 proof：以最终成功 acquire attempt 或 renew 请求的开始时间加 `ttlMs` 作为保守上界，只有请求成功才发布新 proof；renew 在旧 proof 边界仍未确认时立即按 ownership loss 处理。acquire 必须与调用方 signal/deadline 竞争；Store 不支持取消且在调用结束后迟到返回 lease 时，Core best-effort 释放该 lease。这样既允许测试和 Store 使用可控 logical clock，也不要求未来 PostgreSQL/远程 Store 与 controller 绝对时钟同步。
+
 createRun 对 ownerSessionId + runId 建唯一约束。createTask 必须在同一事务中原子维护 ownerSessionId + runId + requestId 与 ownerSessionId + subagentSessionId 两个唯一索引；不同 session/run 可以复用相同 requestId。existing 只在 identity、definition、executor 和 input hash 全部相同时视为幂等重放，否则返回冲突。transaction-local read/index API 必须看见本事务已暂存 mutation，避免实现者在事务外预读后产生 TOCTOU。
 
 transaction callback 必须有实现定义的短时上限，且只能等待同一 `AgentRuntimeStateStore` 的 transaction-local 操作；严禁在事务中等待 Model、Tool、Executor、projector、网络或其他外部副作用。run revision 与 task revision 分别递增，任何一方的 CAS 都不能代替另一方。
@@ -1199,6 +1203,18 @@ Local factory 接收 SubAgentExecutionControl.delegation 并把它作为 child �
 
 ## 17. Phase 2 Executor
 
+### 17.0 C7 固定 Transport 与恢复 Oracle
+
+C7 的三个 placement 共用 Core 导出的协议无关 transport v1 contract，不允许各包复制或扩展不兼容 wire：
+
+- JSON envelope 固定为 `{ version: '1', channelId, sequence, messageId, correlationId?, taskId?, operationId?, kind, payload }`，所有 object 都是 closed shape；默认单个 JSON frame 上限 16 MiB。
+- 每个方向的 `sequence` 从 1 连续递增。相同 `messageId + JCS payload hash` 是协议重放并返回原 reply；相同 ID 不同 hash 为冲突；sequence gap、未知字段、错版本、超限或非 JSON-safe payload 都在调用 Executor/Core 前失败。
+- `SubAgentExecutionRequest` 不直接跨 transport 传输 `AbortSignal` 或 control closure。wire 使用 `remainingMs`，接收端按本地时钟创建 signal 和绝对 deadline；不得信任远端绝对时间。超过 Node 单个 timer 上限 `2^31-1 ms` 的长 deadline 必须分段调度，不得溢出、静默截短或退化为近即时 timeout。
+- artifact reference 继续走 closed JSON；bytes 使用 transport sidecar，Worker 使用 transferable `ArrayBuffer`，Process 使用 advanced serialization 的 `Uint8Array`，HTTP 使用单独 raw body。sidecar 必须重新校验声明 size 与明文 SHA-256，不以 base64 塞入 JSON frame。
+- 目标节点只能按宿主预注册的 `definition name + version` 和 runner identity 解析 factory/Zod schema；factory、Zod object、模块路径和凭证都不进入 wire。
+
+Executor 可以返回内部 `recovery_required` settle marker，但它不是公开 task state 或 Agent outcome。Core 只在以下条件接受：authoritative task 仍为 running、marker operation 与当前 epoch 一致，并且不存在 outcome-unknown provider intent。`checkpoint` recovery 必须已有合法 binding、完整 child checkpoint 和精确 runner/codec compatibility；`unbound_create` 只允许在 binding/checkpoint 均未提交时用原 idempotency operation 重放。每次 live dispatch 最多自动恢复一次，继续失败后等待 host 显式 `recover()`/retry；绝不创建替代 task/job。provider 已 `in_flight` 时固定 `failed + outcomeUnknown`，`result_submitted` 崩溃固定 `failed + partial`，terminal 只读且不可逆。
+
 ### 17.1 Worker Thread / Child Process
 
 新增独立公开包 `@ruixutong.manee/maneeagent-executor-worker` 与 `@ruixutong.manee/maneeagent-executor-process`，要求：
@@ -1210,6 +1226,10 @@ Local factory 接收 SubAgentExecutionControl.delegation 并把它作为 child �
 - 区分正常 child failure、协议错误、进程 crash 和宿主 kill。
 - checkpoint、result receipt 和 event sequence 可在进程退出后恢复。
 - 两者 `reconnect=none`，只允许同一幂等 operation 重放或 checkpoint resume；不把进程重建伪装成 external reconnect。
+- 首版每个 task 使用一个 Worker/Process，不做池化。两者只执行宿主信任的 registry entry，不宣称为不受信代码沙箱。
+- Worker 必须显式传入最小 `env` 且 `execArgv: []`，不得使用 `SHARE_ENV` 或展开 `process.env`。
+- Process 固定 `execPath=process.execPath`、`serialization='advanced'`、`shell=false`、`detached=false`；stdio 默认不转发正文并设置 64 KiB 上限。环境只保留 Windows/Node 启动所需白名单与宿主逐项显式提供的值，禁止透传 `NODE_OPTIONS`、`ARK_*`、`TOKEN`、`SECRET`、`KEY`。
+- cancel 先发送协议控制消息，5 秒内未确认才终止 Worker/Process，并等待 exit/close 完成资源清理。binding 只保存 logical job ID，不保存 threadId、PID、路径或 secret。
 
 ### 17.2 HTTP Remote Executor
 
@@ -1224,6 +1244,16 @@ Local factory 接收 SubAgentExecutionControl.delegation 并把它作为 child �
 - safe error mapper、payload size limit、TLS/secret guidance。
 
 HTTP 包通过 conformance suite 证明语义一致；Core 不规定 HTTP、gRPC、队列或云产品。
+
+HTTP v1 固定行为：
+
+- 所有 RPC 使用 signed POST：`/v1/heartbeat`、`/v1/jobs/create`、`/v1/jobs/{id}/resume`、`/reconnect`、`/cancel`、`/poll`、`/control/{requestId}/reply`。create 以授权主体、owner session 与 idempotency key 唯一；响应不确定时只可重放同一 operation 取回原 job。
+- binding recovery data 只含 `{ kind: 'maneeagent-http/v1', endpointId, jobId }`。`endpointId` 在本地可信 registry 中解析 base URL 与 auth；binding 不含 URL、credential、cursor 或临时授权。
+- heartbeat 默认 10 秒；最近成功小于 30 秒为 available、30–60 秒为 degraded、达到 60 秒为 unavailable。只有 Runtime init/显式 `refreshCatalog()` 更新模型目录 revision；schema 构建不联网，执行前仍 preflight 且无 fallback。
+- remote job event cursor 与 Core task event sequence 是两个独立域。controller 断线时 job 进入 remote 内部 `awaiting_control`，reconnect 用原 binding/cursor 继续；丢失 job 返回 `RECOVERY_TARGET_LOST`，不能 create 替代。
+- 默认只接受 TLS。仅显式 `allowInsecureLoopback` 可在测试/开发使用 `127.0.0.1`、`::1` 或 `localhost`，redirect 一律拒绝。
+
+HMAC-SHA256 v1 固定使用 `Manee-Key-Id`、`Manee-Timestamp`、`Manee-Nonce`、`Manee-Body-SHA256`、`Manee-Signature` headers。签名串按顺序包含版本、uppercase method、normalized path、key ID、Unix 毫秒 timestamp、至少 128-bit base64url nonce 与 lowercase raw-body SHA-256；key 至少 32 bytes，signature 为 base64url HMAC-SHA256 并用 constant-time compare。默认时间窗口为正负 60 秒且边界有效，replay TTL 为 120 秒；`ReplayCache.consume(keyId, nonce, expiresAt)` 必须原子。生产 handler 要求 distributed replay cache，内存实现只允许显式 loopback/test。未知 key、错签名、过期和 replay 对外返回同一安全 401；独立 `authorize(authContext, ownerSessionId, method)` 必须在进入 Core 前完成，session ID 本身不构成授权。
 
 ### 17.3 Phase 3 生产适配器
 

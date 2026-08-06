@@ -14,6 +14,7 @@ import {
   type ResolvedSubAgentLimits,
   type TreeBudgetSnapshot,
 } from '../subagent/limits';
+import { assertPendingBatchInvariants } from '../subagent/pending-batch-invariants';
 import {
   appendSafeTaskEvents,
   isTerminalSubAgentTaskState,
@@ -1927,31 +1928,13 @@ function assertPendingBatch(batch: StoredPendingToolBatch): void {
     if (!resultReady && call.error !== undefined) {
       throw checkpointMismatch('An unresolved pending Tool call cannot retain a result error.');
     }
-    if (call.status === 'paused' && call.kind === 'end-agent') {
-      throw checkpointMismatch('An end-agent call cannot be paused for approval.');
-    }
     if (call.taskId !== undefined) assertNonEmpty(call.taskId, 'pendingBatch.taskId');
-    if (
-      call.kind === 'agent' &&
-      (call.status === 'running' || call.status === 'paused') &&
-      call.taskId === undefined
-    ) {
-      throw checkpointMismatch('An active agent Tool call requires a taskId.');
-    }
     const approvalIds = call.approvalIds ?? [];
     if (
       approvalIds.some((approvalId) => approvalId.trim().length === 0) ||
       new Set(approvalIds).size !== approvalIds.length
     ) {
       throw checkpointMismatch('The pending Tool call contains invalid approval IDs.');
-    }
-    if (
-      (call.status === 'paused' && approvalIds.length === 0) ||
-      (call.status !== 'paused' && approvalIds.length > 0)
-    ) {
-      throw checkpointMismatch(
-        'The pending Tool call approval IDs do not match its durable phase.',
-      );
     }
     orders.add(call.order);
     ids.add(call.callId);
@@ -1962,18 +1945,39 @@ function assertPendingBatch(batch: StoredPendingToolBatch): void {
       throw checkpointMismatch('The pending Tool batch provider order is not contiguous.');
     }
   }
-  if (batch.endRequested) {
-    const endCall = batch.calls[0];
-    if (
-      batch.calls.length !== 1 ||
-      endCall?.kind !== 'end-agent' ||
-      (endCall.status !== 'settled' &&
-        endCall.status !== 'result_submitted' &&
-        endCall.status !== 'applied')
-    ) {
-      throw checkpointMismatch('A requested end-agent call must be standalone and result-ready.');
-    }
-  }
+  assertPendingBatchInvariants(
+    {
+      calls: Object.freeze(
+        batch.calls.map((call) =>
+          Object.freeze({
+            kind: call.kind,
+            name: call.name,
+            status:
+              call.status === 'pending'
+                ? ('prepared' as const)
+                : call.status === 'running'
+                  ? ('in_flight' as const)
+                  : call.status === 'paused'
+                    ? ('waiting_approval' as const)
+                    : call.status === 'settled'
+                      ? ('result_ready' as const)
+                      : call.status,
+            order: call.order,
+            ...(call.taskId === undefined ? {} : { taskId: call.taskId }),
+            approvalIds: Object.freeze([...(call.approvalIds ?? [])]),
+            ...(call.output === undefined ? {} : { result: call.output }),
+            ...(call.error === undefined ? {} : { error: call.error }),
+          }),
+        ),
+      ),
+      endRequested: batch.endRequested,
+      requireResultSubmissionForEnd: false,
+      requireRejectedEndErrorDescriptor: true,
+    },
+    (message): never => {
+      throw checkpointMismatch(message);
+    },
+  );
 }
 
 function assertPendingApprovalRequests(

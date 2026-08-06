@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { assertArtifactReference } from './artifact';
@@ -31,6 +32,8 @@ export const DEFAULT_RUNTIME_EVENT_POLL_MS = 25;
 
 export interface RenewingRuntimeLease {
   readonly lease: StateLease;
+  /** Host-monotonic boundary for the latest successfully confirmed acquire/renew request. */
+  readonly confirmedUntil: number;
   readonly signal: AbortSignal;
   stop(): Promise<void>;
 }
@@ -44,6 +47,9 @@ const DEFAULT_RUNTIME_LEASE_SCHEDULER: RuntimeLeaseScheduler = Object.freeze({
   set: (callback: () => void, delayMs: number) => setTimeout(callback, delayMs),
   clear: (timer: ReturnType<typeof setTimeout>) => clearTimeout(timer),
 });
+
+const DEFAULT_RUNTIME_LEASE_CLOCK = (): number => performance.now();
+const MAX_RUNTIME_TIMER_DELAY_MS = 2_147_483_647;
 
 export type RuntimeIdKind =
   | 'task'
@@ -155,7 +161,7 @@ export async function acquireRuntimeLease(
   for (;;) {
     throwIfOperationAborted(signal, deadlineAt);
     try {
-      return await store.acquireLease(key, ttlMs);
+      return await acquireLeaseWithinOperation(store, key, ttlMs, signal, deadlineAt);
     } catch (error) {
       if (!(error instanceof StateLeaseUnavailableError)) throw error;
       await waitForRuntimeRetry(signal, deadlineAt);
@@ -194,55 +200,152 @@ export async function acquireRenewingRuntimeLease(
   deadlineAt: number,
   ttlMs = DEFAULT_RUNTIME_LEASE_TTL_MS,
   scheduler: RuntimeLeaseScheduler = DEFAULT_RUNTIME_LEASE_SCHEDULER,
+  monotonicNow: () => number = DEFAULT_RUNTIME_LEASE_CLOCK,
 ): Promise<RenewingRuntimeLease> {
   if (!Number.isSafeInteger(ttlMs) || ttlMs < 30) {
     throw new RangeError('Execution lease TTL must be a safe integer of at least 30ms.');
   }
-  let current = await acquireRuntimeLease(store, key, parentSignal, deadlineAt, ttlMs);
+  const acquired = await acquireRuntimeLeaseWithProofStart(
+    store,
+    key,
+    parentSignal,
+    deadlineAt,
+    ttlMs,
+    monotonicNow,
+  );
+  let current = acquired.lease;
   const fixedFencingToken = current.fencingToken;
+  let confirmedUntil = leaseProofDeadline(acquired.proofStartedAt, ttlMs);
+  let renewAt = leaseRenewalDeadline(acquired.proofStartedAt, ttlMs);
   const lost = new AbortController();
   const signal = AbortSignal.any([parentSignal, lost.signal]);
   let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let renewalTimer: ReturnType<typeof setTimeout> | undefined;
+  let expiryTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const schedule = (): void => {
-    if (stopped || signal.aborted) return;
-    timer = scheduler.set(
-      () => {
-        void renew();
-      },
-      Math.max(10, Math.floor(ttlMs / 3)),
-    );
-  };
-  const renew = async (): Promise<void> => {
-    if (stopped || signal.aborted) return;
-    try {
-      const renewed = await current.renew(ttlMs);
-      if (renewed.fencingToken !== fixedFencingToken) {
-        throw new Error('Execution lease renewal changed its fencing token.');
-      }
-      current = renewed;
-      schedule();
-    } catch {
-      lost.abort(
-        createSubAgentError('RECOVERY_TARGET_LOST', 'The subagent execution lease was lost.', {
-          retryable: true,
-          causeCode: 'EXECUTION_LEASE_LOST',
-        }),
+  const readMonotonicNow = (): number => {
+    const value = monotonicNow();
+    if (!Number.isFinite(value) || value < 0) {
+      throw new TypeError(
+        'Execution lease monotonic clock must return a non-negative finite value.',
       );
     }
+    return value;
   };
-  schedule();
+
+  const clearRenewalTimer = (): void => {
+    if (renewalTimer === undefined) return;
+    scheduler.clear(renewalTimer);
+    renewalTimer = undefined;
+  };
+
+  const clearExpiryTimer = (): void => {
+    if (expiryTimer === undefined) return;
+    scheduler.clear(expiryTimer);
+    expiryTimer = undefined;
+  };
+
+  const abortLost = (): void => {
+    if (lost.signal.aborted) return;
+    clearRenewalTimer();
+    clearExpiryTimer();
+    lost.abort(
+      createSubAgentError('RECOVERY_TARGET_LOST', 'The subagent execution lease was lost.', {
+        retryable: true,
+        causeCode: 'EXECUTION_LEASE_LOST',
+      }),
+    );
+  };
+
+  const scheduleExpiryBarrier = (): void => {
+    clearExpiryTimer();
+    const schedule = (): void => {
+      if (stopped || signal.aborted) return;
+      const remaining = confirmedUntil - readMonotonicNow();
+      if (remaining <= 0) {
+        abortLost();
+        return;
+      }
+      expiryTimer = scheduler.set(
+        () => {
+          expiryTimer = undefined;
+          schedule();
+        },
+        Math.min(MAX_RUNTIME_TIMER_DELAY_MS, Math.ceil(remaining)),
+      );
+    };
+    schedule();
+  };
+
+  const scheduleRenewal = (): void => {
+    if (stopped || signal.aborted) return;
+    const remaining = renewAt - readMonotonicNow();
+    renewalTimer = scheduler.set(
+      () => {
+        renewalTimer = undefined;
+        if (readMonotonicNow() < renewAt) {
+          scheduleRenewal();
+          return;
+        }
+        void renew();
+      },
+      Math.min(MAX_RUNTIME_TIMER_DELAY_MS, Math.max(0, Math.ceil(remaining))),
+    );
+  };
+
+  const renew = async (): Promise<void> => {
+    if (stopped || signal.aborted) return;
+    const proofStartedAt = readMonotonicNow();
+    if (proofStartedAt >= confirmedUntil) {
+      abortLost();
+      return;
+    }
+    const previousConfirmedUntil = confirmedUntil;
+    const candidateConfirmedUntil = leaseProofDeadline(proofStartedAt, ttlMs);
+    const candidateRenewAt = leaseRenewalDeadline(proofStartedAt, ttlMs);
+    scheduleExpiryBarrier();
+    try {
+      const renewed = await current.renew(ttlMs);
+      if (renewed.key !== key || renewed.fencingToken !== fixedFencingToken) {
+        try {
+          await renewed.release();
+        } catch {
+          // The adapter already violated the renewal contract; cleanup remains best-effort.
+        }
+        throw new Error('Execution lease renewal changed its key or fencing token.');
+      }
+      if (stopped || signal.aborted) return;
+      const confirmedAt = readMonotonicNow();
+      if (confirmedAt >= previousConfirmedUntil || confirmedAt >= candidateConfirmedUntil) {
+        abortLost();
+        return;
+      }
+      current = renewed;
+      confirmedUntil = candidateConfirmedUntil;
+      renewAt = candidateRenewAt;
+      clearExpiryTimer();
+      scheduleRenewal();
+    } catch {
+      abortLost();
+    }
+  };
+
+  if (readMonotonicNow() >= confirmedUntil) abortLost();
+  else scheduleRenewal();
 
   return Object.freeze({
     get lease(): StateLease {
       return current;
     },
+    get confirmedUntil(): number {
+      return confirmedUntil;
+    },
     signal,
     async stop(): Promise<void> {
       if (stopped) return;
       stopped = true;
-      if (timer !== undefined) scheduler.clear(timer);
+      clearRenewalTimer();
+      clearExpiryTimer();
       try {
         await current.release();
       } catch {
@@ -250,6 +353,68 @@ export async function acquireRenewingRuntimeLease(
       }
     },
   });
+}
+
+async function acquireRuntimeLeaseWithProofStart(
+  store: AgentRuntimeStateStore,
+  key: string,
+  signal: AbortSignal,
+  deadlineAt: number,
+  ttlMs: number,
+  monotonicNow: () => number,
+): Promise<{ readonly lease: StateLease; readonly proofStartedAt: number }> {
+  for (;;) {
+    throwIfOperationAborted(signal, deadlineAt);
+    const proofStartedAt = monotonicNow();
+    if (!Number.isFinite(proofStartedAt) || proofStartedAt < 0) {
+      throw new TypeError(
+        'Execution lease monotonic clock must return a non-negative finite value.',
+      );
+    }
+    try {
+      const lease = await acquireLeaseWithinOperation(store, key, ttlMs, signal, deadlineAt);
+      return Object.freeze({ lease, proofStartedAt });
+    } catch (error) {
+      if (!(error instanceof StateLeaseUnavailableError)) throw error;
+      await waitForRuntimeRetry(signal, deadlineAt);
+    }
+  }
+}
+
+async function acquireLeaseWithinOperation(
+  store: AgentRuntimeStateStore,
+  key: string,
+  ttlMs: number,
+  signal: AbortSignal,
+  deadlineAt: number,
+): Promise<StateLease> {
+  const pending = Promise.resolve().then(() => store.acquireLease(key, ttlMs));
+  try {
+    return await raceWithOperationSignal(pending, signal, deadlineAt);
+  } catch (error) {
+    // A StateStore may not support cancelling an in-flight acquire. If it grants the lease after
+    // the caller has already stopped waiting, release that late success so it cannot strand the
+    // key until TTL expiry. The rejection branch also observes a late Store failure.
+    void pending.then(
+      async (lease) => {
+        try {
+          await lease.release();
+        } catch {
+          // Best-effort cleanup cannot change the already-returned cancellation/deadline result.
+        }
+      },
+      () => undefined,
+    );
+    throw error;
+  }
+}
+
+function leaseProofDeadline(proofStartedAt: number, ttlMs: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, proofStartedAt + ttlMs);
+}
+
+function leaseRenewalDeadline(proofStartedAt: number, ttlMs: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, proofStartedAt + Math.max(10, Math.floor(ttlMs / 3)));
 }
 
 export function normalizeProjectedContext(
@@ -358,12 +523,48 @@ export function safeExecutorError(error: unknown): Readonly<SubAgentErrorDescrip
   });
 }
 
+/**
+ * A task execution ownership loss is control-plane fencing, not an Executor task failure.
+ * The stale owner must surface the loss without publishing a terminal through a session lease.
+ */
+export function isExecutionOwnershipLossError(error: unknown): error is SubAgentRuntimeError {
+  if (!(error instanceof SubAgentRuntimeError) || error.code !== 'RECOVERY_TARGET_LOST') {
+    return false;
+  }
+  return (
+    error.descriptor.causeCode === 'EXECUTION_LEASE_LOST' ||
+    error.descriptor.causeCode === 'EXECUTION_OWNERSHIP_LOST'
+  );
+}
+
+/**
+ * Verify both the composed operation signal and the host-monotonic lease proof. A renewal that is
+ * still pending at the proof boundary is not ownership proof, so the old owner must stop.
+ */
+export function assertExecutionLeaseOwnership(
+  lease: RenewingRuntimeLease,
+  signal: AbortSignal,
+  deadlineAt: number,
+  monotonicNow: () => number = DEFAULT_RUNTIME_LEASE_CLOCK,
+): void {
+  throwIfOperationAborted(signal, deadlineAt);
+  if (monotonicNow() < lease.confirmedUntil) return;
+  throw createSubAgentError('RECOVERY_TARGET_LOST', 'The subagent execution lease was lost.', {
+    retryable: true,
+    causeCode: 'EXECUTION_LEASE_LOST',
+  });
+}
+
 export function raceWithOperationSignal<T>(
   operation: Promise<T>,
   signal: AbortSignal,
   deadlineAt: number,
 ): Promise<T> {
-  if (signal.aborted) return Promise.reject(abortError(signal, deadlineAt));
+  try {
+    throwIfOperationAborted(signal, deadlineAt);
+  } catch (error) {
+    return Promise.reject(error);
+  }
 
   // Executors commonly reject their own work in response to the same signal. If that rejection
   // wins Promise.race by a microtask, preserve the control-plane cancellation/lease-loss reason
@@ -373,11 +574,41 @@ export function raceWithOperationSignal<T>(
     throw error;
   });
 
-  let cleanup = (): void => {};
-  const aborted = new Promise<never>((_resolve, reject) => {
-    const onAbort = (): void => reject(abortError(signal, deadlineAt));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cleanupAbort = (): void => {};
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    const cleanupTimer = (): void => {
+      if (timer === undefined) return;
+      clearTimeout(timer);
+      timer = undefined;
+    };
+    const rejectForInterruption = (): void => {
+      cleanupTimer();
+      reject(abortError(signal, deadlineAt));
+    };
+    const onAbort = (): void => rejectForInterruption();
     signal.addEventListener('abort', onAbort, { once: true });
-    cleanup = () => signal.removeEventListener('abort', onAbort);
+    cleanupAbort = () => signal.removeEventListener('abort', onAbort);
+
+    const scheduleDeadline = (): void => {
+      if (!Number.isFinite(deadlineAt)) return;
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) {
+        rejectForInterruption();
+        return;
+      }
+      timer = setTimeout(
+        () => {
+          timer = undefined;
+          scheduleDeadline();
+        },
+        Math.min(MAX_RUNTIME_TIMER_DELAY_MS, Math.ceil(remaining)),
+      );
+    };
+    scheduleDeadline();
   });
-  return Promise.race([guardedOperation, aborted]).finally(cleanup);
+  return Promise.race([guardedOperation, interrupted]).finally(() => {
+    cleanupAbort();
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }

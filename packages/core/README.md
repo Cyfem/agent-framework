@@ -32,21 +32,23 @@ npm install @ruixutong.manee/maneeagent-framework zod
 - 事件系统：可观察模型响应、工具调用、工具错误、Agent 状态和 Agent 错误。
 - Context compact：active-only 工具 payload 压缩、外部摘要策略与 context-length 恢复，raw history 保留原文。
 - Skills：通过内置 `skill` 工具按名称渐进加载 instructions、文本资源和显式启用的脚本。
-- Subagent v2：typed definition、显式 Executor placement、跨协议 child Agent、审批/嵌套审批、持久 resume、typed result 与树级取消。
+- Subagent v2：typed definition、显式 Executor placement、跨协议 child Agent、审批/嵌套审批、持久 resume、typed result、树级取消，以及 C7 transport/recovery contract。
 
 ## 公开入口
 
-| 根入口导出                                                       | 用途                                                                       |
-| ---------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `Agent` / `AgentRunOutcome`                                      | 协议无关的任务循环与四类 durable run outcome。                             |
-| `Tool` / `ToolRuntimeContext`                                    | 装饰器/运行时 Tool，以及可信的 call、signal、deadline、run/task metadata。 |
-| `Model` / `OpenAIResponsesModel` / `OpenAIChatModel`             | 自定义协议抽象与两个 OpenAI-compatible adapter。                           |
-| `defineSubAgent` / `SubAgentDefinition` / `SubAgentRuntime`      | typed definition、Catalog/Router、持久状态与控制面 Runtime。               |
-| `SubAgentExecutor` / `ExecutorTaskHandle`                        | placement adapter 与 Core 包装前的 Executor task SPI。                     |
-| `AgentRuntimeStateStore` / `ArtifactStore`                       | durable run/task state 与 opaque artifact 的 adapter SPI。                 |
-| `SubAgentChildRunner` / `AgentProtocolCheckpointCodec`           | 协议无关 child loop bridge 与版本化协议 checkpoint codec。                 |
-| `AgentTelemetrySink` 及 Subagent state/result/approval contracts | Executor、StateStore、telemetry adapter 共用的稳定控制面契约。             |
-| `createSubAgentRuntime`                                          | 同步创建 session-bound Runtime；异步校验由 `runtime.init()` 完成。         |
+| 根入口导出                                                       | 用途                                                                         |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `Agent` / `AgentRunOutcome`                                      | 协议无关的任务循环与四类 durable run outcome。                               |
+| `Tool` / `ToolRuntimeContext`                                    | 装饰器/运行时 Tool，以及可信的 call、signal、deadline、run/task metadata。   |
+| `Model` / `OpenAIResponsesModel` / `OpenAIChatModel`             | 自定义协议抽象与两个 OpenAI-compatible adapter。                             |
+| `defineSubAgent` / `SubAgentDefinition` / `SubAgentRuntime`      | typed definition、Catalog/Router、持久状态与控制面 Runtime。                 |
+| `SubAgentExecutor` / `ExecutorTaskHandle`                        | placement adapter 与 Core 包装前的 Executor task SPI。                       |
+| `SubAgentTransportEnvelope` / execution wire codec               | Worker、Process、HTTP 共用的 closed JSON transport v1 与本地 deadline 重建。 |
+| `SubAgentExecutorRecoveryRequired`                               | Executor crash settle marker；只由 Core 消费并按持久状态决定是否恢复。       |
+| `AgentRuntimeStateStore` / `ArtifactStore`                       | durable run/task state 与 opaque artifact 的 adapter SPI。                   |
+| `SubAgentChildRunner` / `AgentProtocolCheckpointCodec`           | 协议无关 child loop bridge 与版本化协议 checkpoint codec。                   |
+| `AgentTelemetrySink` 及 Subagent state/result/approval contracts | Executor、StateStore、telemetry adapter 共用的稳定控制面契约。               |
+| `createSubAgentRuntime`                                          | 同步创建 session-bound Runtime；异步校验由 `runtime.init()` 完成。           |
 
 包根入口同时导出 Agent、Model、Responses、Chat 与 Subagent v2 的配套 TypeScript 类型、常量和 adapter-facing state/control records。当前只公开 `.`，不提供子路径入口或 CLI `bin`。
 
@@ -661,7 +663,15 @@ const coordinator = defineSubAgent({
 
 `runtime.stageTool()` 是供公开 `Agent` loop 使用的 host-only 原子关联 SPI，不属于模型 wire。它先生成稳定 task identity 与可选 create mutation；父 pending call 与新 child task 在同一 StateStore transaction 成功后，Agent 才调用 staged `dispatch()`。崩溃发生在提交前时 task 不可见，发生在提交后/dispatch 前时恢复进程沿原 run/task/call/request identity 补 dispatch，不会另建 task。
 
-Core 使用 RFC 8785/JCS hash、run/task 独立 revision、lease/fencing、operation receipt 和不可逆 terminal state。完整 checkpoint 包含 Chat/Responses 协议 context、稳定 provenance ContextStore、模型迭代、待处理整批 calls 和 compact transaction；summary 与 tool-payload compact 的 prepared、in-flight、result-ready 崩溃窗口都可恢复。caller 取消 root run 时，root 与所有非终态 descendants 会先在同一 fenced StateStore transaction 中原子进入 `cancelled`，提交成功后才 best-effort 通知具体 Executor 清理 placement；task CAS 竞争会整批回滚、重载并重算，未确认的 adapter cleanup 可以用相同 `operationId` 幂等重放。durable provider operation 在 SDK dispatch 前取消会得到 `cancelled`；intent 已持久化为 `in_flight` 后发生 abort、超时或连接结果不确定时，原 task/run 进入 `failed + outcomeUnknown`，即使取消同时到达也不会覆盖该状态，更不会自动重发真实请求。明确收到的 HTTP 4xx/5xx provider rejection 则可清除 in-flight intent，并进入配置的 model-error recovery。
+Core 使用 RFC 8785/JCS hash、run/task 独立 revision、lease/fencing、operation receipt 和不可逆 terminal state。`StateLease.expiresAt` 属于 StateStore 自己的 logical clock domain，不得与无关进程的 `Date.now()` 直接比较；执行 owner 会从每次 acquire/renew 请求开始，以宿主单调时钟维护保守的本地 TTL proof，续租在 proof 边界仍未确认时立即失去写终态资格。lease acquire 本身也受调用方 signal/deadline 约束；若不可取消的 Store acquire 在调用已经结束后才成功，Core 会 best-effort 释放该迟到 lease，避免把 key 无故占用到 TTL 结束。完整 checkpoint 包含 Chat/Responses 协议 context、稳定 provenance ContextStore、模型迭代、待处理整批 calls 和 compact transaction；summary 与 tool-payload compact 的 prepared、in-flight、result-ready 崩溃窗口都可恢复。caller 取消 root run 时，root 与所有非终态 descendants 会先在同一 fenced StateStore transaction 中原子进入 `cancelled`，提交成功后才 best-effort 通知具体 Executor 清理 placement；task CAS 竞争会整批回滚、重载并重算，未确认的 adapter cleanup 可以用相同 `operationId` 幂等重放。durable provider operation 在 SDK dispatch 前取消会得到 `cancelled`；intent 已持久化为 `in_flight` 后发生 abort、超时或连接结果不确定时，原 task/run 进入 `failed + outcomeUnknown`，即使取消同时到达也不会覆盖该状态，更不会自动重发真实请求。明确收到的 HTTP 4xx/5xx provider rejection 则可清除 in-flight intent，并进入配置的 model-error recovery。
+
+### Executor transport 与 crash settle
+
+Core 根入口导出 transport v1 的 closed envelope、frame codec、sequence tracker 和 `SubAgentExecutionRequestWire`。默认单帧上限是 16 MiB，按实际 UTF-8 bytes 计；frame 和 payload 使用 RFC 8785/JCS，sequence 按 channel/方向从 1 连续推进，同 `messageId` 只有在 payload 与 routing identity 都一致时才是 replay。tracker 默认最多保留 4096 个连续 sequence；窗口耗尽时返回 `sequence-window-exhausted`，调用方必须创建新 channel，不能淘汰旧 receipt 后继续接受可能重复的 ID。错版本、额外字段、sequence gap、未知旧 sequence、同 ID 冲突、非 JSON-safe 或超限值会在调用 Executor/Core callback 前失败。
+
+`createSubAgentExecutionRequestWire()` 显式复制协议字段，不会把 `AbortSignal`、宿主绝对时间或意外 closure 跨边界传输；wire 只携带 `remainingMs`。接收端用 `reconstructSubAgentExecutionRequest()` 把 transport cancel signal 与本地 timeout signal 合并，并以接收端时钟重建绝对 deadline；超过 Node 单个 timer 上限 `2^31-1 ms` 的合法长 deadline 会被拆成连续 timer，不会溢出、缩短或退化成近即时超时。decoder 会递归冻结返回值，默认限制 canonical payload 为 16 MiB、JSON 深度为 128、展开节点为 1,000,000，并重验 binding、checkpoint hash/状态/provenance、projection 和 parent path；目标侧仍必须通过受信任 registry 精确解析 definition/runner 及 codec。schema、factory、模块路径和 credential 不是 execution wire 的一部分。当前 transport 只冻结 envelope 和 execution request，不承诺某个具体 Worker、Process 或 HTTP RPC kind；完整 control/outcome/sidecar union 随 C7 placement 实现交付。
+
+Executor 的 `execute()`、`spawn()` 或 raw handle `wait()` 可以返回 `SubAgentExecutorRecoveryRequired`。该 marker 不是 task state、host handle outcome 或 Agent outcome；Core 会校验 live operation identity、attempt/epoch/fencing、binding、checkpoint、runner/codec compatibility 和持久 result/provider 状态。合法 marker 会先原子 settle 当前 operation、释放 active slot，再至多自动恢复一次：`unbound_create` 保持原 `operationId` 与 idempotency key，只推进 attempt/epoch/fencing；`checkpoint` 使用原 task/binding 和完整 checkpoint，不伪装成 reconnect。第二个 marker 保留 `running + recoveryRequired`，等待 host 显式 `recover()`。provider 已 `in_flight` 时固定为 `failed + outcomeUnknown`，result receipt 已提交时固定为带 `partialOutput` 的 `failed`，authoritative terminal 永远只读。
 
 `runtime.limits` 是初始化后可读的冻结 resolved snapshot，默认 `maxDepth=3`、`maxDescendants=32`、`maxConcurrent=4`、`maxTurns=16`、`timeoutMs=120000`；`maxProviderCalls`、input/output token 与 cost 上限默认不启用。该 snapshot 会持久化到 root run 并由所有 descendant task 继承，恢复时不允许漂移。`maxProviderCalls` 使用同一树级持久 ledger：root 普通请求、`context-summary` 与 child 请求都在 SDK dispatch 前按 operation ID 原子、幂等地预留一次；达到上限时不调用 provider。
 
@@ -878,4 +888,4 @@ before/after hook 或 classifier 抛错会让恢复引擎立即终止并包装�
 - CommonJS `require` 使用 `dist/index.cjs`。
 - TypeScript 使用 `dist/index.d.ts`，并按需引用 `dist` 下的配套声明文件。
 
-发布包包含完整 `dist` 目录和本 README，因此也会包含构建生成的 source map 与嵌套声明文件。声明文件保留中文 TSDoc，便于在 IDE 中查看 API 用法。
+发布包包含完整 `dist` 目录和本 README，因此也会包含构建生成的 source map 与嵌套声明文件。声明构建会把内部相对 module specifier 固化为 NodeNext 可解析的 `.js` 或 `/index.js` 路径；仓库的 `pnpm validate:subagent:v2:pack` 只允许根 manifest/README/license 与 `dist` 中的 ESM/CJS、声明、source map，并先执行敏感产物、源码泄漏、缺 map、child 超时/输出超限等负例。真实临时 tarball 解包后，门禁以正式包名执行 ESM `import()` / CommonJS `require()` runtime smoke，并同时编译 `type: module` ESM 与 `.cts` CommonJS 消费者。两种类型消费者都使用 `module/moduleResolution: NodeNext`、`strict: true`、`skipLibCheck: false`、关键公开 contract/字段非 `any` 断言和 missing-export 负检；包名、Node.js 要求、根 exports 和无 `bin` 也会被锁定。声明文件保留中文 TSDoc，便于在 IDE 中查看 API 用法。

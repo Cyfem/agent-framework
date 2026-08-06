@@ -113,4 +113,4 @@ pnpm --filter @ruixutong.manee/maneeagent-executor-local exec vitest run --confi
 
 ## 发布内容
 
-包根入口公开 `MemorySubAgentExecutor`、`LocalSubAgentRunnerRegistry`、`createLocalAgentRunnerRegistration()`、Memory/Atomic File StateStore、filesystem verifier 及其配套 options/types，不提供子路径入口或 CLI `bin`。构建产物包含 ESM `dist/index.js`、CommonJS `dist/index.cjs`、TypeScript 声明、source map 和本 README；`npm pack --dry-run` 只验证待发布内容，不代表该包已经发布到 registry。
+包根入口公开 `MemorySubAgentExecutor`、`LocalSubAgentRunnerRegistry`、`createLocalAgentRunnerRegistration()`、Memory/Atomic File StateStore、filesystem verifier 及其配套 options/types，不提供子路径入口或 CLI `bin`。构建产物包含 ESM `dist/index.js`、CommonJS `dist/index.cjs`、NodeNext-safe TypeScript 声明、source map 和本 README；仓库的 `pnpm validate:subagent:v2:pack` 会把 Local 与同一轮生成、peer range 可接受的 Core 真实 tarball 一起解包，不借用 workspace Core 目录，再以正式包名执行 ESM/CommonJS runtime smoke、NodeNext 双消费者类型检查、关键公开 class/constructor/options 非 `any` 断言和 missing-export 负检。门禁同时锁定包名、Node.js 要求、根 exports、无 `bin`、发布文件正向白名单与敏感文件拒绝；child process 使用最小环境白名单和 wall-clock watchdog。`npm pack --dry-run` 或临时生成 tarball 都只验证待发布内容，不代表该包已经发布到 registry。

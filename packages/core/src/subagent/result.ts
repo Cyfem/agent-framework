@@ -75,6 +75,22 @@ export type SubAgentExecutionOutcome<O extends JsonValue = JsonValue> =
       readonly checkpointRevision: number;
     };
 
+/**
+ * Recoverable Executor settle marker. It is consumed by Core and is never exposed as a host task
+ * outcome. `operationId` must identify the exact live Executor operation that emitted it.
+ */
+export interface SubAgentExecutorRecoveryRequired {
+  readonly type: 'recovery_required';
+  readonly reason: 'checkpoint' | 'unbound_create';
+  readonly operationId: string;
+  readonly causeCode: string;
+}
+
+/** Raw result crossing the Executor/Core boundary before authoritative task reconciliation. */
+export type SubAgentExecutorOperationResult<O extends JsonValue = JsonValue> =
+  | SubAgentExecutionOutcome<O>
+  | SubAgentExecutorRecoveryRequired;
+
 /** Exactly-once receipt for the typed `agent-result` phase. */
 export interface ResultReceipt {
   readonly schemaVersion: '1';

@@ -165,8 +165,11 @@ function taskIdentity(task: StoredTask) {
 }
 
 function elapsedAt(task: StoredTask, now: number): number {
-  if (task.activeStartedAt === undefined) return 0;
-  return Math.max(0, now - task.activeStartedAt);
+  const startedAt =
+    task.activeStartedAt ??
+    (task.state === 'running' && task.recoveryRequired ? task.updatedAt : undefined);
+  if (startedAt === undefined) return 0;
+  return Math.max(0, now - startedAt);
 }
 
 function applyStoppedClock(draft: Record<string, unknown>, task: StoredTask, now: number): void {

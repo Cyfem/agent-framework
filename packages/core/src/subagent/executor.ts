@@ -13,7 +13,8 @@ import type { ResolvedSubAgentLimits } from './limits';
 import type {
   CompletionReceipt,
   ResultReceipt,
-  SubAgentExecutionOutcome,
+  SubAgentExecutorOperationResult,
+  SubAgentExecutorRecoveryRequired,
   SubAgentFailureInput,
   SubAgentProgress,
   SubAgentTaskResult,
@@ -171,7 +172,7 @@ export interface ExecutorTaskHandle {
   readonly taskId: string;
   readonly binding: SubAgentExecutorBinding;
   snapshot(): Promise<ExecutorTaskSnapshot>;
-  wait(): Promise<SubAgentExecutionOutcome>;
+  wait(): Promise<SubAgentExecutorOperationResult>;
   cancel(reason?: string): Promise<void>;
   events(options?: {
     readonly afterSequence?: number;
@@ -196,11 +197,11 @@ export interface SubAgentExecutor {
   execute(
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
-  ): Promise<SubAgentExecutionOutcome>;
+  ): Promise<SubAgentExecutorOperationResult>;
   spawn(
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
-  ): Promise<ExecutorTaskHandle>;
+  ): Promise<ExecutorTaskHandle | SubAgentExecutorRecoveryRequired>;
   /**
    * Binding-addressed cancellation remains available after the originating process loses a raw
    * handle. Implementations must make `operationId` idempotent: replaying the same operation and

@@ -1,4 +1,4 @@
-import { describe, expect, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { Deferred, ManualClock, RecordingRuntimeStateStore, acceptanceIt } from '../../../testkit';
@@ -27,7 +27,10 @@ import type {
   ExecutorAvailabilityProbe,
   SubAgentExecutorDescriptor,
 } from '../src/subagent/catalog';
-import { OPENAI_CHAT_CHECKPOINT_CODEC } from '../src/subagent/checkpoint';
+import {
+  OPENAI_CHAT_CHECKPOINT_CODEC,
+  type SubAgentChildCheckpoint,
+} from '../src/subagent/checkpoint';
 import { defineSubAgent } from '../src/subagent/definition';
 import type {
   ExecutorTaskHandle,
@@ -53,6 +56,178 @@ import {
 } from './helpers/mock-models';
 
 describe('Agent v2 durable recovery', () => {
+  it('projects a result-CAS crash receipt as serialized JSON before replaying the pending batch', async () => {
+    const output = { answer: 'result-cas-agent-recovery-proof' } as const;
+    const outputHash = canonicalJsonSha256(output);
+    const resultInput = { result: output } as const;
+    const resultCallId = 'result-cas-agent-result-call';
+    const taskId = 'result-cas-agent-task';
+    const assistantMessage = {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: resultCallId,
+          type: 'function',
+          function: { name: 'agent-result', arguments: JSON.stringify(resultInput) },
+        },
+      ],
+    } as OpenAIChatContext;
+    const contextStore = new ContextStore<OpenAIChatProtocol>([
+      { role: 'user', content: 'recover the authoritative typed result' },
+    ]);
+    contextStore.openLoopSpan();
+    contextStore.appendToOpenLoop(assistantMessage);
+    const checkpoint: SubAgentChildCheckpoint = {
+      version: '1',
+      runnerId: 'result-cas-agent-runner',
+      runnerVersion: '2.0.0',
+      protocolContext: {
+        protocol: OPENAI_CHAT_CHECKPOINT_CODEC.protocol,
+        codecVersion: OPENAI_CHAT_CHECKPOINT_CODEC.version,
+        value: OPENAI_CHAT_CHECKPOINT_CODEC.encode(contextStore.getActiveContext()),
+      },
+      contextStore: contextStore.exportCheckpoint(OPENAI_CHAT_CHECKPOINT_CODEC),
+      modelIteration: 0,
+      maxIterations: 3,
+      pendingBatch: {
+        version: '1',
+        batchId: 'result-cas-agent-batch',
+        assistantMessage: {
+          protocol: OPENAI_CHAT_CHECKPOINT_CODEC.protocol,
+          codecVersion: OPENAI_CHAT_CHECKPOINT_CODEC.version,
+          value: OPENAI_CHAT_CHECKPOINT_CODEC.encode([assistantMessage]),
+        },
+        calls: [
+          {
+            version: '1',
+            operationId: `call-operation-${canonicalJsonSha256([
+              'result-cas-agent-batch',
+              0,
+              resultCallId,
+            ])}`,
+            kind: 'tool',
+            callId: resultCallId,
+            name: 'agent-result',
+            input: resultInput,
+            inputHash: canonicalJsonSha256(resultInput),
+            status: 'in_flight',
+            order: 0,
+          },
+        ],
+        endRequested: false,
+        createdAt: 1,
+      },
+      resultSubmission: {
+        version: '1',
+        callId: resultCallId,
+        output,
+        outputHash,
+      },
+    };
+    const committed: SubAgentChildCheckpoint[] = [];
+    const submitResult = vi.fn(async (callId: string, candidate: JsonValue) => {
+      expect(callId).toBe(resultCallId);
+      expect(candidate).toEqual(output);
+      return {
+        schemaVersion: '1' as const,
+        receiptId: 'result-cas-agent-receipt',
+        taskId,
+        callId,
+        revision: 3,
+        outputHash,
+        submittedAt: 2,
+        status: 'replayed' as const,
+      };
+    });
+    const complete = vi.fn(async (callId: string) => ({
+      schemaVersion: '1' as const,
+      receiptId: 'result-cas-agent-completion',
+      taskId,
+      callId,
+      revision: 4,
+      completedAt: 3,
+      status: 'completed' as const,
+    }));
+    const control = {
+      signal: new AbortController().signal,
+      deadlineAt: Date.now() + 120_000,
+      delegation: {
+        getCatalog: () => ({ revision: 1, capturedAt: 1, executors: [] }),
+        getCatalogEntries: () => [],
+      },
+      completion: {
+        submitResult,
+        complete,
+        fail: vi.fn(async () => {
+          throw new Error('The recovered child must not fail.');
+        }),
+      },
+      commitCheckpoint: vi.fn(async (_operationId: string, candidate: SubAgentChildCheckpoint) => {
+        committed.push(candidate);
+      }),
+      consumeBudget: vi.fn(async () => undefined),
+    } as unknown as SubAgentExecutionControl;
+    const generate = vi
+      .fn()
+      .mockResolvedValueOnce(chatToolResponse('result-cas-agent-end', 'end-agent', {}));
+    const child = new Agent<OpenAIChatProtocol>({
+      llm: createChatModel('offline-result-cas-agent-recovery', generate),
+      maxIterations: 3,
+    });
+
+    const outcome = await child.runAsSubAgent({
+      request: {
+        ownerSessionId: 'result-cas-agent-session',
+        runId: 'result-cas-agent-run',
+        taskId,
+        subagentSessionId: 'result-cas-child-session',
+        path: [taskId],
+        attempt: 2,
+        executionEpoch: 'result-cas-agent-epoch-2',
+        executionFencingToken: '2',
+        definition: { name: 'result-cas-agent', version: '2' },
+        input: { prompt: 'recover' },
+        projectedContext: [],
+        delegation: {
+          version: '1',
+          ownerSessionId: 'result-cas-agent-session',
+          runId: 'result-cas-agent-run',
+          parentTaskId: taskId,
+          path: [taskId],
+          depth: 1,
+          catalogRevision: 1,
+          definitions: [],
+        },
+        limits: DEFAULT_SUBAGENT_LIMITS,
+        checkpoint,
+        signal: new AbortController().signal,
+        deadlineAt: Date.now() + 120_000,
+      },
+      control,
+      runnerId: checkpoint.runnerId,
+      runnerVersion: checkpoint.runnerVersion,
+      executorName: 'local-result-cas-agent',
+      checkpointMode: 'durable',
+      input: 'recover',
+      outputSchema: z.object({ answer: z.string() }).strict(),
+    });
+
+    expect(outcome).toMatchObject({
+      type: 'terminal',
+      result: { status: 'succeeded', output },
+    });
+    expect(submitResult).toHaveBeenCalledOnce();
+    expect(generate).toHaveBeenCalledOnce();
+    expect(complete).toHaveBeenCalledOnce();
+    const projected = committed.find(
+      (candidate) => candidate.pendingBatch?.calls[0]?.status === 'applied',
+    );
+    expect(projected?.pendingBatch?.calls[0]?.result).toBe(
+      JSON.stringify({ ok: true, status: 'replayed', outputHash }),
+    );
+  });
+
   acceptanceIt('RUN-07.l1.root-model-outcome-unknown', 'chat-resume-status', async () => {
     const sessionId = 'root-model-outcome-unknown';
     const runId = 'root-in-flight-run';
@@ -319,6 +494,93 @@ describe('Agent v2 durable recovery', () => {
       );
     },
   );
+
+  it('resumes an applied root pending batch without replaying its Tool or context', async () => {
+    const sessionId = 'root-applied-pending-session';
+    const runId = 'root-applied-pending-run';
+    const fixture = createToolCompactFixture('root-applied-pending');
+    const runtime = createSubAgentRuntime({
+      sessionId,
+      activeDefinitions: [],
+      executors: [],
+      stateStore: fixture.stateStore,
+    });
+    await runtime.init();
+    const recoveredToolHandler = vi.fn(() => 'must not replay');
+    const buildAgent = (provider: ReturnType<typeof vi.fn>): Agent<OpenAIChatProtocol> => {
+      const agent = new Agent<OpenAIChatProtocol>({
+        llm: createChatModel('offline-root-applied-pending', provider),
+        subAgentRuntime: runtime,
+        sessionId,
+        maxIterations: 3,
+      });
+      agent.tools.push({
+        name: 'echo',
+        description: 'Recovery fixture Tool that must never be replayed.',
+        handler: recoveredToolHandler,
+      });
+      agent.init();
+      return agent;
+    };
+
+    const identityAgent = buildAgent(
+      vi.fn().mockResolvedValueOnce(chatToolResponse('root-applied-identity-end', 'end-agent', {})),
+    );
+    const identityOutcome = await identityAgent.agent('capture configuration identity');
+    const configurationHash = fixture.stateStore
+      .snapshot(sessionId)
+      .runs.find(({ runId: candidate }) => candidate === identityOutcome.runId)!.configurationHash;
+    recoveredToolHandler.mockClear();
+
+    const controller = new AgentRunCheckpointController<OpenAIChatProtocol>({
+      ownerSessionId: sessionId,
+      stateStore: fixture.stateStore,
+      checkpointCodec: OPENAI_CHAT_CHECKPOINT_CODEC,
+    });
+    const active = await controller.beginCreate({
+      runId,
+      contextStore: fixture.contextStore,
+      limits: DEFAULT_SUBAGENT_LIMITS,
+      maxIterations: 3,
+      configurationHash,
+    });
+    await controller.checkpoint(
+      {
+        runId,
+        contextStore: fixture.contextStore,
+        status: 'running',
+        modelIteration: 0,
+        pendingBatch: fixture.pendingBatch,
+      },
+      active.lease,
+    );
+    await active.lease.release();
+
+    const replacementProvider = vi
+      .fn()
+      .mockResolvedValueOnce(chatToolResponse('root-applied-replacement-end', 'end-agent', {}));
+    const replacement = buildAgent(replacementProvider);
+    const outcome = await replacement.resumeRun({ runId });
+
+    expect(outcome).toMatchObject({ status: 'succeeded', sessionId, runId });
+    expect(recoveredToolHandler).not.toHaveBeenCalled();
+    expect(replacementProvider).toHaveBeenCalledOnce();
+    expect(chatToolMessageCounts(replacement.getContext(), fixture.callId)).toEqual({
+      assistant: 1,
+      tool: 1,
+    });
+    expect(chatToolMessageCounts(replacement.getHistory(), fixture.callId)).toEqual({
+      assistant: 1,
+      tool: 1,
+    });
+    const stored = await fixture.stateStore.loadRun(sessionId, runId);
+    expect(stored).toMatchObject({
+      status: 'succeeded',
+      budget: { providerCalls: 1 },
+      pendingApprovals: [],
+    });
+    expect(stored).not.toHaveProperty('pendingBatch');
+  });
 
   acceptanceIt(
     'RUN-07.l1.root-provider-abort-outcome-unknown',
@@ -2121,4 +2383,22 @@ function findChatToolArguments(
     if (call?.type === 'function') return call.function.arguments;
   }
   return undefined;
+}
+
+function chatToolMessageCounts(
+  context: readonly OpenAIChatContext[],
+  callId: string,
+): { readonly assistant: number; readonly tool: number } {
+  let assistant = 0;
+  let tool = 0;
+  for (const message of context) {
+    if (
+      message.role === 'assistant' &&
+      message.tool_calls?.some((candidate) => candidate.id === callId)
+    ) {
+      assistant += 1;
+    }
+    if (message.role === 'tool' && message.tool_call_id === callId) tool += 1;
+  }
+  return Object.freeze({ assistant, tool });
 }

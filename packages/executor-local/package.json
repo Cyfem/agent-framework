@@ -26,7 +26,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "vite build && tsc -p tsconfig.build.json",
+    "build": "vite build && tsc -p tsconfig.build.json && node ../../tooling/typescript/fix-declaration-specifiers.mjs dist",
     "test": "vitest run",
     "test:process": "vitest run --config vitest.process.config.ts",
     "typecheck": "tsc --noEmit",

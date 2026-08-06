@@ -1410,10 +1410,207 @@ describe('SubAgentRuntime execution contract', () => {
     expect(store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint).toEqual(childCheckpoint());
   });
 
+  it('rejects unreachable child pending-batch states before they become authoritative', async () => {
+    const executor = new RuntimeTestExecutor('local', async (execution, control) => {
+      await control.commitBinding('pending-invariant-binding', createBinding(execution));
+      const base = approvalCheckpoint('pending-call-1', 'lookup');
+      const batch = base.pendingBatch;
+      const first = batch.calls[0]!;
+      const second = {
+        ...first,
+        operationId: 'pending-operation-2',
+        callId: 'pending-call-2',
+        name: 'second-tool',
+        order: 1,
+      } as const;
+      const invalid: readonly SubAgentChildCheckpoint[] = [
+        {
+          ...base,
+          pendingBatch: {
+            ...batch,
+            calls: [{ ...first, status: 'result_submitted', result: 'invalid-tool-phase' }],
+          },
+        },
+        {
+          ...base,
+          pendingBatch: {
+            ...batch,
+            calls: [
+              {
+                ...first,
+                name: 'agent-result',
+                status: 'result_ready',
+                result: 'invalid-agent-result-phase',
+              },
+            ],
+          },
+        },
+        {
+          ...base,
+          pendingBatch: { ...batch, calls: [{ ...first, taskId: 'foreign-task' }] },
+        },
+        {
+          ...base,
+          pendingBatch: {
+            ...batch,
+            calls: [
+              {
+                ...first,
+                status: 'waiting_approval',
+                approvals: ['approval-1', 'approval-2'],
+              },
+            ],
+          },
+        },
+        {
+          ...base,
+          pendingBatch: {
+            ...batch,
+            calls: [first, { ...second, status: 'result_ready', result: 'skipped' }],
+          },
+        },
+        {
+          ...base,
+          pendingBatch: {
+            ...batch,
+            calls: [first, { ...second, operationId: first.operationId }],
+          },
+        },
+        {
+          ...base,
+          pendingBatch: {
+            ...batch,
+            calls: [
+              {
+                ...first,
+                kind: 'agent',
+                name: 'agent',
+                status: 'in_flight',
+                taskId: 'shared-task',
+              },
+              {
+                ...second,
+                kind: 'agent',
+                name: 'agent',
+                status: 'in_flight',
+                taskId: 'shared-task',
+              },
+            ],
+          },
+        },
+        {
+          ...base,
+          pendingBatch: {
+            ...batch,
+            calls: [
+              {
+                ...first,
+                kind: 'end-agent',
+                name: 'end-agent',
+                status: 'result_ready',
+                result: 'Agent ended.',
+              },
+            ],
+            endRequested: true,
+          },
+        },
+        {
+          ...base,
+          pendingBatch: {
+            ...batch,
+            calls: [
+              {
+                ...first,
+                name: 'agent-result',
+                status: 'result_submitted',
+                result: JSON.stringify({
+                  ok: true,
+                  status: 'accepted',
+                  outputHash: 'a'.repeat(64),
+                }),
+              },
+            ],
+          },
+        },
+      ];
+
+      for (const [index, checkpoint] of invalid.entries()) {
+        await expect(
+          control.commitCheckpoint(`pending-invariant-${index}`, checkpoint),
+        ).rejects.toMatchObject({ code: 'CHECKPOINT_MIGRATION_FAILED' });
+      }
+
+      const output = { answer: 'invalid-checkpoints-rejected' };
+      await control.completion.submitResult('pending-invariant-result', output);
+      await control.completion.complete('pending-invariant-end', { isStandalone: true });
+      return candidateOutcome(execution, output);
+    });
+    const { runtime, store } = await createFixture({ executors: [executor] });
+
+    await expect(
+      runtime.execute(executeRequest({ requestId: 'pending-invariant-validation' })),
+    ).resolves.toMatchObject({
+      type: 'terminal',
+      result: { status: 'succeeded', output: { answer: 'invalid-checkpoints-rejected' } },
+    });
+    expect(store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint).toBeUndefined();
+  });
+
   it('accepts only the size-bounded child result proof matching the authoritative result CAS', async () => {
     const output = { answer: 'authoritative-result-proof' };
     const executor = new RuntimeTestExecutor('local', async (execution, control) => {
       await control.commitBinding('result-proof-binding', createBinding(execution));
+      const invalidCallInput = {};
+      await expect(
+        control.commitCheckpoint('result-proof-reserved-name', {
+          ...childCheckpoint(),
+          pendingBatch: {
+            version: '1',
+            batchId: 'result-proof-reserved-name-batch',
+            assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+            calls: [
+              {
+                version: '1',
+                operationId: 'result-proof-reserved-name-operation',
+                kind: 'tool',
+                callId: 'result-proof-reserved-name-call',
+                name: 'agent',
+                input: invalidCallInput,
+                inputHash: canonicalJsonSha256(invalidCallInput),
+                status: 'prepared',
+                order: 0,
+              },
+            ],
+            endRequested: false,
+            createdAt: 1_000,
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'CHECKPOINT_MIGRATION_FAILED' });
+      await expect(
+        control.commitCheckpoint('result-proof-agent-without-task', {
+          ...childCheckpoint(),
+          pendingBatch: {
+            version: '1',
+            batchId: 'result-proof-agent-without-task-batch',
+            assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+            calls: [
+              {
+                version: '1',
+                operationId: 'result-proof-agent-without-task-operation',
+                kind: 'agent',
+                callId: 'result-proof-agent-without-task-call',
+                name: 'agent',
+                input: invalidCallInput,
+                inputHash: canonicalJsonSha256(invalidCallInput),
+                status: 'in_flight',
+                order: 0,
+              },
+            ],
+            endRequested: false,
+            createdAt: 1_000,
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'CHECKPOINT_MIGRATION_FAILED' });
       await control.completion.submitResult('result-proof-call', output);
 
       await expect(
@@ -1482,6 +1679,36 @@ describe('SubAgentRuntime execution contract', () => {
           },
         }),
       ).rejects.toMatchObject({ code: 'CHECKPOINT_MIGRATION_FAILED' });
+
+      await control.commitCheckpoint('result-proof-valid-tool-output', {
+        ...childResultCheckpoint('result-proof-call', output),
+        pendingBatch: {
+          version: '1',
+          batchId: 'result-proof-valid-output-batch',
+          assistantMessage: { protocol: 'openai-chat', codecVersion: '1', value: [] },
+          calls: [
+            {
+              version: '1',
+              operationId: 'result-proof-valid-output-operation',
+              kind: 'tool',
+              callId: 'result-proof-call',
+              name: 'agent-result',
+              input: linkedInput,
+              inputHash: canonicalJsonSha256(linkedInput),
+              status: 'result_submitted',
+              // ToolExecutionRecord persists handler output as a JSON string in pending checkpoints.
+              result: JSON.stringify({
+                ok: true,
+                status: 'accepted',
+                outputHash: canonicalJsonSha256(output),
+              }),
+              order: 0,
+            },
+          ],
+          endRequested: false,
+          createdAt: 1_001,
+        },
+      });
       const unrelatedInput = {};
       await expect(
         control.commitCheckpoint('result-proof-unrelated-tool', {

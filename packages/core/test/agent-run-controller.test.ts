@@ -342,6 +342,90 @@ describe('AgentRunCheckpointController', () => {
     await active.lease.release();
   });
 
+  it('enforces the shared production batch invariants and exact mixed end-agent rejection', async () => {
+    const store = new RecordingRuntimeStateStore();
+    const controller = createController(store);
+    const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'task' }]);
+    const active = await controller.beginCreate({ contextStore, limits: DEFAULT_SUBAGENT_LIMITS });
+    const mixedEndBatch = createToolBatchPlan<TestProtocol>({
+      batchId: 'mixed-end-batch',
+      iteration: 0,
+      assistantMessage: {
+        protocol: TEST_CODEC.protocol,
+        codecVersion: TEST_CODEC.version,
+        value: [{ kind: 'assistant', content: 'mixed', calls: [] }],
+      },
+      calls: [parsedCall('lookup-call', 'lookup'), parsedCall('end-call', 'end-agent')],
+      createdAt: 1_060,
+    }).initialCheckpoint;
+
+    await expect(
+      controller.checkpoint(
+        { runId: 'run-1', contextStore, pendingBatch: mixedEndBatch },
+        active.lease,
+      ),
+    ).resolves.toBeDefined();
+    expect(mixedEndBatch.calls[1]).toMatchObject({
+      kind: 'end-agent',
+      status: 'settled',
+      error: {
+        code: 'END_AGENT_MUST_BE_STANDALONE',
+        message: 'end-agent must be the only Tool call in its provider batch.',
+        retryable: false,
+      },
+      output: {
+        ok: false,
+        error: {
+          code: 'END_AGENT_MUST_BE_STANDALONE',
+          message: 'end-agent must be the only Tool call in its provider batch.',
+          retryable: false,
+        },
+      },
+    });
+
+    const endCall = mixedEndBatch.calls[1]!;
+    const invalidBatches: readonly StoredPendingToolBatch[] = [
+      {
+        ...mixedEndBatch,
+        calls: mixedEndBatch.calls.map((call) =>
+          call.kind === 'end-agent' ? { ...call, output: 'tampered' } : call,
+        ),
+      },
+      {
+        ...mixedEndBatch,
+        calls: mixedEndBatch.calls.map((call) =>
+          call.kind === 'end-agent'
+            ? {
+                ...call,
+                error: { ...endCall.error!, message: 'tampered descriptor' },
+              }
+            : call,
+        ),
+      },
+      {
+        ...createPendingBatch(),
+        calls: createPendingBatch().calls.map((call) => ({
+          ...call,
+          status: 'result_submitted' as const,
+          output: 'invalid-agent-phase',
+        })),
+      },
+      {
+        ...createPendingBatch(),
+        calls: createPendingBatch().calls.map((call) => ({
+          ...call,
+          taskId: 'premature-task',
+        })),
+      },
+    ];
+    for (const pendingBatch of invalidBatches) {
+      await expect(
+        controller.checkpoint({ runId: 'run-1', contextStore, pendingBatch }, active.lease),
+      ).rejects.toMatchObject({ code: 'CHECKPOINT_VERSION_MISMATCH' });
+    }
+    await active.lease.release();
+  });
+
   it('rejects a mismatched protocol codec before restoring ContextStore', async () => {
     const store = new RecordingRuntimeStateStore();
     const controller = createController(store);

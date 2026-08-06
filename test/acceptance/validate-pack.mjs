@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
-import { validatePackageDryRun } from './lib/pack.mjs';
+import { validatePackageArtifact, validatePackChildTerminationSelfTest } from './lib/pack.mjs';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDirectory, '..', '..');
@@ -27,7 +27,13 @@ function parseArgs(argv) {
     const value = separator === -1 ? true : arg.slice(separator + 1);
     assert(key.length > 0 && !options.has(key), `duplicate or empty option: ${arg}`);
     assert(
-      ['expected-version', 'package-dir', 'self-test'].includes(key),
+      [
+        'expected-name',
+        'expected-version',
+        'package-dir',
+        'peer-package-dir',
+        'self-test',
+      ].includes(key),
       `unsupported option: --${key}`,
     );
     options.set(key, value);
@@ -49,6 +55,17 @@ function optionString(options, key, fallback) {
   return value;
 }
 
+async function expectFailure(action, pattern, label) {
+  try {
+    await action();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    assert(pattern.test(message), `${label} failed with the wrong diagnostic: ${message}`);
+    return;
+  }
+  throw new Error(`${label} unexpectedly passed`);
+}
+
 async function selfTest() {
   const directory = await mkdtemp(path.join(tmpdir(), 'manee-pack-validator-'));
   try {
@@ -60,6 +77,7 @@ async function selfTest() {
           name: '@fixture/subagent-v2-pack',
           version: '2.0.0',
           type: 'module',
+          engines: { node: '>=22' },
           files: ['dist', 'README.md'],
           main: './dist/index.cjs',
           module: './dist/index.js',
@@ -80,10 +98,73 @@ async function selfTest() {
     await writeFile(path.join(directory, 'README.md'), '# pack validator fixture\n', 'utf8');
     await writeFile(path.join(directory, 'dist', 'index.js'), 'export {};\n', 'utf8');
     await writeFile(path.join(directory, 'dist', 'index.cjs'), 'module.exports = {};\n', 'utf8');
-    await writeFile(path.join(directory, 'dist', 'index.d.ts'), 'export {};\n', 'utf8');
+    await mkdir(path.join(directory, 'dist', 'internal'), { recursive: true });
+    await writeFile(
+      path.join(directory, 'dist', 'index.d.ts'),
+      'export type * from "./internal/index.js";\n',
+      'utf8',
+    );
+    await writeFile(
+      path.join(directory, 'dist', 'internal', 'index.d.ts'),
+      'export interface FixtureContract { readonly status: "passed"; }\n',
+      'utf8',
+    );
     await writeFile(path.join(directory, 'dist', 'index.js.map'), '{}\n', 'utf8');
     await writeFile(path.join(directory, 'dist', 'index.cjs.map'), '{}\n', 'utf8');
-    return await validatePackageDryRun({ packageDirectory: directory, expectedVersion: '2.0.0' });
+    const happyPath = await validatePackageArtifact({
+      packageDirectory: directory,
+      expectedPackageName: '@fixture/subagent-v2-pack',
+      expectedVersion: '2.0.0',
+    });
+    const validateFixture = () =>
+      validatePackageArtifact({
+        packageDirectory: directory,
+        expectedPackageName: '@fixture/subagent-v2-pack',
+        expectedVersion: '2.0.0',
+      });
+
+    const tokenPath = path.join(directory, 'dist', 'token.json');
+    await writeFile(tokenPath, '{"token":"must-not-pack"}\n', 'utf8');
+    await expectFailure(
+      validateFixture,
+      /unsupported dist artifact|secret-sensitive path/iu,
+      'sensitive dist artifact rejection',
+    );
+    await rm(tokenPath, { force: true });
+
+    const privateKeyPath = path.join(directory, 'dist', 'private-key.js');
+    await writeFile(privateKeyPath, 'export const leaked = true;\n', 'utf8');
+    await expectFailure(
+      validateFixture,
+      /secret-sensitive path/iu,
+      'sensitive path pattern rejection',
+    );
+    await rm(privateKeyPath, { force: true });
+
+    const sourcePath = path.join(directory, 'dist', 'source.ts');
+    await writeFile(sourcePath, 'export {};\n', 'utf8');
+    await expectFailure(
+      validateFixture,
+      /unsupported dist artifact|TypeScript source/iu,
+      'TypeScript source rejection',
+    );
+    await rm(sourcePath, { force: true });
+
+    const cjsMapPath = path.join(directory, 'dist', 'index.cjs.map');
+    await rm(cjsMapPath, { force: true });
+    await expectFailure(validateFixture, /CJS source map is missing/iu, 'missing map rejection');
+    await writeFile(cjsMapPath, '{}\n', 'utf8');
+
+    return {
+      ...happyPath,
+      negativeCases: [
+        'sensitive-dist-artifact',
+        'sensitive-path-pattern',
+        'typescript-source',
+        'missing-source-map',
+      ],
+      childTermination: await validatePackChildTerminationSelfTest(),
+    };
   } finally {
     await rm(directory, { force: true, maxRetries: 5, recursive: true, retryDelay: 100 });
   }
@@ -101,12 +182,23 @@ export async function main(argv = process.argv.slice(2)) {
 
   const packageArgument =
     positionalPackage ?? optionString(options, 'package-dir', 'packages/core');
+  const expectedPackageName = optionString(options, 'expected-name', undefined);
+  assert(expectedPackageName !== undefined, '--expected-name is required');
   const expectedVersion = optionString(options, 'expected-version', '2.0.0');
   const packageDirectory = path.resolve(repoRoot, packageArgument);
+  const peerPackageArgument = optionString(options, 'peer-package-dir', undefined);
+  const peerPackageDirectories = peerPackageArgument
+    ? [path.resolve(repoRoot, peerPackageArgument)]
+    : [];
   return {
     status: 'passed',
-    mode: 'npm-pack-dry-run',
-    package: await validatePackageDryRun({ packageDirectory, expectedVersion }),
+    mode: 'npm-pack-runtime-and-node-next-consumers',
+    package: await validatePackageArtifact({
+      packageDirectory,
+      expectedPackageName,
+      peerPackageDirectories,
+      expectedVersion,
+    }),
   };
 }
 

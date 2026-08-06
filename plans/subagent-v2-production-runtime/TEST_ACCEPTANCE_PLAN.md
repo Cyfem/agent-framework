@@ -3,7 +3,7 @@
 ## 1. 文档状态
 
 - 设计状态：验收方案，随 [PLAN.md](./PLAN.md) 与 [TECHNICAL_CHANGES.md](./TECHNICAL_CHANGES.md) 一起作为 Subagent v2 实施基线。
-- 当前实现状态：尚未实现。本文件中的新增目录、脚本、命令、环境变量、测试 ID 和产物格式均是未来交付要求，不代表当前 checkout 已具备。
+- 当前实现状态：当前 checkout 已完成 C0～C6 的 Core v2、官方 Local、公开 Agent durable loop、Phase 1 离线/进程恢复证据；C7 transport/Worker/Process/HTTP 正在实施，C8/C9 与 Docker/真实方舟最终证据仍是待交付要求。
 - 目标范围：Phase 1 Core/Local、Phase 2 Worker/Process/HTTP Remote、Phase 3 PostgreSQL/BullMQ/Docker/S3/OTel、Compose，以及完整离线与真实方舟验收。
 - 目标版本：所有公开包统一 `2.0.0`；不为 v1 legacy Subagent 提供兼容验收。
 - 明确排除：conversation handoff、active-agent 所有权转移、Windows/Electron 桌面交互、任意云厂商 transport 的产品化实现。
@@ -26,18 +26,15 @@ Subagent v2 只有同时满足以下三类证据才可发布：
 
 ## 3. 当前仓库基线
 
-截至本方案编写时，仓库有以下可复用事实：
+当前 checkout 有以下可复用事实：
 
-- 根 `pnpm test` 只执行 `packages/core` 的 Vitest；当前不会自动覆盖未来的 `packages/executor-local`。
-- Vitest 使用 Node 环境、2023-11 decorators 转换，并只收集 `packages/core/test/**/*.test.ts`。
-- 当前没有 Subagent 专项单元测试；v1 Subagent 的最强证据来自 demo。
-- `pnpm demo:features:ark` 已通过同一个方舟 Agent Plan endpoint 顺序运行 Chat 与 Responses。
-- 当前每种协议严格执行 1 次真实 summary、8 次父请求、3 次子请求，共 12 次 provider generate；两种协议最多 24 次。
-- 当前综合 demo 已覆盖 inline/file Skill、reference、asset、受信任 Node.js script、装饰器 Tool、运行时 Tool、约 20K 字符结果、active/raw context 差异、真实 summary、Tool 事件和同协议 v1 Subagent。
-- 当前真实综合 demo 已设置 SDK `maxRetries: 0`、单请求 120 秒 timeout、框架错误恢复次数为 0，并使用白名单 JSON 日志。
-- `demo:ark:subagent` 使用不同 endpoint、旧 Tool wire 和更宽松日志，只保留为独立 smoke，不作为 v2 完整验收的证据来源。
-
-v2 实施应复用现有 `feature-suite` 的配置加载、Observed Model、严格序列、marker、Skills fixture、压缩断言和日志清洗，不另写一套安全边界更弱的真实模型 runner。
+- Core 与 Local 待发布包统一为 `2.0.0`；v1 `subAgents`、`AgentConstructor`、动态 `RuntimeSubAgent` 与旧模型 wire 已由 legacy 门禁禁止。
+- 根 `pnpm test` 显式组合 Core、Local 和 5 个 Windows 进程恢复用例，默认无 API key、网络访问或真实费用；Vitest 统一使用 Node 环境、network deny setup 与 2023-11 decorators transform。
+- Phase 1 manifest 当前覆盖 Core/Local、跨协议、审批、上下文压缩、provider intent、tree budget、lease/fencing、Atomic File WAL 和 process-crash recovery；具体 case 数与 digest 以每次 `pnpm validate:subagent:v2:manifest` 输出为准。
+- `pnpm demo:features:ark` 已迁移到 v2 Local Runtime，继续复用配置加载、Observed Model、严格序列、marker、Skills fixture、压缩断言和白名单日志；它不会进入默认 `pnpm test`。
+- `pnpm demo:ark:subagent` 继续作为独立真实模型 smoke，但不替代完整 v2 manifest、placement profile 或离线竞态证据。
+- C7 的 Worker、Process、HTTP 包和对应真实 placement profile 尚未完成；C8/C9 的 PostgreSQL、BullMQ、Docker、S3、OTel、Compose 与 release report 同样不能由 Phase 1 结果代替。
+- 当前环境未具备 Docker live gate；没有显式方舟凭证和调用确认时也不运行真实 provider 验收。
 
 ## 4. 验收原则
 
@@ -762,6 +759,21 @@ Phase 2/3 的 L6 运维契约还要按 adapter 能力运行以下门禁：
 
 L6-01/02 使用本地 transport test double 即可验证模板 hook，不要求 Core 自建认证系统；Phase 3 则必须由实际生产 adapter 的部署级 harness 提供证据。长时间 soak 与混沌测试使用 scripted provider 控制成本，结束时再运行 9.14 的少量真实方舟 placement profile。
 
+### 12.1 C7 Transport/Placement 固定验收 Oracle
+
+- Transport：closed envelope、错版本/额外字段、16 MiB 边界、JCS digest、双向连续 sequence、same-ID/same-hash replay、same-ID/different-hash conflict、sequence gap，以及 execution `remainingMs` 本地重建 deadline；`2^31` 与 `2^32 ms` 长 timeout 必须保持原时长并可取消，不能触发 Node timer overflow 或 1 ms 退化。
+- 入站重验：definition/runner/checkpoint/adapter identity、Zod input、JSON-safe、projection/artifact limits 和 binding/outcome/control payload；任何失败发生在 child runner/Core mutation 前。
+- 恢复窗口：unbound create 只重放原 operation；完整 checkpoint crash 使用原 task/binding，attempt、epoch、fencing 按恢复规则推进且 reconnect count 为 0；provider `in_flight` 为 `failed + outcomeUnknown`；result receipt 窗口为 `failed + partial`；terminal CAS 后重放只读原 terminal。每次 live dispatch 最多自动恢复一次。
+- Worker/Process：严格环境白名单、secret 不进 env/argv/stdout/stderr/binding；protocol cancel、5 秒 kill fallback、exit/close 分类和无孤儿资源；两者 `reconnect=none`。
+- HTTP/HMAC：method/path/body/timestamp/nonce/signature 全部篡改负例，正负 60 秒边界、120 秒原子 replay TTL、统一安全 401、session authorization、幂等 create/control reply、heartbeat 30/60 秒阈值、cursor 断线重连、lost job 不 create 替代。
+- Artifact sidecar：三种 transport 都验证 byte length 与 SHA-256；JSON envelope 不允许携带大块 base64 数据，binding/job/event/error 不含路径、URL、cursor 或 credential。
+
+Phase 2 manifest 分为 `C7-TRANSPORT`、`C7-WORKER`、`C7-PROCESS`、`C7-HTTP`、`C7-AUTH` 与 `C7-PACK`，并显式映射 CONF-01～08、L6-01～05 和 F02/F08/F09/F12～F15。默认 `pnpm test` 只加入三个 adapter 的无外网 unit/conformance；真实 OS crash 与 HTTP loopback 归入独立 `acceptance:subagent:v2:phase2:offline`，真实方舟仍需显式凭证和调用确认。
+
+当前已实现的 closed envelope、sequence/replay、execution wire 与 recoverable settle 四项 L1 证据单列为 `C7-TRANSPORT-FOUNDATION`；只有 strict RPC control/outcome 与 artifact sidecar 也完成后，完整 `C7-TRANSPORT` requirement 才能从 `planned` 改为 `implemented`。
+
+Ark placement 调用公式固定为：Worker/Process 各为两条跨协议 5-call flow，加 provider in-flight 2、result receipt 3、terminal CAS 4，共 19 次（hard limit 21）；HTTP 为两条 5-call 跨协议 flow 加 1-call lost-target，共 11 次（hard limit 13）。ARK key 只在 controller 内存，child 通过受控 Model gateway 请求，不进入 Worker、Process、HTTP remote 的 env、argv、binding、job store、日志或 evidence。
+
 Phase 3 Docker Compose 必须同时启动 PostgreSQL、Redis、MinIO、HTTP worker、BullMQ worker、隔离 Docker Engine、controller 与故障代理；Docker task 容器断言非 root、只读 rootfs、无 Docker socket、默认无网络。Core telemetry sink 与独立 `maneeagent-observability-otel` bridge 的 span 映射分别验收，Core tarball 不得依赖 OTel SDK。所有公开包和 evidence 统一版本 `2.0.0`。
 
 ## 13. 故障注入矩阵
@@ -862,7 +874,7 @@ dry-run JSON 用于检查文件清单；真实 pack 生成 tarball。脚本随�
 - Local Executor 的 Core dependency/peer range 与目标 2.0 版本一致。
 - tarball 不含 test、fixture、`.env`、checkpoint、artifact、WAL 或验收临时文件。
 
-pack validator 在 `finally` 删除 tarball/consumer，并输出两个 tarball digest、package version 和 consumer caseId；这些字段进入本次 evidence shard，不能靠人工阅读 `npm pack` 输出完成门禁。
+pack validator 先运行敏感 dist 产物、TypeScript 源码、缺 source map、child 超时和输出超限负例，再锁定包名、`engines.node`、仅根 exports、无 `bin`、peer range 及发布文件正向白名单。Local consumer 必须使用同轮生成且 semver 兼容的 Core tarball；tar/tsc/runtime child 使用不含 provider key 的最小环境白名单，所有 npm/tar/tsc/runtime child 都有 wall-clock watchdog，并在超限后等待进程关闭再进入 `finally` 清理。validator 输出两个 tarball digest、package version 和 consumer caseId；这些字段进入本次 evidence shard，不能靠人工阅读 `npm pack` 输出完成门禁。
 
 默认 `pnpm test` 必须完全无网络。前置 `pnpm install --frozen-lockfile` 可以在验收计时外预热 store；offline orchestrator 中的 tarball consumer 强制使用 pnpm/npm cache 的 offline 模式，缺依赖时失败且不能回退访问 registry。若要单独诊断 packaging network，应使用另一个不产生 platform passed 的显式命令。两种路径都禁止访问方舟或其他模型 provider。
 

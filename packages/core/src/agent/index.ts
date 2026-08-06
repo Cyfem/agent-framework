@@ -18,6 +18,7 @@ import type {
   AgentRunOutcome,
   ToolRuntimeContext,
 } from '../subagent/agent-run';
+import { serializeAgentResultReceipt } from '../subagent/agent-result-receipt';
 import type { ApprovalDecision, ApprovalRequest } from '../subagent/approval';
 import type { SubAgentCatalogEntry } from '../subagent/catalog';
 import type {
@@ -4328,8 +4329,7 @@ function projectAuthoritativeResultSubmission(
       'The authoritative child result cannot be projected from this pending call phase.',
     );
   }
-  const output: JsonValue = Object.freeze({
-    ok: true,
+  const output = serializeAgentResultReceipt({
     status: replayStatus,
     outputHash: submission.outputHash,
   });

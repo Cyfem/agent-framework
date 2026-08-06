@@ -13,10 +13,11 @@ import {
   type SubAgentDefinitionRef,
   type SubAgentDelegationClient,
   type SubAgentExecutionControl,
-  type SubAgentExecutionOutcome,
   type SubAgentExecutionRequest,
   type SubAgentExecutor,
   type SubAgentExecutorBinding,
+  type SubAgentExecutorOperationResult,
+  type SubAgentExecutorRecoveryRequired,
   type SubAgentProgress,
   type SubAgentTaskEvent,
   type SubAgentUsageDelta,
@@ -142,7 +143,9 @@ export async function runSubAgentExecutorConformance(
     deadlineAt: spawnRequest.deadlineAt,
     approval: 'approved',
   });
-  const handle = await executor.spawn(spawnRequest, spawnControl.control);
+  const spawned = await executor.spawn(spawnRequest, spawnControl.control);
+  assertExecutorTaskHandle(spawned);
+  const handle = spawned;
   const spawnBinding = onlyBinding(spawnControl.snapshot());
   assertBinding(executor, spawnRequest, spawnBinding);
   assert.deepEqual(handle.binding, spawnBinding);
@@ -170,7 +173,9 @@ export async function runSubAgentExecutorConformance(
     deadlineAt: cancelRequest.deadlineAt,
     approval: 'approved',
   });
-  const cancelHandle = await cancellable.executor.spawn(cancelRequest, cancelControl.control);
+  const cancelSpawned = await cancellable.executor.spawn(cancelRequest, cancelControl.control);
+  assertExecutorTaskHandle(cancelSpawned);
+  const cancelHandle = cancelSpawned;
   await cancellable.waitUntilStarted?.();
   await cancellable.executor.cancel(cancelHandle.binding, {
     operationId: 'executor-conformance-cancel-operation',
@@ -554,16 +559,34 @@ function bindingAsJson(binding: SubAgentExecutorBinding): JsonValue {
 }
 
 function assertSuccessfulOutcome(
-  outcome: SubAgentExecutionOutcome,
+  outcome: SubAgentExecutorOperationResult,
   request: SubAgentExecutionRequest,
   executorName: string,
 ): void {
+  assert.notEqual(
+    outcome.type,
+    'recovery_required',
+    'the conformance settle scenario must not require recovery',
+  );
+  if (outcome.type === 'recovery_required') {
+    throw new Error('The conformance settle scenario unexpectedly required recovery.');
+  }
   assert.equal(outcome.type, 'terminal');
   if (outcome.type !== 'terminal') throw new Error('Expected a terminal outcome.');
   assert.equal(outcome.result.status, 'succeeded');
   assert.equal(outcome.result.task.taskId, request.taskId);
   assert.deepEqual(outcome.result.task.subAgent, request.definition);
   assert.equal(outcome.result.executor, executorName);
+}
+
+function assertExecutorTaskHandle(
+  candidate: ExecutorTaskHandle | SubAgentExecutorRecoveryRequired,
+): asserts candidate is ExecutorTaskHandle {
+  const recoveryRequired = 'type' in candidate && candidate.type === 'recovery_required';
+  assert.equal(recoveryRequired, false, 'the conformance spawn scenario must bind a task handle');
+  if (recoveryRequired) {
+    throw new Error('The conformance spawn scenario unexpectedly required recovery.');
+  }
 }
 
 async function assertAbortableEventIterator(handle: ExecutorTaskHandle): Promise<void> {
@@ -595,6 +618,14 @@ function assertEvent(event: SubAgentTaskEvent, taskId: string): void {
 async function assertCancelled(handle: ExecutorTaskHandle): Promise<void> {
   try {
     const outcome = await handle.wait();
+    assert.notEqual(
+      outcome.type,
+      'recovery_required',
+      'the conformance cancel scenario must not require recovery',
+    );
+    if (outcome.type === 'recovery_required') {
+      throw new Error('The conformance cancel scenario unexpectedly required recovery.');
+    }
     assert.equal(outcome.type, 'terminal');
     if (outcome.type !== 'terminal') throw new Error('Cancelled execution must be terminal.');
     assert.equal(outcome.result.status, 'cancelled');

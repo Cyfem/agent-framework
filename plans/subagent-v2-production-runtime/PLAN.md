@@ -6,6 +6,8 @@
 
 本次是明确的 2.0 breaking change：删除旧 `AgentOptions.subAgents`、`AgentConstructor`、动态 `RuntimeSubAgent` 和旧 `agentName/input/outputDescription` Tool 协议，不提供兼容适配层。官方本地 Executor 作为独立 workspace 包交付，核心包只保留协议无关的语义、路由和状态控制面。
 
+实施状态：当前 checkout 已完成 C0～C6（Core v2、官方 Local、公开 Agent durable loop、v1 原子切换与 Phase 1 离线/进程恢复门禁），正在实施 C7 Worker/Process/HTTP placement；C8/C9、Docker live gate 与完整真实方舟验收仍未完成。下文“背景与现状”保留立项时的 v1 问题陈述，不代表当前源码仍存在这些旧接口。
+
 ## 背景与现状
 
 当前实现位于 `packages/core/src/agent/index.ts` 与 `packages/core/src/agent/types.ts`，已经具备 manager-as-tool、每次创建全新子代理实例、父子上下文默认隔离、Chat/Responses 共用调度路径等基础能力，但存在以下生产阻断项：

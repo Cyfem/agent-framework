@@ -9,6 +9,10 @@ import {
   parseJsonValue,
   type JsonValue,
 } from '../subagent/json';
+import {
+  MIXED_END_AGENT_REJECTION_ERROR,
+  MIXED_END_AGENT_REJECTION_RESULT,
+} from '../subagent/pending-batch-invariants';
 import type { RuntimeTaskCreateMutation } from '../subagent/state-controller';
 import {
   StateLeaseUnavailableError,
@@ -22,12 +26,6 @@ import type { AgentProtocol, AgentToolCall, MaybePromise } from './types';
 
 export const MODEL_SUBAGENT_TOOL_NAME = 'agent';
 export const END_AGENT_TOOL_NAME = 'end-agent';
-
-const END_AGENT_STANDALONE_ERROR: Readonly<SubAgentErrorDescriptor> = Object.freeze({
-  code: 'END_AGENT_MUST_BE_STANDALONE',
-  message: 'end-agent must be the only Tool call in its provider batch.',
-  retryable: false,
-});
 
 const TOOL_EXECUTION_ERROR: Readonly<SubAgentErrorDescriptor> = Object.freeze({
   code: 'INTERNAL_ERROR',
@@ -196,8 +194,8 @@ export function createToolBatchPlan<P extends AgentProtocol>(input: {
         order,
         kind,
         status: 'settled',
-        error: END_AGENT_STANDALONE_ERROR,
-        output: errorEnvelope(END_AGENT_STANDALONE_ERROR),
+        error: MIXED_END_AGENT_REJECTION_ERROR,
+        output: MIXED_END_AGENT_REJECTION_RESULT,
       });
     }
     return freezeStoredCall({

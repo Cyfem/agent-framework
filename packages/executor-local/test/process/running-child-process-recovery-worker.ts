@@ -29,7 +29,9 @@ const SESSION_ID = 'root-running-child-process-session';
 const EXECUTOR_NAME = 'local-root-running-child-process';
 const RUNNER_ID = 'root-running-child-process-runner';
 const RUNNER_VERSION = '2.0.0';
-const EXECUTION_LEASE_TTL_MS = 100;
+// The controller advances the shared StateStore clock past this boundary without sleeping. Keep a
+// production-sized local ownership window so WAL/fsync latency is not mistaken for lease loss.
+const EXECUTION_LEASE_TTL_MS = 30_000;
 const PARENT_CALL_ID = 'root-running-parent-agent-call';
 const PARENT_END_CALL_ID = 'root-running-parent-end-call';
 const CHILD_TOOL_NAME = 'durable-running-proof';

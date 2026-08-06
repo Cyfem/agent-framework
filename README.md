@@ -17,7 +17,7 @@
 - **上下文与历史**：分别维护模型使用的 active context 和完整 raw history，并保留 provider 原始字段。
 - **事件系统**：可观察模型响应、工具调用前后、工具异常、Agent 状态和 Agent 错误。
 - **渐进式 Skills**：首轮只暴露 `name + description`，模型通过内置 `skill` 工具按需加载 instructions、读取文本资源或运行显式启用的脚本。
-- **Subagent v2**：通过 typed `SubAgentDefinition`、模型可见 `{ subAgent, executor, input }` wire 和独立 Executor 调度隔离 child Agent；支持跨协议 placement、审批暂停/恢复、嵌套委派、持久 checkpoint、取消与 typed result。
+- **Subagent v2**：通过 typed `SubAgentDefinition`、模型可见 `{ subAgent, executor, input }` wire 和独立 Executor 调度隔离 child Agent；支持跨协议 placement、审批暂停/恢复、嵌套委派、持久 checkpoint、取消与 typed result，并提供 C7 transport v1 与可恢复 Executor settle contract。
 - **上下文压缩与恢复**：支持 active-only 工具 payload 裁剪、外部摘要事务和 context-length 错误恢复；raw history 始终保留原文。
 - **多模态上下文**：Responses 支持文件上传和图片、文件、视频、音频内容块；Chat 支持图片、音频和文件内容块。
 - **扩展 Model**：可继承 `Model<P>` 接入其他消息协议或 OpenAI-compatible 服务。
@@ -117,7 +117,7 @@ pnpm demo
 
 正式验收证据使用固定的 Node.js 22 和 `pnpm@11.1.3`。Windows 上可运行 `pnpm toolchain:node22`，脚本会把便携工具链安装到被忽略的 `.tools/` 目录，并在解压前核对 Node.js 官方 SHA-256；日常开发可继续使用满足版本要求的本机工具链。
 
-Subagent v2 实施期间可运行 `pnpm validate:subagent:v2:manifest`、`pnpm validate:subagent:v2:legacy` 和 `pnpm validate:subagent:v2:pack` 校验需求追踪、旧 API/wire 零残留与 Core/Local 两个待发布包的内容。manifest 门禁会静态核对所有测试源码中的 literal `acceptanceIt(caseId, variant, fn)` 与清单记录，拒绝动态、重复、错文件或未登记 case；legacy 门禁以 `--forbid-all` 扫描整个 `packages` 与 `demo` 可执行源码树。`validate:subagent:v2:evidence` 还需通过 `--evidence=<repo-relative.json>` 显式指定本次证据 shard。这些是仓库验收命令，不是 npm 包 CLI。
+Subagent v2 实施期间可运行 `pnpm validate:subagent:v2:manifest`、`pnpm validate:subagent:v2:legacy` 和 `pnpm validate:subagent:v2:pack` 校验需求追踪、旧 API/wire 零残留与 Core/Local 两个待发布包的内容。manifest 门禁会静态核对所有测试源码中的 literal `acceptanceIt(caseId, variant, fn)` 与清单记录，拒绝动态、重复、错文件或未登记 case；legacy 门禁以 `--forbid-all` 扫描整个 `packages` 与 `demo` 可执行源码树；pack 门禁会先运行敏感产物、源码泄漏、缺 source map、超时和输出超限负例，再重新构建两包并比对 dry-run 与真实临时 tarball。发布文件只允许根 `package.json`、README/license，以及 `dist` 中的 ESM/CJS、声明和 source map，并叠加 secret-sensitive 文件拒绝。真实 tarball 解包后会以正式包名执行 ESM `import()` 与 CommonJS `require()` smoke，并同时编译 `type: module` ESM 与 `.cts` CommonJS 消费者；两者都使用 `module/moduleResolution: NodeNext`、`strict: true`、`skipLibCheck: false`、关键 contract/字段非 `any` 断言和 missing-export 负检。门禁还锁定包名、Node.js 要求、根 exports、无 `bin` 与 peer range；Local 使用同一轮生成、解包且 semver 兼容的 Core tarball，不借用 workspace Core。除本地 `npm pack` 外的 tar/tsc/runtime child 只收到最小环境白名单，所有 child 都有 wall-clock watchdog，因而不会把 `ARK_API_KEY` 等凭证带入消费 smoke。`validate:subagent:v2:evidence` 还需通过 `--evidence=<repo-relative.json>` 显式指定本次证据 shard。这些是仓库验收命令，不是 npm 包 CLI；临时生成 tarball 也不代表执行了 `npm publish`。
 
 ## Skills
 
@@ -204,7 +204,7 @@ pnpm format:check
 - 同一个 Agent 实例不能并发执行多个 `agent()` 调用。
 - 父 Agent 与 child Agent 可以使用不同协议；child 的 Model、Tools、Skills、system prompts、compact 与错误恢复配置由受信任 Executor factory 独立提供，不从父 Agent 隐式继承。
 - durable root resume 和跨进程 child resume 需要 ready `SubAgentRuntime`、持久 StateStore 以及兼容的版本化 checkpoint codec。无 codec 自定义协议仅限宿主提供、Catalog 明确声明 `same_process` 的 placement：同一 Agent 实例可以保留进程内 checkpoint 并恢复根审批；替换实例、跨进程恢复和无 codec child 自身产生的 durable 审批仍会被拒绝。官方 Local Executor 声明的是 `checkpoint`，不是 `same_process`。
-- 当前 checkout 已实现宿主进程内 Local Executor 与单机 Memory/Atomic File StateStore；Worker、Process、HTTP 和分布式生产适配器属于后续 C7–C9，且当前 Local 包尚未发布到 npm。
+- 当前 checkout 已实现宿主进程内 Local Executor、单机 Memory/Atomic File StateStore，以及 C7 共用的 closed JSON transport v1、execution wire 和 `recovery_required` settle contract；Worker、Process、HTTP 具体 placement 与分布式生产适配器仍属于后续 C7–C9，且当前 Local 包尚未发布到 npm。
 - `@Tool` 需要应用构建链支持 2023-11 decorators。
 
 `agent()` 和独立 `toolCall()` 支持传入 `AbortSignal` 与绝对 `deadlineAt`。取消信号会贯穿 Model、Tool、摘要、payload compactor 和模型错误恢复；Chat/Responses 适配器只把 `signal` 作为 SDK request option 传递，不会把截止时间或运行时身份写入 provider body。取消是协作式的，第三方 Model、Tool 或 callback 仍需主动遵守收到的 signal。对 durable provider operation，SDK dispatch 前收到取消会得到 `cancelled`；请求 intent 已持久化为 `in_flight` 后再发生 abort、超时或连接结果不确定，则 run/task 固定为 `failed + outcomeUnknown`，不会自动重发可能已经执行的请求。
@@ -245,4 +245,4 @@ const agent = new Agent({
 
 核心 API、事件、上下文、Skills、子代理、Responses/Chat 适配和自定义 Model 的完整说明见 [`packages/core/README.md`](./packages/core/README.md)。
 
-Subagent v2 正按三阶段计划分批实施。当前 checkout 的 Core/Local manifest 为 `2.0.0`，C2–C6 源码已完成 Core contracts、持久状态域、Catalog/Router、公开 `Agent` durable loop、v1 原子删除、跨协议 Local placement、审批/嵌套审批恢复、context compact 崩溃窗口恢复，以及 Memory/Atomic File StateStore。C7 的 Worker/Process/HTTP placement 和 C8–C9 的分布式适配器、Compose、完整 evidence/release report 尚未交付；npm 发布状态也独立于这些 manifest。实际 API 与本地存储边界见 [`packages/core/README.md`](./packages/core/README.md) 与 [`packages/executor-local/README.md`](./packages/executor-local/README.md)。
+Subagent v2 正按三阶段计划分批实施。当前 checkout 的 Core/Local manifest 为 `2.0.0`，C2–C6 源码已完成 Core contracts、持久状态域、Catalog/Router、公开 `Agent` durable loop、v1 原子删除、跨协议 Local placement、审批/嵌套审批恢复、context compact 崩溃窗口恢复，以及 Memory/Atomic File StateStore；C7 已交付共用 transport v1 和 recoverable Executor settle 地基。C7 的 Worker/Process/HTTP placement 以及 C8–C9 的分布式适配器、Compose、完整 evidence/release report 尚未交付；npm 发布状态也独立于这些 manifest。实际 API 与本地存储边界见 [`packages/core/README.md`](./packages/core/README.md) 与 [`packages/executor-local/README.md`](./packages/executor-local/README.md)。

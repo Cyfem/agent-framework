@@ -8,6 +8,7 @@ import type {
   ApprovalRequestInput,
 } from './approval';
 import type { ArtifactStore, SubAgentArtifactClient } from './artifact';
+import { parseAgentResultReceipt } from './agent-result-receipt';
 import {
   BUILTIN_AGENT_PROTOCOL_CHECKPOINT_CODECS,
   type AgentCheckpointMigrator,
@@ -49,8 +50,11 @@ import {
   resolveSubAgentLimits,
   type ResolvedSubAgentLimits,
 } from './limits';
+import { assertPendingBatchInvariants } from './pending-batch-invariants';
 import type {
   SubAgentExecutionOutcome,
+  SubAgentExecutorOperationResult,
+  SubAgentExecutorRecoveryRequired,
   SubAgentFailureInput,
   SubAgentProgress,
   SubAgentTaskResult,
@@ -59,12 +63,14 @@ import type {
 import {
   assertRuntimeReady,
   acquireRenewingRuntimeLease,
+  assertExecutionLeaseOwnership,
   assertRuntimeSession,
   cloneJsonValue,
   createOperationSignal,
   createRuntimeId,
   createSubAgentError,
   DEFAULT_RUNTIME_EVENT_POLL_MS,
+  isExecutionOwnershipLossError,
   normalizeProjectedContext,
   raceWithOperationSignal,
   safeExecutorError,
@@ -163,6 +169,48 @@ interface AdoptedCheckpointExecution {
   readonly deadlineAt: number;
 }
 
+interface AdoptedUnboundCreateExecution {
+  readonly task: StoredTask;
+  readonly target: SubAgentExecutionTarget;
+  readonly lease: RenewingRuntimeLease;
+  readonly deadlineAt: number;
+}
+
+interface RecoveryAdoptionLease {
+  readonly lease: RenewingRuntimeLease;
+  readonly acquisitionDeadlineAt: number;
+  stopForwardingParent(): void;
+}
+
+interface AcceptedExecutorRecovery {
+  readonly task: StoredTask;
+  readonly marker: SubAgentExecutorRecoveryRequired;
+}
+
+class HostExecutorRecoveryRequiredError extends SubAgentRuntimeError {
+  constructor(
+    reason: SubAgentExecutorRecoveryRequired['reason'],
+    causeCode?: string,
+    cause?: unknown,
+  ) {
+    super(
+      {
+        code: 'RECOVERY_UNSUPPORTED',
+        message:
+          'The Executor requires explicit host recovery after exhausting automatic recovery.',
+        retryable: true,
+        causeCode:
+          causeCode ??
+          (reason === 'checkpoint'
+            ? 'EXECUTOR_CHECKPOINT_RECOVERY_REQUIRED'
+            : 'EXECUTOR_UNBOUND_CREATE_RECOVERY_REQUIRED'),
+      },
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = 'HostExecutorRecoveryRequiredError';
+  }
+}
+
 type PendingRecoveryOperation =
   | {
       readonly type: 'resume';
@@ -198,6 +246,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   readonly #checkpointCodecs: readonly AgentProtocolCheckpointCodec[];
   readonly #migrators: readonly AgentCheckpointMigrator[];
   readonly #active = new Map<string, ActiveExecution>();
+  readonly #deferredRecoveryErrors = new Map<string, HostExecutorRecoveryRequiredError>();
   #ready = false;
   #initPromise: Promise<void> | undefined;
 
@@ -553,23 +602,23 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       return { handle: this.#createHandle(task.taskId), task };
     }
     if (task.state === 'running' && task.binding === undefined) {
-      let replay: StoredTask;
-      try {
-        replay = await this.#prepareUnboundCreateReplay(task.taskId, signal, deadlineAt);
-      } catch (error) {
-        if (error instanceof SubAgentRuntimeError && error.code === 'TIMED_OUT') {
-          const timedOut = await this.#finalizeExecutionError(
-            task.taskId,
-            task.attempt,
-            error,
-            true,
-          );
-          return { wait: timedOut, task: await this.#loadTask(task.taskId) };
-        }
-        throw error;
+      const adopted = await this.#adoptUnboundCreateExecution(
+        task,
+        target,
+        signal,
+        deadlineAt,
+        task.recoveryRequired,
+      );
+      if (!('lease' in adopted)) {
+        const adoptedOutcome = taskOutcome(adopted);
+        if (adoptedOutcome !== undefined) return { wait: adoptedOutcome, task: adopted };
+        throw createSubAgentError(
+          'RECOVERY_TARGET_LOST',
+          'The unbound create task changed before recovery adoption.',
+        );
       }
-      this.#startReplayedCreateExecution(replay, target, mode, signal, deadlineAt);
-      return { handle: this.#createHandle(replay.taskId), task: replay };
+      this.#startAdoptedUnboundCreateExecution(adopted, mode, signal);
+      return { handle: this.#createHandle(adopted.task.taskId), task: adopted.task };
     }
     throw createSubAgentError(
       'RECOVERY_UNSUPPORTED',
@@ -928,6 +977,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     parentSignal: AbortSignal,
     parentDeadlineAt: number,
   ): void {
+    this.#deferredRecoveryErrors.delete(task.taskId);
     const controller = new AbortController();
     const signal = createOperationSignal({
       signal: parentSignal,
@@ -935,53 +985,73 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       controller,
     });
     const promise = this.#runCreatedTask(task, target, mode, signal, controller)
-      .catch(async (error: unknown) =>
-        this.#finalizeExecutionError(
+      .catch(async (error: unknown) => {
+        if (error instanceof HostExecutorRecoveryRequiredError) {
+          this.#deferredRecoveryErrors.set(task.taskId, error);
+          throw error;
+        }
+        if (isExecutionOwnershipLossError(error)) throw error;
+        const ownership = this.#active.get(task.taskId)?.ownership;
+        return this.#finalizeExecutionError(
           task.taskId,
-          task.attempt,
+          ownership?.attempt ?? task.attempt,
           error,
           false,
-          this.#active.get(task.taskId)?.ownership,
-        ),
-      )
+          ownership,
+        );
+      })
       .finally(() => {
         this.#active.delete(task.taskId);
       });
+    promise.catch(() => undefined);
     this.#active.set(task.taskId, { promise, controller });
   }
 
-  #startReplayedCreateExecution(
-    task: StoredTask,
-    target: SubAgentExecutionTarget,
+  #startAdoptedUnboundCreateExecution(
+    adopted: AdoptedUnboundCreateExecution,
     mode: 'execute' | 'spawn',
     parentSignal: AbortSignal,
-    parentDeadlineAt: number,
   ): void {
+    const { task, target, lease, deadlineAt } = adopted;
+    this.#deferredRecoveryErrors.delete(task.taskId);
     const controller = new AbortController();
-    const deadlineAt = Math.min(
-      parentDeadlineAt,
-      (task.activeStartedAt ?? Date.now()) + task.remainingMs,
-    );
     const signal = createOperationSignal({ signal: parentSignal, deadlineAt, controller });
-    const promise = this.#runWithExecutionOwnership(
-      task,
-      target,
-      'create',
-      mode,
-      signal,
-      deadlineAt,
-    )
-      .catch(async (error: unknown) =>
-        this.#finalizeExecutionError(
-          task.taskId,
-          task.attempt,
-          error,
+    const promise = Promise.resolve()
+      .then(() =>
+        this.#runWithHeldExecutionLease(
+          task,
+          target,
+          'create',
+          mode,
+          deadlineAt,
+          lease,
+          undefined,
           true,
-          this.#active.get(task.taskId)?.ownership,
+          signal,
         ),
       )
+      .catch(async (error: unknown) => {
+        if (error instanceof HostExecutorRecoveryRequiredError) {
+          this.#deferredRecoveryErrors.set(task.taskId, error);
+          throw error;
+        }
+        if (isExecutionOwnershipLossError(error)) throw error;
+        const ownership = this.#active.get(task.taskId)?.ownership;
+        return this.#finalizeExecutionError(
+          task.taskId,
+          ownership?.attempt ?? task.attempt,
+          error,
+          true,
+          ownership,
+        );
+      })
       .finally(() => this.#active.delete(task.taskId));
-    this.#active.set(task.taskId, { promise, controller });
+    promise.catch(() => undefined);
+    this.#active.set(task.taskId, {
+      promise,
+      controller,
+      ownership: executionOwnership(task),
+    });
   }
 
   async #runCreatedTask(
@@ -1014,6 +1084,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     parentSignal: AbortSignal,
     deadlineAt: number,
     recoveryOperation?: PendingRecoveryOperation,
+    automaticRecoveryUsed = false,
   ): Promise<SubAgentExecutionOutcome> {
     const lease = await acquireRenewingRuntimeLease(
       this.stateStore,
@@ -1032,6 +1103,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       recoveryOperation,
       false,
       parentSignal,
+      automaticRecoveryUsed,
     );
   }
 
@@ -1045,7 +1117,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     recoveryOperation: PendingRecoveryOperation | undefined,
     alreadyOwned: boolean,
     operationParentSignal?: AbortSignal,
+    automaticRecoveryUsed = false,
   ): Promise<SubAgentExecutionOutcome> {
+    let acceptedRecovery: AcceptedExecutorRecovery | undefined;
     try {
       const owned = alreadyOwned
         ? task
@@ -1065,20 +1139,57 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
             : AbortSignal.any([lease.signal, operationParentSignal]),
         deadlineAt,
       });
+      // Adoption paths arrive here with ownership already committed. Re-check the host proof at
+      // the common dispatch boundary so a renewal lost while that commit was returning can never
+      // produce an Executor side effect.
+      assertExecutionLeaseOwnership(lease, signal, deadlineAt);
+      let result: SubAgentExecutorOperationResult;
       if (operationType === 'create') {
-        return this.#executeCreateOperation(owned, target, mode, signal, deadlineAt);
+        result = await this.#executeCreateOperation(owned, target, mode, signal, deadlineAt);
+      } else {
+        if (recoveryOperation === undefined) {
+          throw createSubAgentError('INTERNAL_ERROR', 'A recovery operation is required.');
+        }
+        const operation = Object.freeze({
+          ...recoveryOperation,
+          operationId: owned.executorOperation!.operationId,
+        }) as SubAgentExecutorOperation;
+        result = await this.#runRecoveredTask(owned, target, operation, mode, signal, deadlineAt);
       }
-      if (recoveryOperation === undefined) {
-        throw createSubAgentError('INTERNAL_ERROR', 'A recovery operation is required.');
+      assertExecutionLeaseOwnership(lease, signal, deadlineAt);
+      if (!isExecutorRecoveryRequiredType(result)) {
+        const outcome = await this.#normalizeExecutorOutcome(
+          owned.taskId,
+          result,
+          lease,
+          signal,
+          deadlineAt,
+        );
+        return outcome;
       }
-      const operation = Object.freeze({
-        ...recoveryOperation,
-        operationId: owned.executorOperation!.operationId,
-      }) as SubAgentExecutorOperation;
-      return this.#runRecoveredTask(owned, target, operation, mode, signal, deadlineAt);
+      const settled = await this.#settleExecutorRecoveryRequired(
+        owned,
+        target,
+        result,
+        lease,
+        signal,
+        deadlineAt,
+      );
+      if ('outcome' in settled) return settled.outcome;
+      acceptedRecovery = settled;
     } finally {
       await lease.stop();
     }
+    if (acceptedRecovery === undefined) {
+      throw createSubAgentError(
+        'INTERNAL_ERROR',
+        'The Executor recovery marker did not produce a recovery disposition.',
+      );
+    }
+    if (automaticRecoveryUsed) {
+      throw new HostExecutorRecoveryRequiredError(acceptedRecovery.marker.reason);
+    }
+    return this.#runAutomaticExecutorRecovery(acceptedRecovery, mode, operationParentSignal);
   }
 
   async #claimExecutionOwnership(
@@ -1088,12 +1199,14 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     lease: RenewingRuntimeLease,
     deadlineAt: number,
   ): Promise<StoredTask> {
-    throwIfOperationAborted(lease.signal, deadlineAt);
+    assertExecutionLeaseOwnership(lease, lease.signal, deadlineAt);
     const task = await this.#loadTask(taskId);
+    assertExecutionLeaseOwnership(lease, lease.signal, deadlineAt);
     if (task.attempt !== expectedAttempt) {
       throw createSubAgentError(
         'RECOVERY_TARGET_LOST',
         'The task attempt changed before execution ownership was acquired.',
+        { retryable: true, causeCode: 'EXECUTION_OWNERSHIP_LOST' },
       );
     }
     if (task.state !== 'running' && task.state !== 'result_submitted') {
@@ -1123,9 +1236,21 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       recoveryRequired: false,
       updatedAt: now,
     }) as StoredTask;
-    await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
-      tasks: [{ previous: task, next }],
-    });
+    assertExecutionLeaseOwnership(lease, lease.signal, deadlineAt);
+    try {
+      await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
+        tasks: [{ previous: task, next }],
+      });
+    } catch (error) {
+      assertExecutionLeaseOwnership(lease, lease.signal, deadlineAt);
+      if (!isStateCasConflictError(error)) throw error;
+      throw createSubAgentError(
+        'RECOVERY_TARGET_LOST',
+        'The task changed before execution ownership was acquired.',
+        { retryable: true, causeCode: 'EXECUTION_OWNERSHIP_LOST' },
+      );
+    }
+    assertExecutionLeaseOwnership(lease, lease.signal, deadlineAt);
     return next;
   }
 
@@ -1135,7 +1260,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     mode: 'execute' | 'spawn',
     operationSignal: AbortSignal,
     deadlineAt: number,
-  ): Promise<SubAgentExecutionOutcome> {
+  ): Promise<SubAgentExecutorOperationResult> {
     const control = this.#createExecutionControl(task, target, operationSignal, deadlineAt);
     const request = this.#buildExecutionRequest(task, target, operationSignal, deadlineAt, {
       type: 'create',
@@ -1146,15 +1271,16 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     if (mode === 'execute') {
       const operation = Promise.resolve(target.executor.execute(request, control));
       operation.catch(() => undefined);
-      const outcome = await raceWithOperationSignal(operation, operationSignal, deadlineAt);
-      return this.#normalizeExecutorOutcome(task.taskId, outcome);
+      return raceWithOperationSignal(operation, operationSignal, deadlineAt);
     }
 
-    const rawHandle = await raceWithOperationSignal(
+    const spawned = await raceWithOperationSignal(
       Promise.resolve(target.executor.spawn(request, control)),
       operationSignal,
       deadlineAt,
     );
+    if (isExecutorRecoveryRequiredType(spawned)) return spawned;
+    const rawHandle = spawned;
     this.#assertRawHandle(task, rawHandle);
     const active = this.#active.get(task.taskId);
     if (active !== undefined) active.rawHandle = rawHandle;
@@ -1169,53 +1295,223 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     );
     const wait = Promise.resolve(rawHandle.wait());
     wait.catch(() => undefined);
-    const outcome = await raceWithOperationSignal(wait, operationSignal, deadlineAt);
-    return this.#normalizeExecutorOutcome(task.taskId, outcome);
+    return raceWithOperationSignal(wait, operationSignal, deadlineAt);
   }
 
-  async #prepareUnboundCreateReplay(
-    taskId: string,
-    signal: AbortSignal,
-    deadlineAt: number,
-  ): Promise<StoredTask> {
-    return withRuntimeLease(this.stateStore, this.sessionId, signal, deadlineAt, async (lease) => {
-      const task = await this.#loadTask(taskId);
-      if (task.state !== 'running' || task.binding !== undefined) {
-        throw createSubAgentError(
-          'RECOVERY_UNSUPPORTED',
-          'Only an unbound running create operation can be replayed idempotently.',
-        );
-      }
-      const now = Date.now();
-      const elapsed = Math.max(0, now - (task.activeStartedAt ?? now));
-      const remainingMs = Math.max(0, task.remainingMs - elapsed);
-      if (remainingMs < 1) {
-        throw createSubAgentError('TIMED_OUT', 'The unbound create replay timed out.');
-      }
-      const changed = Object.freeze({
-        ...task,
-        revision: task.revision + 1,
-        attempt: task.attempt + 1,
-        activeElapsedMs: task.activeElapsedMs + elapsed,
-        remainingMs,
-        activeStartedAt: now,
-        fencingToken: lease.fencingToken,
-        updatedAt: now,
-      }) as StoredTask;
-      const withEvent = appendSafeTaskEvents(
-        changed,
-        [{ type: 'recovery.started', data: { status: 'running' } }],
-        {
-          eventIds: [createRuntimeId('event')],
-          defaultTimestamp: now,
-          revisionMode: 'preserve',
-        },
+  async #acquireRecoveryAdoptionLease(
+    task: StoredTask,
+    parentSignal?: AbortSignal,
+  ): Promise<RecoveryAdoptionLease> {
+    const persistedDeadlineAt = runningTaskDeadlineAt(task);
+    const cleanupDeadlineAt = boundedTimestampAdd(
+      Math.max(Date.now(), persistedDeadlineAt),
+      this.#executionLeaseTtlMs,
+    );
+    const forwarded = createRecoveryAdoptionSignal(
+      parentSignal,
+      persistedDeadlineAt,
+      cleanupDeadlineAt,
+    );
+    try {
+      const lease = await acquireRenewingRuntimeLease(
+        this.stateStore,
+        `subagent-task:${this.sessionId}:${task.taskId}`,
+        forwarded.signal,
+        cleanupDeadlineAt,
+        this.#executionLeaseTtlMs,
       );
-      await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
-        tasks: [{ previous: task, next: withEvent.task, events: withEvent.events }],
+      return Object.freeze({
+        lease,
+        acquisitionDeadlineAt: cleanupDeadlineAt,
+        stopForwardingParent: forwarded.stopForwardingParent,
       });
-      return withEvent.task;
-    });
+    } catch (error) {
+      forwarded.stopForwardingParent();
+      throw error;
+    }
+  }
+
+  async #adoptUnboundCreateExecution(
+    preparedTask: StoredTask,
+    target: SubAgentExecutionTarget,
+    parentSignal: AbortSignal,
+    parentDeadlineAt: number,
+    requireRecoveryRequired = false,
+  ): Promise<AdoptedUnboundCreateExecution | StoredTask> {
+    const persistedDeadlineAt = runningTaskDeadlineAt(preparedTask);
+    const operationDeadlineAt = Math.min(parentDeadlineAt, persistedDeadlineAt);
+    const adoption = await this.#acquireRecoveryAdoptionLease(preparedTask, parentSignal);
+    const { lease, acquisitionDeadlineAt } = adoption;
+    try {
+      for (;;) {
+        throwIfOperationAborted(lease.signal, acquisitionDeadlineAt);
+        const task = await this.#loadTask(preparedTask.taskId);
+        const outcome = taskOutcome(task);
+        if (outcome !== undefined) {
+          await lease.stop();
+          return task;
+        }
+        if (
+          task.attempt !== preparedTask.attempt ||
+          task.state !== 'running' ||
+          task.binding !== undefined ||
+          task.childCheckpoint !== undefined ||
+          (requireRecoveryRequired &&
+            (!task.recoveryRequired || task.executorOperation?.status !== 'settled'))
+        ) {
+          throw createSubAgentError(
+            'RECOVERY_TARGET_LOST',
+            'Only the exact unbound running create operation can be adopted idempotently.',
+          );
+        }
+        this.#assertExecutionTarget(task, target);
+
+        const now = Math.max(Date.now(), task.updatedAt);
+        const elapsed = runningTaskElapsed(task, now);
+        const remainingMs = Math.max(0, task.remainingMs - elapsed);
+        const stoppedDraft = { ...task };
+        delete stoppedDraft.activeStartedAt;
+        const stopped = Object.freeze({
+          ...stoppedDraft,
+          recoveryRequired: false,
+          activeElapsedMs: task.activeElapsedMs + elapsed,
+          remainingMs,
+        }) as StoredTask;
+        const run = await this.#loadRun(task.runId);
+        const hadActiveSlot = task.activeStartedAt !== undefined;
+
+        if (remainingMs < 1) {
+          const terminal = settleExecutorOperation(
+            transitionSubAgentTask(stopped, 'timed_out', {
+              now,
+              error: {
+                code: 'TIMED_OUT',
+                message: 'The unbound create task timed out before recovery adoption.',
+                retryable: false,
+              },
+            }) as StoredTask,
+            now,
+          );
+          const eventInputs: ExecutorEventInput[] = [
+            ...(task.recoveryRequired
+              ? ([
+                  {
+                    type: 'recovery.failed',
+                    data: { status: 'timed_out', errorCode: 'TIMED_OUT' },
+                  },
+                ] satisfies ExecutorEventInput[])
+              : []),
+            { type: 'task.timed_out', data: { status: 'timed_out', errorCode: 'TIMED_OUT' } },
+          ];
+          const withEvents = appendSafeTaskEvents(
+            { ...terminal, fencingToken: lease.lease.fencingToken } as StoredTask,
+            eventInputs,
+            {
+              eventIds: eventInputs.map(() => createRuntimeId('event')),
+              defaultTimestamp: now,
+              revisionMode: 'preserve',
+            },
+          );
+          const nextRun = hadActiveSlot ? this.#releaseActiveExecution(run, lease.lease, now) : run;
+          try {
+            await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
+              ...(nextRun === run ? {} : { run: { previous: run, next: nextRun } }),
+              tasks: [{ previous: task, next: withEvents.task, events: withEvents.events }],
+            });
+            await lease.stop();
+            return withEvents.task;
+          } catch (error) {
+            if (isStateCasConflictError(error)) {
+              await waitForRuntimeRetry(lease.signal, acquisitionDeadlineAt, 1);
+              continue;
+            }
+            throw error;
+          }
+        }
+
+        throwIfOperationAborted(parentSignal, operationDeadlineAt);
+        if (!hadActiveSlot && run.budget.activeExecutions >= task.limits.maxConcurrent) {
+          throw createSubAgentError(
+            'LIMIT_EXCEEDED',
+            'No subagent execution slot is available for unbound create recovery.',
+            { retryable: true },
+          );
+        }
+        throwIfOperationAborted(parentSignal, operationDeadlineAt);
+        if (Date.now() >= runningTaskDeadlineAt(task)) continue;
+        const attempt = task.attempt + 1;
+        const executionEpoch = createRuntimeId('epoch');
+        const operationId =
+          task.executorOperation?.type === 'create'
+            ? task.executorOperation.operationId
+            : createRuntimeId('operation');
+        const changed = Object.freeze({
+          ...stopped,
+          revision: task.revision + 1,
+          attempt,
+          activeStartedAt: now,
+          executionEpoch,
+          executionFencingToken: lease.lease.fencingToken,
+          executorOperation: Object.freeze({
+            version: '1' as const,
+            operationId,
+            type: 'create' as const,
+            attempt,
+            executionEpoch,
+            status: 'dispatched' as const,
+            createdAt:
+              task.executorOperation?.type === 'create' ? task.executorOperation.createdAt : now,
+            updatedAt: now,
+          }),
+          fencingToken: lease.lease.fencingToken,
+          updatedAt: now,
+        }) as StoredTask;
+        const withEvent = appendSafeTaskEvents(
+          changed,
+          [{ type: 'recovery.started', data: { status: 'running' } }],
+          {
+            eventIds: [createRuntimeId('event')],
+            defaultTimestamp: now,
+            revisionMode: 'preserve',
+          },
+        );
+        const nextRun = hadActiveSlot
+          ? run
+          : Object.freeze({
+              ...run,
+              revision: run.revision + 1,
+              fencingToken: lease.lease.fencingToken,
+              budget: Object.freeze({
+                ...run.budget,
+                activeExecutions: run.budget.activeExecutions + 1,
+              }),
+              updatedAt: now,
+            });
+        try {
+          await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
+            ...(nextRun === run ? {} : { run: { previous: run, next: nextRun } }),
+            tasks: [{ previous: task, next: withEvent.task, events: withEvent.events }],
+          });
+          return Object.freeze({
+            task: withEvent.task,
+            target,
+            lease,
+            deadlineAt: Math.min(parentDeadlineAt, now + remainingMs),
+          });
+        } catch (error) {
+          if (isStateCasConflictError(error)) {
+            await waitForRuntimeRetry(lease.signal, acquisitionDeadlineAt, 1);
+            continue;
+          }
+          throw error;
+        }
+      }
+    } catch (error) {
+      await lease.stop();
+      throw error;
+    } finally {
+      adoption.stopForwardingParent();
+    }
   }
 
   async #waitForExecutionSlot(taskId: string, signal: AbortSignal): Promise<StartResult> {
@@ -2790,10 +3086,367 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     );
   }
 
+  async #settleExecutorRecoveryRequired(
+    owned: StoredTask,
+    target: SubAgentExecutionTarget,
+    candidate: SubAgentExecutorRecoveryRequired,
+    executionLease: RenewingRuntimeLease,
+    signal: AbortSignal,
+    deadlineAt: number,
+  ): Promise<AcceptedExecutorRecovery | { readonly outcome: SubAgentExecutionOutcome }> {
+    const ownership = executionOwnership(owned);
+    for (;;) {
+      assertExecutionLeaseOwnership(executionLease, signal, deadlineAt);
+      let task: StoredTask;
+      try {
+        task = await this.#loadTask(owned.taskId);
+      } finally {
+        assertExecutionLeaseOwnership(executionLease, signal, deadlineAt);
+      }
+      const authoritative = taskOutcome(task);
+      if (authoritative?.type === 'terminal') return { outcome: authoritative };
+
+      const marker = normalizeExecutorRecoveryRequired(candidate);
+      this.#assertOperationOwner(task, target, ownership);
+      if (
+        task.executorOperation?.status !== 'dispatched' ||
+        marker.operationId !== task.executorOperation.operationId
+      ) {
+        throw invalidExecutorRecoveryMarker(
+          'The Executor recovery marker does not identify the live operation.',
+        );
+      }
+      if (task.state !== 'running' && task.state !== 'result_submitted') {
+        throw invalidExecutorRecoveryMarker(
+          'An Executor recovery marker requires an authoritative active task.',
+        );
+      }
+      if (task.activeStartedAt === undefined) {
+        throw invalidExecutorRecoveryMarker(
+          'An Executor recovery marker requires a live active-slot owner.',
+        );
+      }
+
+      const providerOutcomeUnknown = task.childCheckpoint?.modelOperation?.phase === 'in_flight';
+      if (task.state === 'result_submitted' || providerOutcomeUnknown) {
+        const descriptor: SubAgentErrorDescriptor = providerOutcomeUnknown
+          ? Object.freeze({
+              code: 'EXECUTOR_FAILED',
+              message: 'The provider outcome could not be confirmed.',
+              retryable: false,
+              causeCode: 'MODEL_OUTCOME_UNKNOWN',
+              outcomeUnknown: true,
+            })
+          : Object.freeze({
+              code: 'EXECUTOR_FAILED',
+              message: 'The Executor stopped after submitting a partial result.',
+              retryable: false,
+              causeCode: marker.causeCode,
+            });
+        const now = Math.max(Date.now(), task.updatedAt);
+        const terminal = transitionSubAgentTask(task, 'failed', { now, error: descriptor });
+        const settled = settleExecutorOperation(terminal as StoredTask, now);
+        const eventInputs: ExecutorEventInput[] = [
+          {
+            type: 'recovery.failed',
+            timestamp: now,
+            data: { status: 'failed', errorCode: descriptor.code, reasonCode: marker.causeCode },
+          },
+          {
+            type: 'task.failed',
+            timestamp: now,
+            data: {
+              status: 'failed',
+              errorCode: descriptor.code,
+              ...(descriptor.outcomeUnknown === undefined
+                ? {}
+                : { outcomeUnknown: descriptor.outcomeUnknown }),
+            },
+          },
+        ];
+        const stateLease = executionLease.lease;
+        const withEvents = appendSafeTaskEvents(
+          { ...settled, fencingToken: stateLease.fencingToken } as StoredTask,
+          eventInputs,
+          {
+            eventIds: eventInputs.map(() => createRuntimeId('event')),
+            defaultTimestamp: now,
+            revisionMode: 'preserve',
+          },
+        );
+        let run: StoredAgentRun;
+        try {
+          run = await this.#loadRun(task.runId);
+        } finally {
+          assertExecutionLeaseOwnership(executionLease, signal, deadlineAt);
+        }
+        const commitLease = executionLease.lease;
+        const nextRun = this.#releaseActiveExecution(run, commitLease, now);
+        try {
+          await commitRuntimeStateMutation(this.stateStore, this.sessionId, commitLease, {
+            run: { previous: run, next: nextRun },
+            tasks: [{ previous: task, next: withEvents.task, events: withEvents.events }],
+          });
+          return {
+            outcome: taskOutcome(withEvents.task) as SubAgentExecutionOutcome,
+          };
+        } catch (error) {
+          assertExecutionLeaseOwnership(executionLease, signal, deadlineAt);
+          if (isStateCasConflictError(error)) continue;
+          throw error;
+        }
+      }
+
+      this.#assertRecoverableExecutorMarker(task, target, marker);
+      const now = Math.max(Date.now(), task.updatedAt);
+      const elapsed = Math.max(0, now - task.activeStartedAt);
+      const remainingMs = Math.max(0, task.remainingMs - elapsed);
+      const stoppedDraft = { ...task };
+      delete stoppedDraft.activeStartedAt;
+      const stopped = Object.freeze({
+        ...stoppedDraft,
+        recoveryRequired: false,
+        activeElapsedMs: task.activeElapsedMs + elapsed,
+        remainingMs,
+      }) as StoredTask;
+      let next: StoredTask;
+      let eventInputs: ExecutorEventInput[];
+      if (remainingMs < 1) {
+        next = settleExecutorOperation(
+          transitionSubAgentTask(stopped, 'timed_out', {
+            now,
+            error: {
+              code: 'TIMED_OUT',
+              message: 'The subagent task timed out before Executor recovery.',
+              retryable: false,
+            },
+          }) as StoredTask,
+          now,
+        );
+        eventInputs = [
+          {
+            type: 'recovery.failed',
+            timestamp: now,
+            data: { status: 'timed_out', errorCode: 'TIMED_OUT', reasonCode: marker.causeCode },
+          },
+          {
+            type: 'task.timed_out',
+            timestamp: now,
+            data: { status: 'timed_out', errorCode: 'TIMED_OUT' },
+          },
+        ];
+      } else {
+        next = Object.freeze({
+          ...settleExecutorOperation(stopped, now),
+          revision: task.revision + 1,
+          recoveryRequired: true,
+          fencingToken: executionLease.lease.fencingToken,
+          updatedAt: now,
+        }) as StoredTask;
+        eventInputs = [
+          {
+            type: 'recovery.failed',
+            timestamp: now,
+            data: { status: 'running', reasonCode: marker.causeCode },
+          },
+        ];
+      }
+      const withEvents = appendSafeTaskEvents(next, eventInputs, {
+        eventIds: eventInputs.map(() => createRuntimeId('event')),
+        defaultTimestamp: now,
+        revisionMode: 'preserve',
+      });
+      let run: StoredAgentRun;
+      try {
+        run = await this.#loadRun(task.runId);
+      } finally {
+        assertExecutionLeaseOwnership(executionLease, signal, deadlineAt);
+      }
+      const commitLease = executionLease.lease;
+      const nextRun = this.#releaseActiveExecution(run, commitLease, now);
+      try {
+        await commitRuntimeStateMutation(this.stateStore, this.sessionId, commitLease, {
+          run: { previous: run, next: nextRun },
+          tasks: [{ previous: task, next: withEvents.task, events: withEvents.events }],
+        });
+        const timeoutOutcome = taskOutcome(withEvents.task);
+        return timeoutOutcome === undefined
+          ? { task: withEvents.task, marker }
+          : { outcome: timeoutOutcome };
+      } catch (error) {
+        assertExecutionLeaseOwnership(executionLease, signal, deadlineAt);
+        if (isStateCasConflictError(error)) continue;
+        throw error;
+      }
+    }
+  }
+
+  #assertRecoverableExecutorMarker(
+    task: StoredTask,
+    target: SubAgentExecutionTarget,
+    marker: SubAgentExecutorRecoveryRequired,
+  ): void {
+    if (marker.reason === 'unbound_create') {
+      if (
+        task.executorOperation?.type !== 'create' ||
+        task.binding !== undefined ||
+        task.childCheckpoint !== undefined
+      ) {
+        throw invalidExecutorRecoveryMarker(
+          'Unbound-create recovery is valid only before binding and checkpoint persistence.',
+        );
+      }
+      return;
+    }
+    if (
+      task.executorOperation?.type === 'reconnect' ||
+      target.descriptor.capabilities.recovery.resume !== 'checkpoint' ||
+      task.binding === undefined ||
+      task.childCheckpoint === undefined
+    ) {
+      throw invalidExecutorRecoveryMarker(
+        'Checkpoint recovery requires a resumable binding and complete child checkpoint.',
+      );
+    }
+    try {
+      validateBinding(task.binding, task.taskId, this.sessionId, target);
+      const checkpoint = validateChildCheckpointV1(
+        cloneJsonValue(task.childCheckpoint as unknown as JsonValue),
+        this.#checkpointCodecs,
+      );
+      if (
+        checkpoint.runnerId !== task.binding.runnerId ||
+        checkpoint.runnerVersion !== task.binding.runnerVersion ||
+        !target.descriptor.childCheckpointVersions.includes(checkpoint.version) ||
+        !target.descriptor.runnerCompatibility.some(
+          (runner) =>
+            runner.runnerId === checkpoint.runnerId &&
+            runner.runnerVersion === checkpoint.runnerVersion &&
+            runner.childCheckpointVersions.includes(checkpoint.version),
+        )
+      ) {
+        throw new Error('incompatible checkpoint');
+      }
+      assertAuthoritativeResultSubmission(task, checkpoint);
+    } catch (error) {
+      throw invalidExecutorRecoveryMarker(
+        'The Executor recovery checkpoint is invalid or incompatible.',
+        error,
+      );
+    }
+  }
+
+  async #runAutomaticExecutorRecovery(
+    accepted: AcceptedExecutorRecovery,
+    mode: 'execute' | 'spawn',
+    parentSignal?: AbortSignal,
+  ): Promise<SubAgentExecutionOutcome> {
+    const current = await this.#loadTask(accepted.task.taskId);
+    const deadlineAt = runningTaskDeadlineAt(current);
+    const signal = createOperationSignal({
+      ...(parentSignal === undefined ? {} : { signal: parentSignal }),
+      deadlineAt,
+    });
+    let target: SubAgentExecutionTarget;
+    try {
+      target = this.#executors.selectRecovery(current.definition, current.executor);
+      this.#assertExecutionTarget(current, target);
+    } catch (error) {
+      if (isRecoveryDispatchDeferredError(error)) {
+        throw new HostExecutorRecoveryRequiredError(
+          accepted.marker.reason,
+          'EXECUTOR_RECOVERY_TARGET_UNAVAILABLE',
+          error,
+        );
+      }
+      throw error;
+    }
+    if (accepted.marker.reason === 'unbound_create') {
+      try {
+        const adopted = await this.#adoptUnboundCreateExecution(
+          current,
+          target,
+          signal,
+          deadlineAt,
+          true,
+        );
+        if (!('lease' in adopted)) {
+          const outcome = taskOutcome(adopted);
+          if (outcome !== undefined) return outcome;
+          throw createSubAgentError(
+            'RECOVERY_TARGET_LOST',
+            'The unbound create task changed before automatic recovery adoption.',
+          );
+        }
+        return this.#runWithHeldExecutionLease(
+          adopted.task,
+          target,
+          'create',
+          mode,
+          adopted.deadlineAt,
+          adopted.lease,
+          undefined,
+          true,
+          signal,
+          true,
+        );
+      } catch (error) {
+        if (isRecoveryDispatchDeferredError(error)) {
+          throw new HostExecutorRecoveryRequiredError(
+            accepted.marker.reason,
+            'EXECUTOR_RECOVERY_CAPACITY_UNAVAILABLE',
+            error,
+          );
+        }
+        throw error;
+      }
+    }
+
+    let prepared: StoredTask;
+    let adopted: AdoptedCheckpointExecution | StoredTask;
+    try {
+      prepared = await this.#prepareRecoveryCheckpoint(current, target, signal, deadlineAt);
+      adopted = await this.#adoptCheckpointExecution(prepared, target, signal, deadlineAt);
+    } catch (error) {
+      if (isRecoveryDispatchDeferredError(error)) {
+        throw new HostExecutorRecoveryRequiredError(
+          accepted.marker.reason,
+          'EXECUTOR_RECOVERY_CAPACITY_UNAVAILABLE',
+          error,
+        );
+      }
+      throw error;
+    }
+    if (!('lease' in adopted)) {
+      const outcome = taskOutcome(adopted);
+      if (outcome !== undefined) return outcome;
+      throw createSubAgentError(
+        'RECOVERY_UNSUPPORTED',
+        'The task changed state before automatic checkpoint recovery.',
+      );
+    }
+    return this.#runWithHeldExecutionLease(
+      adopted.task,
+      target,
+      'resume_checkpoint',
+      'execute',
+      adopted.deadlineAt,
+      adopted.lease,
+      adopted.operation,
+      true,
+      signal,
+      true,
+    );
+  }
+
   async #normalizeExecutorOutcome(
     taskId: string,
     candidate: SubAgentExecutionOutcome,
+    executionLease: RenewingRuntimeLease,
+    signal: AbortSignal,
+    deadlineAt: number,
   ): Promise<SubAgentExecutionOutcome> {
+    assertExecutionLeaseOwnership(executionLease, signal, deadlineAt);
     if (
       typeof candidate !== 'object' ||
       candidate === null ||
@@ -2804,7 +3457,12 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         'The Executor returned an invalid execution outcome.',
       );
     }
-    const task = await this.#loadTask(taskId);
+    let task: StoredTask;
+    try {
+      task = await this.#loadTask(taskId);
+    } finally {
+      assertExecutionLeaseOwnership(executionLease, signal, deadlineAt);
+    }
     const outcome = taskOutcome(task);
     if (outcome !== undefined) return outcome;
     throw createSubAgentError(
@@ -2996,7 +3654,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       task.attempt !== ownership.attempt ||
       task.executionEpoch !== ownership.executionEpoch ||
       task.executionFencingToken !== ownership.executionFencingToken ||
-      task.executorOperation?.executionEpoch !== ownership.executionEpoch
+      task.executorOperation?.executionEpoch !== ownership.executionEpoch ||
+      task.executorOperation?.status !== 'dispatched' ||
+      task.recoveryRequired
     ) {
       throw createSubAgentError(
         'RECOVERY_TARGET_LOST',
@@ -3055,9 +3715,14 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     assertRuntimeSession(sessionId, this.sessionId);
     const task = await this.#loadTask(taskId);
     const outcome = taskOutcome(task);
-    if (outcome !== undefined) return outcome;
+    if (outcome !== undefined) {
+      this.#deferredRecoveryErrors.delete(taskId);
+      return outcome;
+    }
     const active = this.#active.get(taskId);
     if (active === undefined) {
+      const deferredRecoveryError = this.#deferredRecoveryErrors.get(taskId);
+      if (deferredRecoveryError !== undefined) throw deferredRecoveryError;
       throw createSubAgentError(
         'RECOVERY_UNSUPPORTED',
         'The task is not active in this process and requires explicit resume or reconnect.',
@@ -3416,6 +4081,31 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
 
     const selected = this.#executors.selectRecovery(task.definition, task.executor);
     this.#assertExecutionTarget(task, selected);
+    if (
+      task.state === 'running' &&
+      task.recoveryRequired &&
+      task.binding === undefined &&
+      task.childCheckpoint === undefined
+    ) {
+      const deadlineAt = runningTaskDeadlineAt(task);
+      const signal = createOperationSignal({ deadlineAt });
+      if (task.executorOperation?.type !== 'create') {
+        throw createSubAgentError(
+          'RECOVERY_UNSUPPORTED',
+          'Unbound create recovery requires its durable create operation identity.',
+        );
+      }
+      const adopted = await this.#adoptUnboundCreateExecution(
+        task,
+        selected,
+        signal,
+        deadlineAt,
+        true,
+      );
+      if (!('lease' in adopted)) return this.#createHandle(taskId);
+      this.#startAdoptedUnboundCreateExecution(adopted, 'execute', signal);
+      return this.#createHandle(taskId);
+    }
     if (selected.descriptor.capabilities.recovery.resume === 'checkpoint') {
       const recovery = await this.#resolveRecoveryTarget(task, 'checkpoint');
       task = await this.#prepareRecoveryCheckpoint(recovery.task, recovery.target);
@@ -3791,6 +4481,8 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   async #prepareRecoveryCheckpoint(
     task: StoredTask,
     target: SubAgentExecutionTarget,
+    parentSignal?: AbortSignal,
+    parentDeadlineAt?: number,
   ): Promise<StoredTask> {
     if (task.binding === undefined || task.childCheckpoint === undefined) {
       throw createSubAgentError(
@@ -3798,8 +4490,21 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         'Resume requires a complete child checkpoint and binding.',
       );
     }
-    const deadlineAt = Date.now() + this.#limits.timeoutMs;
-    const signal = createOperationSignal({ deadlineAt });
+    const recoveryDeadlineAt = runningTaskDeadlineAt(task);
+    if (task.state === 'running' && task.recoveryRequired && Date.now() >= recoveryDeadlineAt) {
+      return task;
+    }
+    const deadlineAt = Math.min(
+      parentDeadlineAt ?? Number.MAX_SAFE_INTEGER,
+      task.state === 'running' && task.recoveryRequired
+        ? recoveryDeadlineAt
+        : Date.now() + this.#limits.timeoutMs,
+    );
+    const signal = createOperationSignal({
+      ...(parentSignal === undefined ? {} : { signal: parentSignal }),
+      deadlineAt,
+    });
+    throwIfOperationAborted(signal, deadlineAt);
     const normalized = await this.#normalizeChildCheckpoint(
       task.childCheckpoint,
       signal,
@@ -3832,12 +4537,21 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       ) {
         throw stateCasConflict();
       }
+      const now = Math.max(Date.now(), current.updatedAt);
+      const elapsed = runningTaskElapsed(current, now);
+      const remainingMs = Math.max(0, current.remainingMs - elapsed);
+      if (current.state === 'running' && current.recoveryRequired && remainingMs < 1) {
+        return current;
+      }
       const next = Object.freeze({
         ...current,
         childCheckpoint: migrated,
         revision: current.revision + 1,
+        activeElapsedMs: current.activeElapsedMs + elapsed,
+        remainingMs,
+        ...(current.activeStartedAt === undefined ? {} : { activeStartedAt: now }),
         fencingToken: lease.fencingToken,
-        updatedAt: Date.now(),
+        updatedAt: now,
       }) as StoredTask;
       await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
         tasks: [{ previous: current, next }],
@@ -4225,16 +4939,16 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
   async #adoptCheckpointExecution(
     preparedTask: StoredTask,
     target: SubAgentExecutionTarget,
+    parentSignal?: AbortSignal,
+    parentDeadlineAt?: number,
   ): Promise<AdoptedCheckpointExecution | StoredTask> {
-    const acquisitionDeadlineAt = Date.now() + this.#limits.timeoutMs;
-    const acquisitionSignal = createOperationSignal({ deadlineAt: acquisitionDeadlineAt });
-    const lease = await acquireRenewingRuntimeLease(
-      this.stateStore,
-      `subagent-task:${this.sessionId}:${preparedTask.taskId}`,
-      acquisitionSignal,
-      acquisitionDeadlineAt,
-      this.#executionLeaseTtlMs,
+    const persistedDeadlineAt = runningTaskDeadlineAt(preparedTask);
+    const operationDeadlineAt = Math.min(
+      parentDeadlineAt ?? Number.MAX_SAFE_INTEGER,
+      persistedDeadlineAt,
     );
+    const adoption = await this.#acquireRecoveryAdoptionLease(preparedTask, parentSignal);
+    const { lease, acquisitionDeadlineAt } = adoption;
     try {
       for (;;) {
         throwIfOperationAborted(lease.signal, acquisitionDeadlineAt);
@@ -4281,15 +4995,18 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         assertAuthoritativeResultSubmission(task, task.childCheckpoint);
 
         const now = Date.now();
-        const elapsed = Math.max(0, now - (task.activeStartedAt ?? now));
+        const elapsed = runningTaskElapsed(task, now);
         const remainingMs = Math.max(0, task.remainingMs - elapsed);
         const stoppedDraft = { ...task };
         delete stoppedDraft.activeStartedAt;
         const stopped = Object.freeze({
           ...stoppedDraft,
+          recoveryRequired: false,
           activeElapsedMs: task.activeElapsedMs + elapsed,
           remainingMs,
         }) as StoredTask;
+        const run = await this.#loadRun(task.runId);
+        const hadActiveSlot = task.activeStartedAt !== undefined;
         if (remainingMs < 1) {
           const timedOut = transitionSubAgentTask(stopped, 'timed_out', {
             now,
@@ -4308,11 +5025,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
               revisionMode: 'preserve',
             },
           );
-          const run = await this.#loadRun(task.runId);
-          const nextRun =
-            task.activeStartedAt === undefined
-              ? run
-              : this.#releaseActiveExecution(run, lease.lease, now);
+          const nextRun = hadActiveSlot ? this.#releaseActiveExecution(run, lease.lease, now) : run;
           try {
             await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
               ...(nextRun === run ? {} : { run: { previous: run, next: nextRun } }),
@@ -4332,6 +5045,21 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           }
         }
 
+        if (parentSignal !== undefined) {
+          throwIfOperationAborted(parentSignal, operationDeadlineAt);
+        }
+        if (!hadActiveSlot && run.budget.activeExecutions >= task.limits.maxConcurrent) {
+          throw createSubAgentError(
+            'LIMIT_EXCEEDED',
+            'No subagent execution slot is available for checkpoint recovery.',
+            { retryable: true },
+          );
+        }
+
+        if (parentSignal !== undefined) {
+          throwIfOperationAborted(parentSignal, operationDeadlineAt);
+        }
+        if (Date.now() >= runningTaskDeadlineAt(task)) continue;
         const attempt = task.attempt + 1;
         const executionEpoch = createRuntimeId('epoch');
         const operationId = createRuntimeId('operation');
@@ -4368,8 +5096,21 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
             revisionMode: 'preserve',
           },
         );
+        const nextRun = hadActiveSlot
+          ? run
+          : Object.freeze({
+              ...run,
+              revision: run.revision + 1,
+              fencingToken: lease.lease.fencingToken,
+              budget: Object.freeze({
+                ...run.budget,
+                activeExecutions: run.budget.activeExecutions + 1,
+              }),
+              updatedAt: now,
+            });
         try {
           await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease.lease, {
+            ...(nextRun === run ? {} : { run: { previous: run, next: nextRun } }),
             tasks: [{ previous: task, next: withEvents.task, events: withEvents.events }],
           });
           const owned = withEvents.task;
@@ -4383,7 +5124,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
               binding: owned.binding as SubAgentExecutorBinding,
               checkpoint: owned.childCheckpoint as SubAgentChildCheckpoint,
             }),
-            deadlineAt: now + remainingMs,
+            deadlineAt: Math.min(parentDeadlineAt ?? Number.MAX_SAFE_INTEGER, now + remainingMs),
           });
         } catch (error) {
           if (
@@ -4399,6 +5140,8 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     } catch (error) {
       await lease.stop();
       throw error;
+    } finally {
+      adoption.stopForwardingParent();
     }
   }
 
@@ -4422,12 +5165,13 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
         );
       }
       const now = Date.now();
-      const elapsed = Math.max(0, now - (task.activeStartedAt ?? now));
+      const elapsed = runningTaskElapsed(task, now);
       const remainingMs = Math.max(0, task.remainingMs - elapsed);
       const stoppedDraft = { ...task };
       delete stoppedDraft.activeStartedAt;
       const stopped = Object.freeze({
         ...stoppedDraft,
+        recoveryRequired: false,
         activeElapsedMs: task.activeElapsedMs + elapsed,
         remainingMs,
       }) as StoredTask;
@@ -4450,9 +5194,10 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           },
         );
         const run = await this.#loadRun(task.runId);
-        const nextRun = this.#releaseActiveExecution(run, lease, now);
+        const nextRun =
+          task.activeStartedAt === undefined ? run : this.#releaseActiveExecution(run, lease, now);
         await commitRuntimeStateMutation(this.stateStore, this.sessionId, lease, {
-          run: { previous: run, next: nextRun },
+          ...(nextRun === run ? {} : { run: { previous: run, next: nextRun } }),
           tasks: [{ previous: task, next: withEvent.task, events: withEvent.events }],
         });
         return withEvent.task;
@@ -4499,8 +5244,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     operation: PendingRecoveryOperation,
     mode: 'execute' | 'spawn',
   ): void {
+    this.#deferredRecoveryErrors.delete(task.taskId);
     const controller = new AbortController();
-    const deadlineAt = Date.now() + task.remainingMs;
+    const deadlineAt = runningTaskDeadlineAt(task);
     const signal = createOperationSignal({ deadlineAt, controller });
     const operationType =
       operation.type === 'reconnect'
@@ -4517,21 +5263,29 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
       deadlineAt,
       operation,
     )
-      .catch(async (error: unknown) =>
-        this.#finalizeExecutionError(
+      .catch(async (error: unknown) => {
+        if (error instanceof HostExecutorRecoveryRequiredError) {
+          this.#deferredRecoveryErrors.set(task.taskId, error);
+          throw error;
+        }
+        if (isExecutionOwnershipLossError(error)) throw error;
+        const ownership = this.#active.get(task.taskId)?.ownership;
+        return this.#finalizeExecutionError(
           task.taskId,
-          task.attempt,
+          ownership?.attempt ?? task.attempt,
           error,
           true,
-          this.#active.get(task.taskId)?.ownership,
-        ),
-      )
+          ownership,
+        );
+      })
       .finally(() => this.#active.delete(task.taskId));
+    promise.catch(() => undefined);
     this.#active.set(task.taskId, { promise, controller });
   }
 
   #startAdoptedCheckpointExecution(adopted: AdoptedCheckpointExecution): void {
     const { task, target, lease, operation, deadlineAt } = adopted;
+    this.#deferredRecoveryErrors.delete(task.taskId);
     const controller = new AbortController();
     const promise = Promise.resolve()
       .then(() =>
@@ -4547,16 +5301,17 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           controller.signal,
         ),
       )
-      .catch(async (error: unknown) =>
-        this.#finalizeExecutionError(
-          task.taskId,
-          task.attempt,
-          error,
-          true,
-          executionOwnership(task),
-        ),
-      )
+      .catch(async (error: unknown) => {
+        if (error instanceof HostExecutorRecoveryRequiredError) {
+          this.#deferredRecoveryErrors.set(task.taskId, error);
+          throw error;
+        }
+        if (isExecutionOwnershipLossError(error)) throw error;
+        const ownership = this.#active.get(task.taskId)?.ownership ?? executionOwnership(task);
+        return this.#finalizeExecutionError(task.taskId, ownership.attempt, error, true, ownership);
+      })
       .finally(() => this.#active.delete(task.taskId));
+    promise.catch(() => undefined);
     this.#active.set(task.taskId, {
       promise,
       controller,
@@ -4571,20 +5326,21 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     mode: 'execute' | 'spawn',
     signal: AbortSignal,
     deadlineAt: number,
-  ): Promise<SubAgentExecutionOutcome> {
+  ): Promise<SubAgentExecutorOperationResult> {
     const control = this.#createExecutionControl(task, target, signal, deadlineAt);
     const request = this.#buildExecutionRequest(task, target, signal, deadlineAt, operation);
     if (mode === 'execute') {
       const pending = Promise.resolve(target.executor.execute(request, control));
       pending.catch(() => undefined);
-      const outcome = await raceWithOperationSignal(pending, signal, deadlineAt);
-      return this.#normalizeExecutorOutcome(task.taskId, outcome);
+      return raceWithOperationSignal(pending, signal, deadlineAt);
     }
-    const rawHandle = await raceWithOperationSignal(
+    const spawned = await raceWithOperationSignal(
       Promise.resolve(target.executor.spawn(request, control)),
       signal,
       deadlineAt,
     );
+    if (isExecutorRecoveryRequiredType(spawned)) return spawned;
+    const rawHandle = spawned;
     this.#assertRawHandle(task, rawHandle);
     if (operation.type !== 'reconnect') {
       throw createSubAgentError(
@@ -4615,8 +5371,7 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
     );
     const pending = Promise.resolve(rawHandle.wait());
     pending.catch(() => undefined);
-    const outcome = await raceWithOperationSignal(pending, signal, deadlineAt);
-    return this.#normalizeExecutorOutcome(task.taskId, outcome);
+    return raceWithOperationSignal(pending, signal, deadlineAt);
   }
 
   async #loadTask(taskId: string): Promise<StoredTask> {
@@ -4671,11 +5426,138 @@ function assertNonEmpty(value: unknown, label: string): asserts value is string 
   }
 }
 
+function runningTaskClockStartedAt(task: StoredTask): number | undefined {
+  return (
+    task.activeStartedAt ??
+    (task.state === 'running' && task.recoveryRequired ? task.updatedAt : undefined)
+  );
+}
+
+function runningTaskElapsed(task: StoredTask, now: number): number {
+  const startedAt = runningTaskClockStartedAt(task);
+  return startedAt === undefined ? 0 : Math.max(0, now - startedAt);
+}
+
+function runningTaskDeadlineAt(task: StoredTask, now = Date.now()): number {
+  return (runningTaskClockStartedAt(task) ?? now) + task.remainingMs;
+}
+
+function boundedTimestampAdd(timestamp: number, durationMs: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, timestamp + durationMs);
+}
+
+function createRecoveryAdoptionSignal(
+  parentSignal: AbortSignal | undefined,
+  persistedDeadlineAt: number,
+  cleanupDeadlineAt: number,
+): {
+  readonly signal: AbortSignal;
+  stopForwardingParent(): void;
+} {
+  const cancellation = new AbortController();
+  const forwardParentAbort = (): void => {
+    if (
+      parentSignal === undefined ||
+      isPersistedDeadlineTimeout(parentSignal.reason, persistedDeadlineAt)
+    ) {
+      return;
+    }
+    cancellation.abort(parentSignal.reason);
+  };
+  if (parentSignal?.aborted === true) forwardParentAbort();
+  else parentSignal?.addEventListener('abort', forwardParentAbort, { once: true });
+  return Object.freeze({
+    signal: createOperationSignal({ signal: cancellation.signal, deadlineAt: cleanupDeadlineAt }),
+    stopForwardingParent: () => parentSignal?.removeEventListener('abort', forwardParentAbort),
+  });
+}
+
+function isPersistedDeadlineTimeout(reason: unknown, persistedDeadlineAt: number): boolean {
+  if (Date.now() < persistedDeadlineAt) return false;
+  if (reason instanceof SubAgentRuntimeError) return reason.code === 'TIMED_OUT';
+  return (
+    typeof reason === 'object' &&
+    reason !== null &&
+    'name' in reason &&
+    reason.name === 'TimeoutError'
+  );
+}
+
+function isRecoveryDispatchDeferredError(error: unknown): boolean {
+  return (
+    error instanceof SubAgentRuntimeError &&
+    (error.code === 'LIMIT_EXCEEDED' ||
+      error.code === 'DEFINITION_NOT_FOUND' ||
+      error.code === 'EXECUTOR_NOT_FOUND' ||
+      error.code === 'EXECUTOR_DISALLOWED' ||
+      error.code === 'EXECUTOR_UNAVAILABLE' ||
+      error.code === 'UNSUPPORTED_CAPABILITY')
+  );
+}
+
 function stateCasConflict(): SubAgentRuntimeError {
   return createSubAgentError(
     'INVALID_STATE_TRANSITION',
     'The state mutation lost its revision or fencing CAS.',
     { retryable: true, causeCode: 'STATE_CAS_CONFLICT' },
+  );
+}
+
+function isStateCasConflictError(error: unknown): boolean {
+  return (
+    error instanceof SubAgentRuntimeError && error.descriptor.causeCode === 'STATE_CAS_CONFLICT'
+  );
+}
+
+function isExecutorRecoveryRequiredType(value: unknown): value is SubAgentExecutorRecoveryRequired {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'type' in value &&
+    value.type === 'recovery_required'
+  );
+}
+
+function normalizeExecutorRecoveryRequired(
+  candidate: SubAgentExecutorRecoveryRequired,
+): SubAgentExecutorRecoveryRequired {
+  if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+    throw invalidExecutorRecoveryMarker('The Executor recovery marker must be an object.');
+  }
+  const keys = Object.keys(candidate).sort();
+  if (
+    keys.length !== 4 ||
+    keys[0] !== 'causeCode' ||
+    keys[1] !== 'operationId' ||
+    keys[2] !== 'reason' ||
+    keys[3] !== 'type' ||
+    candidate.type !== 'recovery_required' ||
+    (candidate.reason !== 'checkpoint' && candidate.reason !== 'unbound_create') ||
+    typeof candidate.operationId !== 'string' ||
+    candidate.operationId.length < 1 ||
+    candidate.operationId.length > 256 ||
+    typeof candidate.causeCode !== 'string' ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(candidate.causeCode)
+  ) {
+    throw invalidExecutorRecoveryMarker('The Executor recovery marker shape is invalid.');
+  }
+  return Object.freeze({
+    type: 'recovery_required',
+    reason: candidate.reason,
+    operationId: candidate.operationId,
+    causeCode: candidate.causeCode,
+  });
+}
+
+function invalidExecutorRecoveryMarker(message: string, cause?: unknown): SubAgentRuntimeError {
+  return new SubAgentRuntimeError(
+    {
+      code: 'EXECUTOR_FAILED',
+      message,
+      retryable: false,
+      causeCode: 'EXECUTOR_RECOVERY_MARKER_INVALID',
+    },
+    cause === undefined ? undefined : { cause },
   );
 }
 
@@ -5414,6 +6296,7 @@ function validateChildCheckpointV1(
       );
     }
     const callIds = new Set<string>();
+    const operationIds = new Set<string>();
     for (let index = 0; index < pending.calls.length; index += 1) {
       const call = pending.calls[index]!;
       if (
@@ -5421,6 +6304,7 @@ function validateChildCheckpointV1(
         call.order !== index ||
         typeof call.operationId !== 'string' ||
         call.operationId.length === 0 ||
+        operationIds.has(call.operationId) ||
         !['tool', 'agent', 'end-agent'].includes(call.kind) ||
         typeof call.callId !== 'string' ||
         call.callId.length === 0 ||
@@ -5442,14 +6326,16 @@ function validateChildCheckpointV1(
           'The child pending batch contains an invalid call.',
         );
       }
+      operationIds.add(call.operationId);
       const approvalIds = call.approvals ?? [];
       if (
+        !Array.isArray(approvalIds) ||
         new Set(approvalIds).size !== approvalIds.length ||
         approvalIds.some(
           (approvalId: string) => typeof approvalId !== 'string' || approvalId.length === 0,
         ) ||
-        (call.status === 'waiting_approval' && approvalIds.length === 0) ||
-        (call.status !== 'waiting_approval' && approvalIds.length > 0) ||
+        (call.taskId !== undefined &&
+          (typeof call.taskId !== 'string' || call.taskId.length === 0)) ||
         (['result_ready', 'result_submitted', 'applied'].includes(call.status) &&
           call.result === undefined) ||
         (['prepared', 'in_flight', 'waiting_approval'].includes(call.status) &&
@@ -5461,19 +6347,6 @@ function validateChildCheckpointV1(
         );
       }
       callIds.add(call.callId);
-    }
-    if (pending.endRequested) {
-      const endCalls = pending.calls.filter((call) => call.kind === 'end-agent');
-      if (
-        pending.calls.length !== 1 ||
-        endCalls.length !== 1 ||
-        !['result_ready', 'result_submitted', 'applied'].includes(endCalls[0]!.status)
-      ) {
-        throw createSubAgentError(
-          'CHECKPOINT_MIGRATION_FAILED',
-          'A completed child end-agent request must be standalone and result-ready.',
-        );
-      }
     }
   }
   const compact = checkpoint.compactTransaction;
@@ -5518,6 +6391,32 @@ function validateChildCheckpointV1(
         'The child result submission checkpoint is invalid.',
       );
     }
+  }
+  if (pending !== undefined) {
+    assertPendingBatchInvariants(
+      {
+        calls: Object.freeze(
+          pending.calls.map((call) =>
+            Object.freeze({
+              kind: call.kind,
+              name: call.name,
+              status: call.status,
+              order: call.order,
+              ...(call.taskId === undefined ? {} : { taskId: call.taskId }),
+              approvalIds: Object.freeze([...(call.approvals ?? [])]),
+              ...(call.result === undefined ? {} : { result: call.result }),
+            }),
+          ),
+        ),
+        endRequested: pending.endRequested,
+        requireResultSubmissionForEnd: true,
+        requireResultSubmissionForCompletedAgentResult: true,
+        resultSubmissionPresent: resultSubmission !== undefined,
+      },
+      (message): never => {
+        throw createSubAgentError('CHECKPOINT_MIGRATION_FAILED', message);
+      },
+    );
   }
   assertResultSubmissionPendingBatchLink(checkpoint);
   return Object.freeze(cloneJsonValue(value) as unknown as SubAgentChildCheckpoint);
@@ -5571,34 +6470,12 @@ function assertResultSubmissionPendingBatchLink(checkpoint: SubAgentChildCheckpo
     );
   }
   if (call.status === 'in_flight') return;
-  if (typeof call.result !== 'string') {
-    throw createSubAgentError(
-      'CHECKPOINT_MIGRATION_FAILED',
-      'The child agent-result Tool output is invalid.',
-    );
-  }
-  let result: unknown;
   try {
-    result = JSON.parse(call.result);
+    parseAgentResultReceipt(call.result, submission.outputHash);
   } catch {
     throw createSubAgentError(
       'CHECKPOINT_MIGRATION_FAILED',
-      'The child agent-result Tool output is invalid.',
-    );
-  }
-  if (
-    typeof result !== 'object' ||
-    result === null ||
-    Array.isArray(result) ||
-    Object.keys(result).length !== 3 ||
-    (result as Record<string, unknown>).ok !== true ||
-    ((result as Record<string, unknown>).status !== 'accepted' &&
-      (result as Record<string, unknown>).status !== 'replayed') ||
-    (result as Record<string, unknown>).outputHash !== submission.outputHash
-  ) {
-    throw createSubAgentError(
-      'CHECKPOINT_MIGRATION_FAILED',
-      'The child agent-result Tool output does not match the authoritative result hash.',
+      'The child agent-result Tool receipt is invalid or does not match the authoritative result.',
     );
   }
 }

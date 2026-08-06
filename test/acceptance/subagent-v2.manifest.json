@@ -1014,6 +1014,67 @@
       ]
     },
     {
+      "requirementId": "C7-TRANSPORT-FOUNDATION",
+      "status": "implemented",
+      "phase": "phase-2",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["transport-v1", "transport-replay", "execution-wire", "recovery-marker"],
+      "cases": [
+        {
+          "caseId": "C7-TRANSPORT-01.l1.envelope-codec",
+          "variant": "transport-v1",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport.test.ts",
+            "testName": "[acceptance:C7-TRANSPORT-01.l1.envelope-codec][variant:transport-v1]"
+          }
+        },
+        {
+          "caseId": "C7-TRANSPORT-02.l1.replay-sequence",
+          "variant": "transport-replay",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport.test.ts",
+            "testName": "[acceptance:C7-TRANSPORT-02.l1.replay-sequence][variant:transport-replay]"
+          }
+        },
+        {
+          "caseId": "C7-TRANSPORT-03.l1.execution-wire",
+          "variant": "execution-wire",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport.test.ts",
+            "testName": "[acceptance:C7-TRANSPORT-03.l1.execution-wire][variant:execution-wire]"
+          }
+        },
+        {
+          "caseId": "C7-TRANSPORT-04.l1.recovery-marker",
+          "variant": "recovery-marker",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-runtime-adversarial.test.ts",
+            "testName": "[acceptance:C7-TRANSPORT-04.l1.recovery-marker][variant:recovery-marker]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C7-TRANSPORT",
+      "status": "planned",
+      "phase": "phase-2",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["rpc-control", "rpc-outcome", "artifact-sidecar"],
+      "cases": []
+    },
+    {
       "requirementId": "PHASE-1",
       "status": "planned",
       "phase": "phase-1",

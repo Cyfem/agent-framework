@@ -188,7 +188,11 @@ export type CreateStoredTaskResult =
   | { readonly status: 'created'; readonly task: StoredTask }
   | { readonly status: 'existing'; readonly task: StoredTask };
 
-/** Monotonic lease; a takeover increments fencingToken while renew does not. */
+/**
+ * Monotonic lease; a takeover increments fencingToken while renew does not. `expiresAt` belongs to
+ * the issuing StateStore's logical clock domain and must not be compared with an unrelated host
+ * wall clock.
+ */
 export interface StateLease {
   readonly key: string;
   readonly fencingToken: string;

@@ -20,3 +20,5 @@ export * from './state-controller';
 export * from './state-machine';
 export * from './state-store';
 export * from './telemetry';
+export * from './transport';
+export * from './transport-codec';
