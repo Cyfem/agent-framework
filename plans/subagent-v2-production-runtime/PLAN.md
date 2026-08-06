@@ -200,6 +200,35 @@ Phase 1 退出标准：
 
 当前增量状态：Core 已公开 closed transport v1、12-kind strict RPC、16-method control dispatcher/proxy、双向 Peer、canonical replay、同步 writer admission、带 settlement headroom 的 channel rollover、spawn 的 accepted-or-direct-unbound 生命周期、abort tombstone 与默认 32 MiB artifact sidecar。`reconstructSubAgentExecutionRequest()` 返回 `{ request, dispose }`，placement adapter 必须在 settle 后清理接收端 timer/listener。Remote proxy 暂不提供 artifact `put`；下列 Worker、Process、HTTP 包与各自的认证、进程/网络生命周期和 conformance 仍是 Phase 2 待交付内容。
 
+#### C7c 实施前冻结决策（尚未实现）
+
+以下决策是 Worker、Process 与 HTTP placement 开工前的固定 Oracle，不表示当前 checkout 已具备这些能力；在 C7c 全部门禁通过前，Phase 2 状态仍为未完成：
+
+- Core 新增受信任的 target registry，按精确的 `definition name + definition version + runner identity` 解析 target-local child runner factory、schema/codec 与模型绑定。registry 在 `init()` 时拒绝重复或不完整条目，并生成不可变 snapshot；factory、Zod object、模块路径、环境变量与凭证都不能来自 wire，也不能在目标侧做动态加载或版本 fallback。
+- Core 提供一对 placement-neutral controller/target bridge。controller bridge 把 `SubAgentExecutor` 的 execute/spawn/control 操作接入现有 Peer/RPC，并托管反向 control 与 Model gateway；target bridge 只在完整解码、scope 校验和 registry 命中后重建 execution request、创建独立 child runner，并在唯一 settle 路径的 `finally` 中调用 `dispose()`。Worker、Process、HTTP 包只负责各自的 I/O、生命周期与认证，不复制 Core 状态机、RPC union 或 control dispatcher。
+- control dispatcher 不再依赖单个 channel 内的临时 `Map` 保存 nested task handle，而是注入 session-scoped task handle registry。registry 以 `ownerSessionId + parentTaskId + childTaskId` 为可信索引，支持 register、resolve 与 terminal release；handle 本身不序列化。Worker/Process 可以使用进程生命周期内的内存实现，HTTP 必须通过 controller 的 authoritative Runtime 懒解析旧 handle，使新 channel 上的 reconnect/control 不依赖旧 dispatcher 对象。
+- strict RPC vocabulary 从 12 kind 精确扩展为 14 kind，只新增 `model.request` 与 `model.reply`；既有 12 kind 的 wire 和 16 个 control method 均不改变。`model.request` 携带稳定 `providerOperationId`、受信模型 binding、协议/codec 版本、JSON-safe generate request 与 `remainingMs`；`model.reply` 用同一 ID 返回已归一化的成功结果/usage，或白名单失败与 `outcomeUnknown`。SDK client、HTTP headers/body、原始 provider wrapper、stack、credential 与任意非 JSON-safe 对象都不可进入该 RPC。
+- `providerOperationId` 在首次 provider dispatch 前生成并随 child checkpoint/controller ledger 持久化；同一 ID 加相同 canonical request 只可取回原 reservation、在途状态或已缓存 reply，同一 ID 不同语义立即冲突。controller 必须先用 durable CAS 把 operation 置为 `in_flight`，随后才可调用 SDK create；只要恢复时 authoritative ledger 仍停留在 `in_flight`，无论 crash 发生在 SDK create 之前还是之后，都固定把原 task 标记为 `outcomeUnknown` 并禁止自动重发。controller 对一个 ID 最多启动一次 SDK create；transport 重放、channel reconnect、进程重建和 timeout 都不得生成新 ID 或自动再次请求 provider。
+- 真实方舟 adapter 与 call/token ledger 只存在于 controller，`ARK_API_KEY` 只保留在 controller 内存。key 不进入 Worker/Process/HTTP target 的 env、argv、workerData、IPC/RPC、binding、job store、checkpoint、日志、错误或 artifact；target child 只能使用注入的 Model proxy 经 `model.request` 请求 controller。
+- external reconnect 只允许接回仍存在、没有未决 provider 调用的 HTTP job。若 controller 已把 `model.request` 标记为 provider in-flight，但连接丢失前没有持久化归一化 `model.reply`，原 task 固定失败为 `EXECUTOR_FAILED + outcomeUnknown=true`，禁止 reconnect/resume/自动重发；若 reply 已持久化，则新 channel 只能重放同一 reply。Worker/Process 的 `reconnect` 仍固定为 `none`。
+- HTTP 每个 Peer packet 使用一次 signed `multipart/mixed` POST：首 part 的 `Content-Type` 固定为 `application/vnd.maneeagent.packet+json`，body 是且只能是 closed JSON `{ "version": "1", "frame": string, "sidecars": [...] }`；`frame` 是已经序列化的 RPC 字符串而不是嵌套 object。随后严格按 `sidecars` descriptor 顺序放置 binary parts；不提供独立 unsigned sidecar route，也不把 bytes base64 放入 JSON。单件上限 32 MiB、每 packet 最多 8 件且合计 128 MiB。handler 必须先完整校验 multipart 结构、part 顺序、数量、长度、SHA-256、packet scope 与全部 owned-copy 边界，再把一个完整 packet 交给 Peer；任一 part 或认证失败都必须零调用 Peer、零 stage、零部分可见副作用。
+- HTTP HMAC-SHA256 v1 固定使用六个 header：`Manee-Auth-Version: 1`、`Manee-Key-Id`、`Manee-Timestamp`、`Manee-Nonce`、`Manee-Body-SHA256`、`Manee-Signature`。canonical UTF-8 signing string 精确为 `MANEE-HMAC-SHA256-V1\n${keyId}\n${timestamp}\n${nonce}\n${METHOD}\n${path}\n${bodyDigest}`，末尾没有 LF；其中 method 必须 uppercase，path 使用 raw request path 且请求到达 verifier 时就必须已经是唯一 canonical form，verifier 不做 decode、normalize 或 re-encode，timestamp 是 Unix 毫秒，body digest 是完整 multipart 原始 bytes 的 lowercase SHA-256。raw request path 禁止 query、fragment、百分号编码、反斜线、`.`/`..` segment、重复斜线和尾斜线；redirect 一律拒绝。
+- HMAC key 至少 32 bytes；nonce 是无 padding base64url，解码后 16～64 bytes；signature 解码后必须正好 32 bytes 并做 constant-time compare。默认时钟窗口为 `±60s` 且两端边界有效，原子 `ReplayCache.consume(keyId, nonce, expiresAt)` 的 TTL 固定为 120 秒。版本、key、时间、nonce、body digest、签名或 replay 任一认证失败都返回相同的安全 401，不泄露命中阶段；生产 handler 必须使用分布式 replay cache，内存实现只允许显式 loopback/test。认证后仍需独立 `authorize(authContext, ownerSessionId, method)`，`sessionId` 不是认证凭据。
+- 包边界固定如下：`@ruixutong.manee/maneeagent-executor-worker` 只实现 `worker_threads`、transferable `ArrayBuffer`、每 task 一个受信 Worker、最小环境/`execArgv: []`、cancel/terminate 与 `reconnect=none`；`@ruixutong.manee/maneeagent-executor-process` 只实现 `child_process` advanced serialization、受限 stdio/env、cancel/kill/exit/close 分类、孤儿清理与 `reconnect=none`；`@ruixutong.manee/maneeagent-executor-http` 实现 signed multipart client/server、heartbeat、binding codec、幂等 job、event cursor、approval/resume/external reconnect、HMAC/authz 与 safe error mapping。三包都通过 Core target registry/bridge 运行受信条目，不携带方舟 key，不实现 handoff，也不相互依赖。
+
+#### C7c 稳定提交拆分
+
+C7c 只按以下可独立回滚、可通过对应门禁的提交推进；任何中间提交都不得把 Phase 2 或尚未完成的包写成已交付：
+
+1. **C7c-1 Core bridge 与 Model gateway**：target registry、controller/target bridge、session-scoped task handle registry、12→14 kind RPC、可执行的 controller Model gateway，以及 authoritative provider-operation ledger 必须在同一稳定批次交付；ledger 锁定 reservation/`in_flight`/settled/`outcomeUnknown` 状态、canonical request 幂等、reply cache 与 target checkpoint ACK。codec/golden/type/pack、checkpoint ACK、幂等重放和 `in_flight` 在 SDK create 前后崩溃的故障测试全部通过后，Worker placement 才可以依赖该地基；既有 12 kind 与 16 control method 保持兼容。
+2. **C7c-2 Worker placement**：新增 Worker 包、target bootstrap、transferable sidecar、cancel/terminate/cleanup、crash/checkpoint oracle 与无网络 conformance；包内 `reconnect=none`。
+3. **C7c-3 Process placement**：新增 Process 包、advanced serialization、env/argv/stdio 边界、cancel/kill/exit/close 与孤儿清理测试；包内 `reconnect=none`。
+4. **C7c-4 HTTP wire security**：先独立交付 signed multipart codec、完整包全验后准入、HMAC 六 header、path/time/nonce/replay/authz 正反例；该提交不宣称 remote job 生命周期完成。
+5. **C7c-5 HTTP placement**：新增 HTTP client/server、target registry、authoritative handle resolution、幂等 create、heartbeat、cursor、approval/resume/external reconnect 与 provider in-flight fail-closed 故障注入。
+6. **C7c-6 Phase 2 release gate**：补齐三个公开包的 README/manifest/pack、根文档、离线 Phase 2 acceptance 和独立 Ark placement profiles；只有固定 clean SHA 的全部离线门禁通过且真实 profile 有合规 evidence 时，才分别记录对应通过状态。缺少 Docker 或 `ARK_API_KEY` 时继续如实记录未执行，不能用 Core unit test 替代。
+
+每个提交先运行受影响包的 unit/type/lint/build/conformance，再运行仓库 `format:check`、`typecheck`、`lint`、`build` 与默认离线 `test`；通过后单独提交并推送当前分支，失败只追加修复提交，不改写历史。
+
 交付内容：
 
 - 新增 `@ruixutong.manee/maneeagent-executor-worker`、`@ruixutong.manee/maneeagent-executor-process` 与 `@ruixutong.manee/maneeagent-executor-http`，复用 Core conformance suite。

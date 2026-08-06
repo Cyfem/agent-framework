@@ -1207,13 +1207,61 @@ Local factory 接收 SubAgentExecutionControl.delegation 并把它作为 child �
 
 C7 的三个 placement 共用 Core 导出的协议无关 transport v1 contract，不允许各包复制或扩展不兼容 wire：
 
-当前 Core 实现已经冻结并公开该公共层：12-kind strict RPC、16-method control dispatcher/proxy、双向 `SubAgentTransportPeer`、canonical replay/reply cache、同步 writer admission receipt、带 settlement headroom 的 drain/rollover、spawn 的 `accepted → settled` 或 direct `unbound_create` recovery settlement、abort/timeout tombstone，以及默认 32 MiB 的 artifact sidecar。writer 的可选 `settled` 只报告 I/O 完成，不参与下一帧准入排序；非法同步 receipt 在调用返回前失败，准入前 abort 不发送 packet。Peer 对 accepted/settled/events reply 与原 request 做语义关联，超长 timeout 分段调度；soft drain 仍允许所有 reply/replay 和 active executor task 的 control/cancel/snapshot/events continuation，hard sequence bound 才 fail-close。它们通过 closed schema、scope/receipt/outcome 重验和 safe-error 白名单把远端 runner 接回 Core control plane；具体 Worker、Process、HTTP transport、鉴权和 OS/network 生命周期仍未实现，因此不能把本节状态写成 Phase 2 通过。
+当前 Core 实现已经冻结并公开该公共层：C7b 基线的 12-kind strict RPC、16-method control dispatcher/proxy、双向 `SubAgentTransportPeer`、canonical replay/reply cache、同步 writer admission receipt、带 settlement headroom 的 drain/rollover、spawn 的 `accepted → settled` 或 direct `unbound_create` recovery settlement、abort/timeout tombstone，以及默认 32 MiB 的 artifact sidecar。writer 的可选 `settled` 只报告 I/O 完成，不参与下一帧准入排序；非法同步 receipt 在调用返回前失败，准入前 abort 不发送 packet。Peer 对 accepted/settled/events reply 与原 request 做语义关联，超长 timeout 分段调度；soft drain 仍允许所有 reply/replay 和 active executor task 的 control/cancel/snapshot/events continuation，hard sequence bound 才 fail-close。它们通过 closed schema、scope/receipt/outcome 重验和 safe-error 白名单把远端 runner 接回 Core control plane。C7c 在这套 wire 上原子增加下文冻结的 controller/target bridge 与 `model.request`/`model.reply`，完成后 RPC kind 总数固定为 14；具体 Worker、Process、HTTP transport、鉴权和 OS/network 生命周期仍未实现，因此不能把本节状态写成 Phase 2 通过。
 
 - JSON envelope 固定为 `{ version: '1', channelId, sequence, messageId, correlationId?, taskId?, operationId?, kind, payload }`，所有 object 都是 closed shape；默认单个 JSON frame 上限 16 MiB。
 - 每个方向的 `sequence` 从 1 连续递增。相同 `messageId + canonical decoded envelope` 是协议重放并返回原 reply，sidecar 以 `sidecarId` 无序比较；相同 ID 不同语义或 bytes 为冲突；sequence gap、未知字段、错版本、超限或非 JSON-safe payload 都在调用 Executor/Core 前失败。
 - `SubAgentExecutionRequest` 不直接跨 transport 传输 `AbortSignal` 或 control closure。wire 使用 `remainingMs`，接收端按本地时钟创建 signal 和绝对 deadline；`reconstructSubAgentExecutionRequest()` 返回 `{ request, dispose }`，adapter 必须在处理 settle 后调用幂等 `dispose()` 释放接收端 timer/listener。不得信任远端绝对时间。超过 Node 单个 timer 上限 `2^31-1 ms` 的长 deadline 必须分段调度，不得溢出、静默截短或退化为近即时 timeout。
-- artifact reference 继续走 closed JSON；bytes 使用 transport sidecar，Worker 使用 transferable `ArrayBuffer`，Process 使用 advanced serialization 的 `Uint8Array`，HTTP 使用单独 raw body。sidecar 必须拒绝 Proxy，使用 internal slots 固定源长度并复制到普通 owned buffer，再校验声明 size 与明文 SHA-256；不能调用源对象可覆写的 getter、iterator、`slice()` 或 `Symbol.species`，也不以 base64 塞入 JSON frame。当前 remote execution-control proxy 不提供 artifact `put`；它只接受已有 reference 对应的 sidecar，写入 reserve/stage 语义留给后续 adapter 设计。
+- artifact reference 继续走 closed JSON；bytes 使用 transport sidecar，Worker 使用 transferable `ArrayBuffer`，Process 使用 advanced serialization 的 `Uint8Array`，HTTP 使用 17.2 冻结的单请求 signed `multipart/mixed` packet。sidecar 必须拒绝 Proxy，使用 internal slots 固定源长度并复制到普通 owned buffer，再校验声明 size 与明文 SHA-256；不能调用源对象可覆写的 getter、iterator、`slice()` 或 `Symbol.species`，也不以 base64 塞入 JSON frame。当前 remote execution-control proxy 不提供 artifact `put`；它只接受已有 reference 对应的 sidecar，不提供独立 upload/stage/commit route。
 - 目标节点只能按宿主预注册的 `definition name + version` 和 runner identity 解析 factory/Zod schema；factory、Zod object、模块路径和凭证都不进入 wire。
+
+#### 17.0.1 Trusted target runner registry 与校验顺序
+
+所有 placement 共享一个 target-side trusted registry。注册键固定为 `{ runnerId, definitionName, definitionVersion }`；值是在目标节点启动时由宿主代码注册的 factory、input/output Zod schema、protocol/checkpoint codec identity 和允许的 model gateway identity。`runnerId` 是 opaque、host-only 标识，只能由 controller 根据已经冻结的 Executor binding/registry 选择，不进入模型可见 catalog，也不能由 execution input 覆盖。远端不能提交模块路径、构造函数、Zod 对象、Model endpoint 或任意动态 import specifier。
+
+目标节点对新的 execution packet 固定按以下顺序处理：
+
+1. 完成 transport frame、sidecar、sequence/replay、size 与 JSON-safe 校验，得到 owned immutable packet。
+2. 校验可信 owner session/run/task/operation scope，并用 packet 中的 ref 查找精确 `{ runnerId, definitionName, definitionVersion }`；unknown、disabled 或 identity/version 不一致统一返回安全 `RESOURCE_NOT_FOUND`/compatibility error，不尝试其他 runner。
+3. 比对 registry 固定的 protocol、checkpoint codec、adapter state 与 model gateway identity；任一不一致在创建 Agent、打开事件流或调用 Model 前失败。
+4. 使用该 registry entry 自己持有的 input Zod schema 对 wire input 执行 `safeParse`，再对 parse 后结果执行 JSON-safe/JCS、256 KiB input、projection 与 artifact limits 校验。runner 只接收这份 owned parse result；不得使用 wire 携带的 schema，也不得先构造 runner 再校验。
+5. 以上步骤全部通过后，才由 factory 创建独立 child Agent/runner，注入 task-scoped control、delegation、artifact client、signal/deadline 与 protocol-specific Model proxy。
+
+同一 input 会先在 controller Router create 阶段校验，再在 target registry 入站阶段重验；两端必须注册相同 definition version。带 transform/default/refinement 的 schema 必须把“controller 输出再次作为同版本 schema 输入”纳入 registry compatibility/conformance，不能靠跳过 target parse 规避非幂等 schema。
+
+#### 17.0.2 Controller/target bridge 与 lazy handle
+
+Core 新增且只保留一套 placement-neutral bridge：controller 侧 bridge 实现 `SubAgentExecutor`，把 execution request/control 映射到 `SubAgentTransportPeer`；target 侧 bridge 把验证后的 request 交给 `SubAgentChildRunner`，并把 16-method control 反向代理回 authoritative Core Runtime。Core task/run/approval/result receipt/lease/fencing 仍由 controller StateStore 决定，target job、PID/thread、HTTP cursor 都不是权威 task state。
+
+`spawn` 收到合法 `executor.accepted` 后只构造一个 lazy `ExecutorTaskHandle`：`snapshot()`、`wait()`、`cancel()` 和 `events()` 在调用时才发对应 RPC。创建 handle 不得启动隐式 poll、无限 event subscription 或后台 timer；`events({ afterSequence, limit, signal })` 每次最多取得一页，再按 consumer demand 拉下一页，取消/iterator return 必须释放当前请求。handle 只保存 validated binding/task identity 和 bridge 引用；进程重建后由 Executor 通过 binding 创建新 handle，不序列化 closure 或 Peer 实例。`execute` 可以复用同一 handle 的 wait path，但不得建立第二套 settle/replay 语义。
+
+#### 17.0.3 Model gateway RPC 与 provider outcome Oracle
+
+C7c 把 strict RPC 从 12 kind 原子扩展为 14 kind，只新增一对双向消息，不改变已有 12 kind 或 16-method control：
+
+- `model.request`：target 的 protocol-specific Model proxy 请求 controller gateway 执行一轮 generate；payload 只含 frozen gateway/codec identity、协议 codec 编码后的 JSON-safe context/tools/purpose/runtime 元数据和 host-only `providerOperationId`，不含 API key、base URL、SDK client、任意 header 或可执行对象。
+- `model.reply`：controller 返回同一 `providerOperationId` 对应的 codec-normalized messages/usage，或 closed safe error；SDK raw response、provider error body/header 和 credential 永不跨回 target。request/reply 必须与原 task、execution epoch、iteration/request-attempt、gateway identity 和 correlation ID 精确关联。
+
+`providerOperationId` 由受信 target Model proxy 根据 controller 分配的 task/epoch 与当前 iteration/request-attempt 生成或取得，模型文本、Tool 参数和用户 input 都不能指定它。它只存在于内部 RPC、authoritative provider-operation ledger、checkpoint/recovery metadata 和脱敏事件关联字段中；Model adapter 必须在构造 provider body/header 前剥离它。重复 ID + 相同 canonical request 只能读取已持久的 completed reply，重复 ID + 不同 request 固定为 idempotency conflict。
+
+每轮 child Model 调用顺序冻结为：
+
+1. target 先把调用前完整 child context、pending Tool batch、iteration/request-attempt 和 `providerOperationId` 通过 `commitCheckpoint` 写回 controller，并等待 durable ACK。
+2. 只有收到该 ACK 后才能发送 `model.request`；未 ACK、超时或连接中断都不得触发 gateway/provider。
+3. controller 在 authoritative provider ledger 中将同一 operation 从 `prepared` CAS 为 `in_flight` 后才调用 SDK，且 SDK `maxRetries=0`；这次 CAS 是不可自动重发的恢复分界线。provider response 必须先以 codec-normalized `completed` result 持久化，再发送 `model.reply`。
+4. target 收到并校验 reply 后更新 child checkpoint，再继续 Agent loop；reply 丢失可按同一 `providerOperationId` 读取已持久的 completed result，不能发起第二个 provider attempt。
+
+authoritative ledger 的 `in_flight` CAS 一旦提交，随后发生 controller crash、网络断开、timeout 或进程丢失时，无论故障实际位于 SDK create 调用前还是调用后，生产恢复都必须把原 task 置为 `failed + outcomeUnknown=true`，禁止 bridge、Peer、Executor、SDK 和 recovery 自动重发；恢复逻辑不能根据缺失的进程内证据猜测 provider 是否已收到请求。确定性测试必须分别提供两个 failpoint：CAS 后、SDK create 前的注入断言 SDK count = 0，SDK create 返回/抛出前后的注入断言 SDK count = 1；两者的持久恢复 Oracle 都同为 outcome unknown/no auto resend。`prepared` 且尚未进入 `in_flight` 可以从已 ACK checkpoint 用相同 operation 继续；`completed` 只能重放原 normalized reply。Worker/Process/loopback 可使用 controller-process scoped ledger，HTTP external reconnect 和任何跨 controller 重启声明必须使用与 Runtime 同恢复域的 durable ledger；否则 capability 必须保守降为不可跨进程恢复。
+
+#### 17.0.4 三种 placement 的复用边界
+
+Worker、Process 与 HTTP 必须复用 Core 的 request reconstruction、target registry、controller/target bridge、14-kind RPC codec、16-method control、lazy handle、Model gateway proxy、safe wire projector 和 Peer state machine，不得各自复制 runner/control/result/replay 逻辑。各包只实现以下 transport/lifecycle 边界：
+
+- Worker：`MessagePort` packet I/O、transferable sidecar、Worker 启停/exit/cancel 分类和 worker binding codec。
+- Process：advanced-serialization IPC、环境/stdio 白名单、child process 启停/kill/exit 分类和 process binding codec。
+- HTTP：TLS/HMAC、signed multipart packet、heartbeat/availability、durable remote job/cursor/reconnect、HTTP binding codec 和部署级 replay cache。
+
+三者可以提供自己的 availability probe、adapter-state version、binding codec 和故障分类，但不能改变 RPC kind、control method、registry lookup/validation 顺序或 provider outcome Oracle。Local Executor 不被强制绕 transport loopback；它继续直接实现同一 Core SPI/conformance。所有 placement 只改变 child execution 的位置，根 Agent、run、session、provider gateway 和对话所有权始终留在 controller，不实现 handoff。
 
 Executor 可以返回内部 `recovery_required` settle marker，但它不是公开 task state 或 Agent outcome。Core 只在以下条件接受：authoritative task 仍为 running、marker operation 与当前 epoch 一致，并且不存在 outcome-unknown provider intent。`checkpoint` recovery 必须已有合法 binding、完整 child checkpoint 和精确 runner/codec compatibility；`unbound_create` 只允许在 binding/checkpoint 均未提交时用原 idempotency operation 重放。每次 live dispatch 最多自动恢复一次，继续失败后等待 host 显式 `recover()`/retry；绝不创建替代 task/job。provider 已 `in_flight` 时固定 `failed + outcomeUnknown`，`result_submitted` 崩溃固定 `failed + partial`，terminal 只读且不可逆。
 
@@ -1222,8 +1270,8 @@ Executor 可以返回内部 `recovery_required` settle marker，但它不是公�
 新增独立公开包 `@ruixutong.manee/maneeagent-executor-worker` 与 `@ruixutong.manee/maneeagent-executor-process`，要求：
 
 - 只跨 IPC 发送 definition ref、JSON input、context projection、limits 和 binding。
-- worker/process 内按 name + version registry 解析 factory。
-- 入站重新执行 Zod 与 JSON-safe 校验。
+- worker/process 内使用 17.0.1 的 trusted target runner registry 精确解析 runner/factory。
+- 入站严格按 17.0.1 顺序重新执行 Zod、JSON-safe、identity 与 limits 校验。
 - signal/cancel 映射为 IPC 控制消息和进程终止兜底。
 - 区分正常 child failure、协议错误、进程 crash 和宿主 kill。
 - checkpoint、result receipt 和 event sequence 可在进程退出后恢复。
@@ -1255,7 +1303,24 @@ HTTP v1 固定行为：
 - remote job event cursor 与 Core task event sequence 是两个独立域。controller 断线时 job 进入 remote 内部 `awaiting_control`，reconnect 用原 binding/cursor 继续；丢失 job 返回 `RECOVERY_TARGET_LOST`，不能 create 替代。
 - 默认只接受 TLS。仅显式 `allowInsecureLoopback` 可在测试/开发使用 `127.0.0.1`、`::1` 或 `localhost`，redirect 一律拒绝。
 
-HMAC-SHA256 v1 固定使用 `Manee-Key-Id`、`Manee-Timestamp`、`Manee-Nonce`、`Manee-Body-SHA256`、`Manee-Signature` headers。签名串按顺序包含版本、uppercase method、normalized path、key ID、Unix 毫秒 timestamp、至少 128-bit base64url nonce 与 lowercase raw-body SHA-256；key 至少 32 bytes，signature 为 base64url HMAC-SHA256 并用 constant-time compare。默认时间窗口为正负 60 秒且边界有效，replay TTL 为 120 秒；`ReplayCache.consume(keyId, nonce, expiresAt)` 必须原子。生产 handler 要求 distributed replay cache，内存实现只允许显式 loopback/test。未知 key、错签名、过期和 replay 对外返回同一安全 401；独立 `authorize(authContext, ownerSessionId, method)` 必须在进入 Core 前完成，session ID 本身不构成授权。
+HTTP transport sidecar 固定使用单请求 signed `multipart/mixed`，不设计独立 upload/stage route。完整格式如下：
+
+- 首 part 必须且只能是 `Content-Type: application/vnd.maneeagent.packet+json`，body 为 closed JSON `{ version: '1', frame: string, sidecars: descriptor[] }`；`frame` 是已经序列化的 RPC JSON string，不是嵌套 JSON object，也不能由 multipart parser 重序列化，descriptor 使用 Core sidecar closed schema。
+- 后续每个 part 必须是 `Content-Type: application/octet-stream`，`Content-ID` 精确等于对应 `sidecarId`，并严格按首 part 的 descriptor 顺序出现；不允许额外/missing/duplicate part、未知 MIME header、nested multipart、content-transfer-encoding 或 base64。
+- 每件最多 32 MiB，每 packet 最多 8 件且 sidecar 合计最多 128 MiB；HTTP server 还必须在解析前执行总 body/header/boundary 上限。每件复制到 owned buffer 后校验 descriptor size 与 SHA-256，全部 part 收齐并通过 frame/sidecar 校验后才一次调用 `Peer.receive()`。
+- 任一 MIME、长度、digest、frame 或 HMAC 校验失败都丢弃整个请求，不调用 Peer/Core、不保留 stage/orphan。完整原始 multipart body bytes（包括 boundary、CRLF、part headers 和顺序）参与 `Manee-Body-SHA256`，因此 frame 与 sidecar 被同一签名原子覆盖。
+
+HMAC-SHA256 v1 固定使用六个 headers：`Manee-Auth-Version: 1`、`Manee-Key-Id`、`Manee-Timestamp`、`Manee-Nonce`、`Manee-Body-SHA256`、`Manee-Signature`。canonical string 是 UTF-8、字段间仅 LF (`0x0a`)、**无尾换行**的精确字符串：
+
+```text
+MANEE-HMAC-SHA256-V1\n${keyId}\n${timestamp}\n${nonce}\n${METHOD}\n${path}\n${bodyDigest}
+```
+
+其中 `timestamp` 是无符号十进制 Unix milliseconds，除值 `0` 外不得有前导零；默认时间窗口为 `abs(now - timestamp) <= 60000`，正负边界均有效。`nonce` 必须是无 padding base64url，解码后 16～64 bytes；`bodyDigest` 必须是完整原始 body 的 64 字符 lowercase hex SHA-256；key 至少 32 bytes；signature 必须是无 padding base64url、解码后恰好 32 bytes 的 HMAC-SHA256，并用 constant-time compare。任何字段禁止 CR/LF。
+
+`METHOD` 必须已经是 endpoint allowlist 中的 uppercase ASCII method；v1 当前只允许 `POST`。raw request path 必须在到达 verifier 时就已经是与预注册 route template 匹配的唯一 canonical form，动态 job/request ID 只允许 route 定义的 opaque ASCII identifier alphabet。请求 target 禁止 query（包括空 `?`）、fragment、任何 `%` percent-encoding、反斜杠、ASCII control、`.`/`..` 独立 segment、重复 `/` 与 trailing slash；verifier、HTTP framework 和前置代理都不得先 percent decode、dot removal、slash collapse、Unicode normalize 或改写大小写再验签，validated raw path 本身就是 canonical `path`。无法从代理/框架无损取得原始 request-target，或代理可能在 verifier 前改写 path 时，部署必须 fail closed，不能用已归一化 URL 猜测签名输入。
+
+验证顺序固定为：closed headers/route/body bounds → raw body digest → timestamp/key/encoding → signature constant-time compare → 原子 `ReplayCache.consume(keyId, nonce, expiresAt)`（TTL 固定 120 秒）→ `authorize(authContext, ownerSessionId, method)` → multipart/RPC/Core。生产 handler 要求 distributed replay cache，内存实现只允许显式 loopback/test。未知 key、错签名、过期、replay、path/query 不规范、未授权及其他认证失败对外都返回同一安全 401，且进入 Core/Peer/runner 的 callback 次数必须为 0；session ID 本身不构成授权。
 
 ### 17.3 Phase 3 生产适配器
 

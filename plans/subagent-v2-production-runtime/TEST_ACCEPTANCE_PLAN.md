@@ -778,6 +778,122 @@ Ark placement 调用公式固定为：Worker/Process 各为两条跨协议 5-cal
 
 Phase 3 Docker Compose 必须同时启动 PostgreSQL、Redis、MinIO、HTTP worker、BullMQ worker、隔离 Docker Engine、controller 与故障代理；Docker task 容器断言非 root、只读 rootfs、无 Docker socket、默认无网络。Core telemetry sink 与独立 `maneeagent-observability-otel` bridge 的 span 映射分别验收，Core tarball 不得依赖 OTel SDK。所有公开包和 evidence 统一版本 `2.0.0`。
 
+### 12.2 C7c Placement bridge、Model gateway 与 HTTP 安全验收矩阵
+
+本节冻结 C7c 的目标验收 Oracle；在对应实现、manifest case、Worker/Process 真实进程 shard、HTTP loopback shard 和 Ark placement profile 实际产出证据前，所有条目均为 `pending_external_evidence` 或未满足 requirement，不能据此宣称 Phase 2 passed。C7c 仍只改变 child execution placement，父 Agent、root run、owner session 和审批控制权都留在 controller，不实现 handoff。
+
+#### 12.2.1 Target registry 与 controller/target bridge
+
+`SubAgentTargetRunnerRegistry` 是 host-only 的受信 registry。模型只看见既有 `{ subAgent, executor, input }`，transport 对端也不能提交模块路径、构造器、factory、entrypoint、环境变量或 argv 来选择可执行代码。
+
+| ID         | 正向与边界场景                                                                                                                                                                              | 必须拒绝/证明                                                                                                                                                                                                              | 层级  |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| C7C-REG-01 | init 对每个 target entry 校验稳定 target identity、definition name/version、协议、runner factory 与所需 checkpoint codec；成功后生成不可变 snapshot。                                       | 空白/超 schema 上限/控制字符 identity、重复 target、缺 factory、未知协议、缺 codec、definition 或 adapter identity 不一致时在 Worker/Process/HTTP 创建及任何网络前失败，不留下半 registry。                                | L1/L2 |
+| C7C-REG-02 | public catalog 的 `(subAgent, executor)` 经过 definition allowlist、Executor `supports()`、availability 和 target registry 保守交集后唯一解析到受信 target。                                | wire 中伪造 target/module/path/URL、未知 target、recovery-only target 用于新建、同一公开选择解析到多个 target，统一安全失败；不得 `import()`、`eval`、spawn 任意代码或 fallback 到另一个 target/Executor。                 | L1/L2 |
+| C7C-REG-03 | execution request、checkpoint、binding、protocol 和 adapter identity 与路由时 registry revision 精确绑定；in-flight task 使用创建时 snapshot，显式刷新只影响后续 create。                   | registry mutation、旧 revision、版本降级、checkpoint/runner/协议错配确定失败；恢复只能找回原 identity 或使用显式 migrator，不能把同名新 factory 当成原 target。                                                            | L1/L3 |
+| C7C-REG-04 | 每个 task 从 target factory 创建独立 child runner；同一 target 可以处理不同 task，但不能共享 Agent/context/Tool 实例或可变 app state。                                                      | factory 返回已使用 runner、父 Agent、另一 task 的 runner 或跨 session 对象时失败；一个 task 的 context、approval、artifact、Model proxy 与 event 不得被另一个 task观察。                                                   | L2/L4 |
+| C7C-REG-05 | Router 在实际 dispatch 前用最新 availability revision 复核，target resolver 再按已授权 identity 做最后一次闭合校验。                                                                        | catalog snapshot 后 target 消失、不健康或被撤销时不创建 task/job、不消费 child provider budget且不 fallback；失败目录只返回模型可见的安全公开字段，不泄漏 target key、registry revision 或内部原因。                       | L1/L2 |
+| C7C-BRG-01 | 全链路必须真实经过 Runtime/Router → placement Executor → `SubAgentTransportPeer` → execution RPC → target registry → request reconstruction → child runner → reverse control proxy。        | 禁止测试直接调用 child runner、伪造 settled outcome 或绕过 Peer/dispatcher；每个 trust boundary 都重验 closed schema、scope、identity、hash、signal/deadline 和 limits，首个失败点之后 Core mutation 计数为 0。            | L2/L4 |
+| C7C-BRG-02 | child 的 checkpoint/result/end/progress/approval/delegation 通过 16-method control proxy 返回 controller，controller 写权威 StateStore；settled reply 再按原 call order 回到父 checkpoint。 | raw `SubAgentExecutionControl`、StateStore、API key、父 Agent、raw task handle 或未脱敏 error 不得进入 target factory、binding、wire、日志或 child context；reverse call 的 task/session/call correlation 任一错配都失败。 | L2/L4 |
+| C7C-BRG-03 | `execute`、`spawn`、approval resume、checkpoint recovery、cancel、snapshot、wait 和 events 都使用同一 bridge，规范化 outcome 与 Local conformance golden 一致。                             | adapter 不得为某个方法建立旁路或在进程/网络失败后 create 替代 task；Worker/Process 固定 `reconnect=none`，HTTP 只能 reconnect 原 external binding。                                                                        | L2/L3 |
+| C7C-BRG-04 | `reconstructSubAgentExecutionRequest()` 的 `dispose()` 在 success/failure/cancel/timeout/runner throw 的 `finally` 中恰好生效，重复调用幂等。                                               | settle 后 signal listener、分段 deadline timer、MessagePort/IPC/request body、sidecar owned buffer、child runner 与 registry lease 均为 0；迟到 reply 只能命中 tombstone，不能复活 task。                                  | L1/L3 |
+
+task-handle registry 必须是 lazy、session-bound 且可回收的，不能把原始 Worker/Process/HTTP handle 当作持久状态：
+
+| ID         | 场景                                                                                                                     | Oracle                                                                                                                                                                                                  | 层级  |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| C7C-HDL-01 | accepted binding 后首次 `snapshot/wait/events/cancel` 才按 `ownerSessionId + taskId` 解析 lazy handle。                  | 仅 create/terminal 但未调用 handle API 时不注册 listener/timer；checkpoint、binding、event 与 artifact 不序列化 raw handle、PID、threadId、socket、URL 或 closure。                                     | L1/L2 |
+| C7C-HDL-02 | 同 session 对同 task 重复解析复用同一受控 operation state；并发首次解析通过 single-flight。                              | unknown 与跨 session 都返回相同 `RESOURCE_NOT_FOUND` 投影；错误 owner、task、binding、executor 或 target identity 在接触 adapter 前失败，不泄漏资源是否存在。                                           | L1/L2 |
+| C7C-HDL-03 | `events(afterSequence)` 按需建立一个 cursor subscription，重复/断线重连只回放 `sequence > afterSequence` 的权威事件。    | iterator `return()`、AbortSignal、HTTP disconnect、terminal、Peer close 和异常路径都移除 listener；同 cursor 重连不重复事件、不跳 sequence、不保持旧 response writer。                                  | L2/L3 |
+| C7C-HDL-04 | terminal 且没有 pending operation/subscriber 后驱逐 lazy entry；后续只读查询从 StateStore/remote terminal receipt 重建。 | 10,000 次 create/resolve/cancel/terminal 与反复 events connect/disconnect 后，registry entry、listener、timer、MessagePort、child process、socket 和 pending promise 回到基线，不得随 task 数单调增长。 | L2/L6 |
+
+#### 12.2.2 14-kind RPC 与受控 Model gateway
+
+C7c 将现有 12-kind closed RPC union 只增加 `model.request` 与 `model.reply` 两个 kind，总数必须精确为 14；未知第 15 种 kind、额外字段或把 model payload 塞入普通 control/execution kind 都在 Model、SDK 和 StateStore 前拒绝。`model.request/model.reply` 复用同一 Peer sequence、correlation、canonical replay、packet/sidecar limits 和同步 writer admission，不建立第二套无界 IPC。
+
+Model gateway 的持久顺序固定为：
+
+```text
+child checkpoint CAS committed
+  -> checkpoint ACK(task/revision/digest) recorded
+  -> model.request admitted
+  -> provider budget token reserved
+  -> provider state prepared -> in_flight CAS
+  -> SDK create started
+  -> normalized result + result hash recorded as result_ready
+  -> model.reply admitted
+```
+
+`checkpoint ACK` 之前 `model.request admission count=0`、`provider reservation count=0` 且 `SDK create count=0`；`prepared -> in_flight` CAS 必须先于 SDK create。一旦进入 `in_flight`，即使 SDK 尚未真正开始也按 outcome unknown 处理；`result_ready` 记录成功后，即使 reply/connection 丢失也不能再次调用 provider。
+
+| ID         | 正向场景                                                                                                                                                                    | 负例与精确 Oracle                                                                                                                                                                                                                                           | 层级     |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| C7C-MDL-01 | Chat 与 Responses 各通过 protocol-specific Model proxy 发出 closed `model.request`，controller 只用 registry 绑定的 adapter/model endpoint 处理并返回同协议 reply。         | protocol/adapter/target/task 错配、custom protocol、未知 purpose、额外字段、target 指定 endpoint/model/baseURL 或任意 provider options 均失败；不能把一种协议的 context/reply 交给另一 adapter。                                                            | L1/L4/L5 |
+| C7C-MDL-02 | request 关联原 owner/session/run/task/attempt、logical model request ID、checkpoint revision/digest 和规范化请求 SHA-256；reply 关联同一 scope、request ID 与 result hash。 | 任一 scope、attempt、ACK、protocol 或 hash 错配返回稳定安全错误；不能因只匹配 transport correlationId 就接受 reply，迟到 reply 不能推进 failed/terminal task。                                                                                              | L1/L2    |
+| C7C-MDL-03 | child checkpoint commit/ACK 先于 `model.request` admission；丢失 ACK 后相同 scope/ID/hash 重放返回原 ACK，再准入至多一次 model request/provider attempt。                   | 无 ACK、ACK 未提交、旧 revision、错误 digest、另一 task 的 ACK、ACK 后 StateStore rollback 模拟均在 model request/provider 前失败；trace 必须满足 `checkpoint.acked < model.request.admitted < budget.reserved < provider.in_flight < sdk.create.started`。 | L1/L3    |
+| C7C-MDL-04 | 幂等 key 的作用域包含受信 task scope 与 logical request/attempt；canonical request hash 覆盖协议、purpose、context、Tools、runtime request metadata 和 checkpoint digest。  | 同 key + 同 hash 只 reserve/create 一次并返回同 ACK/reply；同 key + 不同 canonical hash 为 `IDEMPOTENCY_CONFLICT`，SDK=0；对象 key 顺序差异等价，Unicode、数字、lone surrogate 等继续服从 JCS Oracle。                                                      | L1/L3    |
+| C7C-MDL-05 | provider 返回后先保存允许恢复的规范化 Chat/Responses result 与 hash，再发送 `model.reply`；reply 丢失后重放返回 byte-equivalent semantic reply。                            | SDK create 成功但结果是否返回不确定时不得伪造缓存；结果已保存时不得标 `outcomeUnknown` 或再次 create；同 request ID 的不同 result/hash、重复 completion、乱序旧 reply 都不能覆盖第一份已提交结果。                                                          | L1/L3    |
+| C7C-MDL-06 | `signal`、remaining deadline、共享 provider ledger 和 `maxRetries: 0` 进入 controller adapter；abort 精确中止对应 SDK request。                                             | target 不能扩张 deadline、重置 attempt、跳过 budget、触发 SDK/framework retry 或把一个 task 的 abort 传播到无关 task；timeout/cancel 后 listener、reservation 和 pending reply 全清理。                                                                     | L1/L4/L5 |
+| C7C-MDL-07 | L4 使用 Fake OpenAI client 真正进入 `OpenAIChatModel.generate()` 与 `OpenAIResponsesModel.generate()`；L5 再用方舟验证两种协议 Tool-call/result checkpoint。                | fake fixture 不能绕过正式 adapter parse/build/rewrite；Chat `tool_calls[]`/`tool` role、Responses item/call ID、summary purpose 与 typed Tool schema 不交叉泄漏，checkpoint restore 后 provider call 序列不重复。                                           | L4/L5    |
+| C7C-MDL-08 | API key 与 provider credential 从始至终只存在于 controller Model gateway 内存；proxy 只携带协议安全请求与稳定关联字段。                                                     | fake secret marker 扫描 Worker `env/workerData/argv`、Process `env/argv/stdio/IPC`、HTTP headers/body/job/binding、checkpoint/WAL、event、error、DLQ、日志、trace、artifact/evidence 必须 0 命中。                                                          | L2/L3/L6 |
+
+#### 12.2.3 四个故障窗口与 placement 变体
+
+四个窗口必须由 Worker、Process 和 HTTP 各自的确定性 offline harness 全覆盖；只有会实际发生 provider attempt 的窗口进入既有 Ark profile，准入前/后零调用用例不能为了“真实”标签浪费或新增 SDK calls。
+
+| 窗口                 | 注入点                                                                                                                   | task/job/Model Oracle                                                                                                                                                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pre_admission`      | writer 返回 admission receipt 前 throw/abort，或 HTTP 在认证/完整 multipart 校验前断开。                                 | 不消费 Peer sequence、不创建 target job/runner、不写 checkpoint、不 reserve/provider call、不留 lazy handle/tombstone；host 可用同 operation 原样重试。                                                                             |
+| `post_admission`     | execution/placement packet 已同步 admitted，但 accepted binding 或 child checkpoint ACK 尚未提交时进程/连接失败。        | 只允许按同 operation ID/hash 重放原 operation；task/job 最多各 1，model request admission=0、provider call=0。相同语义继续，冲突语义 `IDEMPOTENCY_CONFLICT`；不能 create 替代 task/job 或 fallback。                                |
+| `provider_in_flight` | A：`prepared -> in_flight` CAS 已提交但 SDK create 前 crash；B：SDK 已启动但 `result_ready` 尚未记录时 worker/连接丢失。 | 两个子变体都让原 task `failed + EXECUTOR_FAILED + outcomeUnknown=true` 且禁止恢复/自动重发；A 确定 `SDK create=0`，B 确定 `SDK create=1`。reservation/attempt 不返还，迟到 reply 被吞掉，只有可信 host 可以创建 `retryOf` 新 task。 |
+| `model_result_ready` | 规范化 result/hash 已提交，但 `model.reply` 或 target ACK 丢失，随后 runner/controller 重连。                            | 同 request replay 返回原 result/hash且 provider exactly once；child 从原 checkpoint 继续，再由 F08/F09 分别验 result receipt 与 terminal CAS。不能把确定结果降级为 unknown，也不能覆盖结果或增加 provider attempt。                 |
+
+| Placement | 必须执行的 bridge/OS/network 证据                                                                                                                                                                                                                                                  | Ark profile 内的既有调用映射                                                                                                                                                                             |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Worker    | 真实 `worker_threads`、受信 target registry、transferable owned `ArrayBuffer` sidecar、最小 env/空 `execArgv`、双向 MessagePort、protocol cancel → 5 秒 terminate fallback、`error/exit` 分类；四窗口与 reverse control 并发后无 Port/runner/listener 泄漏，`reconnect=none`。     | 保持 19/21：两条跨协议 5-call flow；provider in-flight 2；`model_result_ready` 可与既有 result-receipt 3-call flow 共用同一 provider result；terminal CAS 4；pre/post admission 为 0-call offline case。 |
+| Process   | 真实 child process、固定 `execPath`、advanced serialization、`shell=false/detached=false`、严格 env 白名单、64 KiB stdio 上限、IPC close/exit/kill 分类、protocol cancel → 5 秒 kill fallback和孤儿清理；四窗口与 reverse control 不死锁，`reconnect=none`。                       | 保持 19/21，公式与 Worker 相同；crash evidence 必须来自真实 OS process，不得用同进程 throw 冒充。                                                                                                        |
+| HTTP      | TLS（生产）或显式 loopback-test 模式、HMAC verifier、单 packet multipart、幂等 job、heartbeat、cursor events、approval resume、external binding reconnect；controller/target 任一断线都只找回原 job，四窗口和 lazy event stream 全部无 socket/request writer/staged sidecar 泄漏。 | 保持 11/13：两条跨协议 5-call flow 中一条嵌入 result-ready reply 丢失/重放且不增加 SDK call；1-call lost-target 覆盖 provider in-flight unknown；pre/post admission 为 0-call offline case。             |
+
+上述映射不修改 9.14 的 standalone 24/24、Worker 19/21、Process 19/21、HTTP 11/13、BullMQ 15/16、Docker 15/16 和 Core full 110/112；总计仍必须精确为 **213/223**。manifest、CLI acknowledgement 或 ledger 若因新增 C7c case 变成其他合计，必须在读取 `ARK_API_KEY`、创建 Model、target registry 或运行 Skill script 前失败。
+
+#### 12.2.4 HTTP 单包 multipart 与 HMAC-SHA256 v1 负例
+
+HTTP sidecar 固定为一次已签名的 `multipart/mixed` packet，不提供先传 artifact 再发 frame、单独 raw sidecar route 或客户端可选两阶段协议。第一 part 的 `Content-Type` 必须精确为 `application/vnd.maneeagent.packet+json`，body 是 closed packet JSON；`frame` 必须是已经序列化的 RPC frame 字符串，不能是嵌套 JSON object：
+
+```json
+{ "version": "1", "frame": "<serialized-rpc-frame>", "sidecars": [] }
+```
+
+`sidecars` 非空时包含既有 closed descriptor object。其余 part 必须按 descriptor 顺序逐一携带原始 binary，`Content-ID` 与对应 sidecar ID 精确一致。所有 part 都使用固定 header allowlist；禁止 nested multipart、MIME `Content-Transfer-Encoding` 或其他 transfer-encoding 语义和未知 part header。descriptor 仍受单件 32 MiB、每 packet 8 件、合计 128 MiB 限制；HTTP parser 自身还要在分配/落盘前限制累计 body 与 header/boundary 开销。`Manee-Body-SHA256` 覆盖未经重序列化的完整 multipart raw body。只有 body digest/HMAC、closed JSON、所有 part、count/order/ID/length/SHA-256 和 limits 全部通过后，才能一次性把 owned sidecars 交给 Peer；任一失败都要求 `Peer.receive=0`、target/Model/Core/StateStore 调用=0、artifact stage/put/残留=0。
+
+| ID            | multipart/route 反例                                                                                                                                                                                           | Oracle                                                                                                                                                       |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| C7C-HTTP-MP01 | 缺/错 `multipart/mixed` boundary；首 part Content-Type 不是精确 `application/vnd.maneeagent.packet+json`；packet version/frame/sidecars 缺失或有额外字段；`frame` 非 string；JSON 重复 key/超深/超 nodes。     | 在 Peer 前返回固定安全 protocol error；不尝试宽松 JSON、把 nested object 当 frame、content sniffing、base64 fallback 或第二条 route。                        |
+| C7C-HTTP-MP02 | binary part 少/多/乱序、重复或未知 `Content-ID`、descriptor 重复、part media type 不符、零件声明但无 bytes、无 descriptor 却附加 bytes；nested multipart、MIME/part transfer-encoding 或任一未知 part header。 | 整 packet 原子失败；已读临时 bytes 立即清理，不能 decode transfer encoding、递归解析 multipart、忽略 header、留下部分 stage 或让 frame 先执行。              |
+| C7C-HTTP-MP03 | 单件/件数/合计恰好等于上限通过；任一超 1 byte/1 件、声明 length 与实际不符、截断、trailing bytes、sidecar SHA-256 不符。                                                                                       | 越界/不完整在 Peer 前失败；不得截断、忽略尾部、只信 `Content-Length` 或分批提交。                                                                            |
+| C7C-HTTP-MP04 | 发送后 mutation、Proxy/伪 typed array 由发送端 sidecar guard 拒绝；raw body 任一 boundary、CRLF、part header、JSON key order 或 binary byte 被未重新签名地篡改。                                               | 发送端仍只产生 owned copy；接收端 body digest/HMAC 失败且 Core=0。即使测试用可信 key 对结构非法 body 重新签名，multipart closed validator 仍失败且零 stage。 |
+| C7C-HTTP-MP05 | 非法 method/未知 route、artifact upload/download 辅助 route、同 path 的 trailing slash/query 变体、把 binary 直接放 JSON/base64。                                                                              | 不做 route fallback/redirect/内容协商；在认证/route policy 定义的安全边界失败，绝不把相近路径解释成合法 RPC。                                                |
+
+HMAC 必填 header 精确为 `Manee-Auth-Version: 1`、`Manee-Key-Id`、`Manee-Timestamp`、`Manee-Nonce`、`Manee-Body-SHA256`、`Manee-Signature`。canonical string 按以下字节序列构造，最后没有换行：
+
+```text
+MANEE-HMAC-SHA256-V1\nkeyId\ntimestamp\nnonce\nMETHOD\npath\nbodyDigest
+```
+
+`METHOD` 必须是 uppercase；收到的 raw path 自身必须已经是 route table 中唯一的 absolute canonical form，禁止 query、fragment、`%` 编码、反斜杠、`.`/`..` segment、重复 `/` 和 trailing `/`。服务端绝不能先 normalize、decode 或重写 path 再验签。`bodyDigest` 是完整 raw body 的 lowercase SHA-256 hex。timestamp 是无符号十进制 Unix 毫秒，默认窗口 `now ± 60_000 ms` 且两个边界都有效；nonce 是无 padding base64url，解码后 16～64 bytes；配置 key 至少 32 bytes；signature 是无 padding base64url HMAC-SHA256，解码后精确 32 bytes并 constant-time compare。replay cache 原子消费 `(keyId, nonce)`，TTL 固定 120 秒。
+
+| ID              | HMAC/authorization 反例                                                                                                                                                         | Oracle                                                                                                                                                                                                             |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| C7C-HTTP-AUTH01 | 六 header 任一缺失/重复/合并多值/含前后空白或控制字符，Auth-Version 非 `1`，timestamp 使用 `+`/负数/小数/指数/前导零，digest 非 64 位 lowercase hex。                           | verifier 统一安全 401，响应不区分原因；route handler、multipart parser、Peer、target registry、Model gateway 和 Core 调用均为 0。                                                                                  |
+| C7C-HTTP-AUTH02 | canonical method 大小写变化，raw path 添加 query/fragment/百分号编码/反斜杠/dot segment/重复 slash/trailing slash，交换 canonical 行、添加尾换行，body boundary/byte 变化。     | 未重签名时 signature/digest 失败；即使使用测试 key 重签，非 canonical raw method/path 仍拒绝。服务端必须按收到的 raw path 验证，绝不能先 decode/normalize/rewrite，也不得让代理重写产生第二种有效 canonical form。 |
+| C7C-HTTP-AUTH03 | timestamp 恰好 `now-60_000` 与 `now+60_000` 通过；`±60_001`、非整数、溢出或解析后精度丢失失败。                                                                                 | ManualClock 下边界确定；失败不消费 replay nonce、不进入 authorize/Core。                                                                                                                                           |
+| C7C-HTTP-AUTH04 | nonce 非 base64url/有 padding/解码少于 16 或多于 64 bytes；key 配置少于 32 bytes；signature 非 base64url/有 padding/不等于 32 bytes；未知 keyId、错 body digest、错 signature。 | 弱 key 在 server init/listen 前失败；请求侧所有 verifier failure 对外仍是相同 401。signature 比较只对固定 32-byte buffers做 constant-time compare，不因首个错误 byte 位置改变可观察分类。                          |
+| C7C-HTTP-AUTH05 | 同 `(keyId, nonce)` 顺序重放、并发 100 次重放、body/method/path 不同但 nonce 相同、两个 server 实例同时消费。                                                                   | distributed/loopback atomic cache 精确一个 winner，其余统一 401；TTL=120 秒内不能因 timestamp/body变化复用。内存 cache 只能在显式 loopback/test profile 使用，不能产生 production L6 passed 证据。                 |
+| C7C-HTTP-AUTH06 | authentication 成功但 principal 无 owner session/method 权限、猜中另一 session/task、授权在验签后撤销；TLS 缺失或 production handler 被配置为 loopback verifier。               | `authorize(authContext, ownerSessionId, method)` 在 Peer/Core 前执行；denial 使用固定不枚举资源的安全响应且 Core=0。production 启动必须 fail closed，模型选择的 Executor 或 sessionId 本身不构成认证/授权。        |
+| C7C-HTTP-AUTH07 | 错 key、错签名、过期、未来时间、replay、body tamper 的 stdout/stderr、access log、event、trace 和 HTTP response 扫描。                                                          | 只记录固定分类、request correlation digest和状态；不得记录 header value、canonical string、raw body、nonce、signature、key material、session/task existence、provider payload 或内部 stack。                       |
+
+C7c manifest 至少拆分 `C7-TARGET-REGISTRY`、`C7-BRIDGE`、`C7-MODEL-GATEWAY`、`C7-WORKER`、`C7-PROCESS`、`C7-HTTP`、`C7-AUTH` 与 `C7-PACK`，并把上表每个 ID 映射到 literal `acceptanceIt(caseId, variant, fn)`、真实进程 reporter 或 Ark scenario。L1/L2 unit/conformance 可进入默认无网络 `pnpm test`；真实 Worker/Process crash 与 HTTP loopback 进入 Phase 2 offline shard；Chat/Responses Fake SDK 进入 L4；Ark placement 只有在显式 key/ack 和精确 ledger 下进入 L5。缺任一 variant 是未完成 requirement，不是 skip/pass。
+
 ## 13. 故障注入矩阵
 
 测试私有 failpoint：
@@ -799,13 +915,17 @@ Phase 3 Docker Compose 必须同时启动 PostgreSQL、Redis、MinIO、HTTP work
 | F13 | queue/Model/Tool/summary/recovery 各阶段 abort             | 单一终态、无 retry、资源释放。                                                                                                                                             |
 | F14 | catalog snapshot 后 availability revision 改变             | Router 二次校验且无 fallback。                                                                                                                                             |
 | F15 | budget reserve/settle 前后、并发 siblings 同时到边界       | ledger 不超卖，budget 事件与终态原子。                                                                                                                                     |
+| F16 | placement packet 同步 admission 前                         | sequence/job/runner/checkpoint/provider 均为 0；同 operation 可安全重试，无 tombstone 或 lazy handle。                                                                     |
+| F17 | placement packet admitted 后、binding/checkpoint ACK 前    | 原 operation ID/hash 幂等重放，task/job 各至多 1且 provider=0；冲突 payload 失败，不创建替代 job。                                                                         |
+| F18 | provider `prepared -> in_flight` CAS 后、result_ready 前   | 分别注入 SDK create 前 crash（SDK=0）与 SDK 已启动后 crash（SDK=1）；两者都 failed + `outcomeUnknown=true`、attempt 不返还且不自动重发，只允许 host retry 新 task。        |
+| F19 | normalized Model result/hash 已记录、reply/target ACK 前   | 重放原 result且 provider exactly once；随后继续 F08/F09，不覆盖结果、不回滚为 unknown。                                                                                    |
 
 failpoint 按 capability/phase 选择，不要求不存在的能力伪造通过：
 
 - Core recording/Memory：F01-F10、F13-F15；same-process 不宣称 WAL/remote 语义。
 - Atomic File + 真实 child process：F01-F11、F13-F15。
-- Phase 2 Remote template：F01、F02、F08、F09、F12-F15。
-- 真实方舟只复用与模型可见流程有关的 F04-F06、F08-F10、F13-F15；存储原子性仍以 L1-L3 为权威。
+- Phase 2 Worker/Process/HTTP：F01、F02、F08、F09、F12-F19；三种 placement 都必须分别覆盖 F16-F19，不能用 Core Peer unit test 替代 adapter/OS/network evidence。
+- 真实方舟只复用与模型可见流程有关的 F04-F06、F08-F10、F13-F15、F18-F19；F16-F17 是零 provider 调用的 Phase 2 offline 证据，存储原子性仍以 L1-L3 为权威。
 
 WAL 或 remote 专属点因 descriptor 不支持而不运行时，acceptance report 记录固定 `unsupported_by_descriptor` variant，不使用普通 Vitest skip 掩盖缺口。每个实际启用的 failpoint 都必须证明无重复任务/副作用、无半事务、无替代 create/fallback。
 
