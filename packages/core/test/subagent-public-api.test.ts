@@ -15,6 +15,9 @@ import {
   OPENAI_RESPONSES_CHECKPOINT_CODEC,
   RESOURCE_NOT_FOUND_ERROR,
   SUBAGENT_ERROR_CODES,
+  SUBAGENT_TRANSPORT_CONTROL_METHODS,
+  SUBAGENT_TRANSPORT_RPC_KINDS,
+  SubAgentTransportPeer,
   SubAgentRuntimeError,
   TERMINAL_SUBAGENT_TASK_STATES,
   assertArtifactReference,
@@ -23,6 +26,10 @@ import {
   canonicalJsonSha256,
   canonicalizeJson,
   createResourceNotFoundError,
+  createSubAgentTransportArtifactSidecar,
+  createSubAgentTransportControlDispatcher,
+  createSubAgentTransportPeerWriterAdmission,
+  createSubAgentTransportRpcEnvelope,
   createStoredTaskIdempotently,
   commitRuntimeStateMutation,
   defineSubAgent,
@@ -46,10 +53,26 @@ import {
   type RuntimeStateMutation,
   type SubAgentChildRunner,
   type SubAgentDefinition,
+  type SubAgentErrorDescriptor,
   type SubAgentExecutionControl,
   type SubAgentExecutor,
   type SubAgentRuntime,
   type SubAgentTaskHandle,
+  type SubAgentTransportArtifactSidecar,
+  type SubAgentTransportControlExchangeContext,
+  type SubAgentTransportControlReply,
+  type SubAgentTransportControlRequest,
+  type SubAgentTransportExecutionOutcome,
+  type SubAgentTransportExecutorOperationResult,
+  type SubAgentTransportFailureInput,
+  type SubAgentTransportPeerPacket,
+  type SubAgentTransportPeerWriterAdmission,
+  type SubAgentTransportRpcEnvelope,
+  type SubAgentTransportRpcReplyEnvelope,
+  type SubAgentTransportRpcRequestEnvelope,
+  type SubAgentTransportSafeError,
+  type SubAgentTransportTaskResult,
+  type SubAgentTransportTaskSnapshot,
   type ToolRuntimeContext,
 } from '../src';
 
@@ -65,6 +88,9 @@ const publicValues = [
   OPENAI_RESPONSES_CHECKPOINT_CODEC,
   RESOURCE_NOT_FOUND_ERROR,
   SUBAGENT_ERROR_CODES,
+  SUBAGENT_TRANSPORT_CONTROL_METHODS,
+  SUBAGENT_TRANSPORT_RPC_KINDS,
+  SubAgentTransportPeer,
   SubAgentRuntimeError,
   TERMINAL_SUBAGENT_TASK_STATES,
   assertArtifactReference,
@@ -73,6 +99,10 @@ const publicValues = [
   canonicalJsonSha256,
   canonicalizeJson,
   createResourceNotFoundError,
+  createSubAgentTransportArtifactSidecar,
+  createSubAgentTransportControlDispatcher,
+  createSubAgentTransportPeerWriterAdmission,
+  createSubAgentTransportRpcEnvelope,
   createStoredTaskIdempotently,
   commitRuntimeStateMutation,
   defineSubAgent,
@@ -103,12 +133,49 @@ type PublicContractTypes =
   | SubAgentExecutor
   | SubAgentRuntime
   | SubAgentTaskHandle
+  | SubAgentTransportArtifactSidecar
+  | SubAgentTransportControlExchangeContext
+  | SubAgentTransportControlReply
+  | SubAgentTransportControlRequest
+  | SubAgentTransportExecutionOutcome
+  | SubAgentTransportExecutorOperationResult
+  | SubAgentTransportFailureInput
+  | SubAgentTransportPeerPacket
+  | SubAgentTransportPeerWriterAdmission
+  | SubAgentTransportRpcEnvelope
+  | SubAgentTransportRpcReplyEnvelope
+  | SubAgentTransportRpcRequestEnvelope
+  | SubAgentTransportSafeError
+  | SubAgentTransportTaskResult
+  | SubAgentTransportTaskSnapshot
   | ToolRuntimeContext;
 
 void (undefined as PublicContractTypes | undefined);
 
+const transportFailureMustNotExposeEventCursor: SubAgentTransportFailureInput = {
+  status: 'failed',
+  error: {
+    code: 'EXECUTOR_FAILED',
+    message: 'The child execution failed.',
+    retryable: false,
+    // @ts-expect-error -- event cursors remain host-local and are not part of the public wire.
+    eventCursor: 3,
+  },
+};
+void transportFailureMustNotExposeEventCursor;
+
+function assertHostErrorRequiresProjection(
+  hostErrorWithOptionalEventCursor: SubAgentErrorDescriptor,
+): void {
+  // @ts-expect-error -- host descriptors cannot be assigned to the wire even when the cursor is absent at runtime.
+  const transportErrorMustBeExplicitlyProjected: SubAgentTransportSafeError =
+    hostErrorWithOptionalEventCursor;
+  void transportErrorMustBeExplicitlyProjected;
+}
+void assertHostErrorRequiresProjection;
+
 describe('Subagent v2 package root', () => {
-  it('exports the implemented C2-C3 runtime values from the public root', () => {
+  it('exports the implemented runtime and transport values from the public root', () => {
     expect(publicValues.every((value) => value !== undefined)).toBe(true);
   });
 

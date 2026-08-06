@@ -1068,11 +1068,56 @@
     },
     {
       "requirementId": "C7-TRANSPORT",
-      "status": "planned",
+      "status": "implemented",
       "phase": "phase-2",
       "requiredLayers": ["L1"],
-      "requiredVariants": ["rpc-control", "rpc-outcome", "artifact-sidecar"],
-      "cases": []
+      "requiredVariants": ["rpc-control", "rpc-outcome", "artifact-sidecar", "rpc-peer"],
+      "cases": [
+        {
+          "caseId": "C7-TRANSPORT-05.l1.rpc-control",
+          "variant": "rpc-control",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-control.test.ts",
+            "testName": "[acceptance:C7-TRANSPORT-05.l1.rpc-control][variant:rpc-control]"
+          }
+        },
+        {
+          "caseId": "C7-TRANSPORT-06.l1.rpc-outcome",
+          "variant": "rpc-outcome",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-rpc.test.ts",
+            "testName": "[acceptance:C7-TRANSPORT-06.l1.rpc-outcome][variant:rpc-outcome]"
+          }
+        },
+        {
+          "caseId": "C7-TRANSPORT-07.l1.artifact-sidecar",
+          "variant": "artifact-sidecar",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-sidecar.test.ts",
+            "testName": "[acceptance:C7-TRANSPORT-07.l1.artifact-sidecar][variant:artifact-sidecar]"
+          }
+        },
+        {
+          "caseId": "C7-TRANSPORT-08.l1.rpc-peer",
+          "variant": "rpc-peer",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-peer.test.ts",
+            "testName": "[acceptance:C7-TRANSPORT-08.l1.rpc-peer][variant:rpc-peer]"
+          }
+        }
+      ]
     },
     {
       "requirementId": "PHASE-1",

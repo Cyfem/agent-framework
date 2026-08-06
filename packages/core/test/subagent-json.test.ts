@@ -100,6 +100,19 @@ describe('strict JSON-safe validation', () => {
     );
   });
 
+  it('enforces structural limits for in-memory JSON values without rejecting shared references', () => {
+    const shared = { proof: true };
+    const value = { items: [shared, shared] };
+
+    expect(() => assertJsonValue(value, { maxDepth: 3, maxNodes: 6 })).not.toThrow();
+    expect(() => assertJsonValue(value, { maxDepth: 2 })).toThrowError(
+      expect.objectContaining({ reason: 'depth-limit-exceeded' }),
+    );
+    expect(() => assertJsonValue(value, { maxNodes: 5 })).toThrowError(
+      expect.objectContaining({ reason: 'node-limit-exceeded' }),
+    );
+  });
+
   it('reports the precise nested path without reading the invalid value', () => {
     const candidate = { outer: [{ value: undefined }] };
 
@@ -150,6 +163,38 @@ describe('duplicate-aware JSON parsing', () => {
       expect(() => parseJsonValue(source)).toThrowError(
         expect.objectContaining({ reason: 'invalid-syntax' }),
       );
+    }
+  });
+
+  it('enforces parser depth before recursively expanding hostile JSON', () => {
+    expect(parseJsonValue('{"items":[1]}', { maxDepth: 2 })).toEqual({ items: [1] });
+    expect(() => parseJsonValue('{"items":[1]}', { maxDepth: 1 })).toThrowError(
+      expect.objectContaining({
+        reason: 'depth-limit-exceeded',
+        path: '$["items"][0]',
+      }),
+    );
+
+    const hostile = `${'['.repeat(10_000)}0${']'.repeat(10_000)}`;
+    expect(() => parseJsonValue(hostile, { maxDepth: 128 })).toThrowError(
+      expect.objectContaining({ reason: 'depth-limit-exceeded' }),
+    );
+  });
+
+  it('counts every parsed JSON value against the configured node limit', () => {
+    expect(parseJsonValue('{"items":[1]}', { maxNodes: 3 })).toEqual({ items: [1] });
+    expect(() => parseJsonValue('{"items":[1]}', { maxNodes: 2 })).toThrowError(
+      expect.objectContaining({
+        reason: 'node-limit-exceeded',
+        path: '$["items"][0]',
+      }),
+    );
+  });
+
+  it('rejects invalid parser structural limits before reading input', () => {
+    for (const value of [-1, 1.5, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => parseJsonValue('null', { maxDepth: value })).toThrowError(TypeError);
+      expect(() => parseJsonValue('null', { maxNodes: value })).toThrowError(TypeError);
     }
   });
 });

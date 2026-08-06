@@ -23,10 +23,16 @@ export type JsonValueErrorReason =
   | 'cyclic-reference'
   | 'invalid-syntax'
   | 'duplicate-key'
+  | 'depth-limit-exceeded'
+  | 'node-limit-exceeded'
   | 'byte-limit-exceeded';
 
 export interface JsonValueBoundaryOptions {
   readonly maxBytes?: number;
+  /** Optional structural limit; the root value has depth zero. */
+  readonly maxDepth?: number;
+  /** Optional structural limit counting every expanded JSON value. */
+  readonly maxNodes?: number;
   readonly label?: string;
 }
 
@@ -239,7 +245,74 @@ function normalizeBoundaryOptions(
   ) {
     throw new TypeError('maxBytes must be a non-negative safe integer.');
   }
+  for (const [label, value] of [
+    ['maxDepth', normalized.maxDepth],
+    ['maxNodes', normalized.maxNodes],
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new TypeError(`${label} must be a non-negative safe integer.`);
+    }
+  }
   return normalized;
+}
+
+function assertJsonStructuralLimits(value: unknown, options: JsonValueBoundaryOptions): void {
+  if (options.maxDepth === undefined && options.maxNodes === undefined) return;
+
+  type WorkItem =
+    | {
+        readonly type: 'value';
+        readonly value: unknown;
+        readonly path: string;
+        readonly depth: number;
+      }
+    | { readonly type: 'leave'; readonly value: object };
+  const work: WorkItem[] = [{ type: 'value', value, path: '$', depth: 0 }];
+  const active = new WeakSet<object>();
+  let nodes = 0;
+
+  while (work.length > 0) {
+    const item = work.pop() as WorkItem;
+    if (item.type === 'leave') {
+      active.delete(item.value);
+      continue;
+    }
+
+    nodes += 1;
+    if (options.maxNodes !== undefined && nodes > options.maxNodes) {
+      valueError(
+        'node-limit-exceeded',
+        `JSON value exceeds the configured node limit ${options.maxNodes}`,
+        item.path,
+      );
+    }
+    if (options.maxDepth !== undefined && item.depth > options.maxDepth) {
+      valueError(
+        'depth-limit-exceeded',
+        `JSON value exceeds the configured depth limit ${options.maxDepth}`,
+        item.path,
+      );
+    }
+    if (typeof item.value !== 'object' || item.value === null || nodeTypes.isProxy(item.value)) {
+      continue;
+    }
+    if (active.has(item.value)) continue;
+
+    active.add(item.value);
+    work.push({ type: 'leave', value: item.value });
+    const keys = Reflect.ownKeys(item.value);
+    for (let index = keys.length - 1; index >= 0; index -= 1) {
+      const key = keys[index] as PropertyKey;
+      if (typeof key !== 'string' || (Array.isArray(item.value) && key === 'length')) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(item.value, key);
+      if (descriptor?.enumerable !== true || !('value' in descriptor)) continue;
+      const path =
+        Array.isArray(item.value) && ARRAY_INDEX.test(key)
+          ? arrayPath(item.path, Number(key))
+          : propertyPath(item.path, key);
+      work.push({ type: 'value', value: descriptor.value, path, depth: item.depth + 1 });
+    }
+  }
 }
 
 function serializeValidated(value: JsonValue): string {
@@ -287,6 +360,7 @@ export function assertJsonValue(
   options?: number | JsonValueBoundaryOptions,
 ): asserts value is JsonValue {
   const normalized = normalizeBoundaryOptions(options);
+  assertJsonStructuralLimits(value, normalized);
   validateJsonValue(value, '$', new Set());
 
   if (normalized.maxBytes !== undefined) {
@@ -330,12 +404,17 @@ export function assertJsonByteLimit(
 
 class DuplicateAwareJsonParser {
   #index = 0;
+  #nodes = 0;
 
-  constructor(private readonly source: string) {}
+  constructor(
+    private readonly source: string,
+    private readonly maxDepth: number | undefined,
+    private readonly maxNodes: number | undefined,
+  ) {}
 
   parse(): JsonValue {
     this.#skipWhitespace();
-    const value = this.#parseValue('$');
+    const value = this.#parseValue('$', 0);
     this.#skipWhitespace();
     if (this.#index !== this.source.length) {
       this.#fail('invalid-syntax', 'Unexpected trailing JSON input');
@@ -343,11 +422,26 @@ class DuplicateAwareJsonParser {
     return value;
   }
 
-  #parseValue(path: string): JsonValue {
+  #parseValue(path: string, depth: number): JsonValue {
+    if (this.maxDepth !== undefined && depth > this.maxDepth) {
+      this.#fail(
+        'depth-limit-exceeded',
+        `JSON value exceeds the configured depth limit ${this.maxDepth}`,
+        path,
+      );
+    }
+    this.#nodes += 1;
+    if (this.maxNodes !== undefined && this.#nodes > this.maxNodes) {
+      this.#fail(
+        'node-limit-exceeded',
+        `JSON value exceeds the configured node limit ${this.maxNodes}`,
+        path,
+      );
+    }
     const current = this.source[this.#index];
     if (current === '"') return this.#parseString(path);
-    if (current === '{') return this.#parseObject(path);
-    if (current === '[') return this.#parseArray(path);
+    if (current === '{') return this.#parseObject(path, depth);
+    if (current === '[') return this.#parseArray(path, depth);
     if (current === 't') return this.#parseLiteral('true', true);
     if (current === 'f') return this.#parseLiteral('false', false);
     if (current === 'n') return this.#parseLiteral('null', null);
@@ -441,7 +535,7 @@ class DuplicateAwareJsonParser {
     this.#fail('invalid-syntax', 'Unterminated JSON string', path);
   }
 
-  #parseArray(path: string): JsonValue[] {
+  #parseArray(path: string, depth: number): JsonValue[] {
     this.#index += 1;
     this.#skipWhitespace();
     const result: JsonValue[] = [];
@@ -451,7 +545,7 @@ class DuplicateAwareJsonParser {
     }
 
     while (true) {
-      result.push(this.#parseValue(arrayPath(path, result.length)));
+      result.push(this.#parseValue(arrayPath(path, result.length), depth + 1));
       this.#skipWhitespace();
       const separator = this.source[this.#index];
       this.#index += 1;
@@ -462,7 +556,7 @@ class DuplicateAwareJsonParser {
     }
   }
 
-  #parseObject(path: string): { [key: string]: JsonValue } {
+  #parseObject(path: string, depth: number): { [key: string]: JsonValue } {
     this.#index += 1;
     this.#skipWhitespace();
     const result: { [key: string]: JsonValue } = {};
@@ -492,7 +586,7 @@ class DuplicateAwareJsonParser {
       }
       this.#index += 1;
       this.#skipWhitespace();
-      const value = this.#parseValue(childPath);
+      const value = this.#parseValue(childPath, depth + 1);
       Object.defineProperty(result, key, {
         value,
         enumerable: true,
@@ -534,7 +628,12 @@ export function parseJsonValue(
   if (typeof source !== 'string') {
     throw new TypeError('parseJsonValue source must be a string.');
   }
-  const value = new DuplicateAwareJsonParser(source).parse();
-  assertJsonValue(value, options);
+  const normalized = normalizeBoundaryOptions(options);
+  const value = new DuplicateAwareJsonParser(
+    source,
+    normalized.maxDepth,
+    normalized.maxNodes,
+  ).parse();
+  assertJsonValue(value, normalized);
   return value;
 }

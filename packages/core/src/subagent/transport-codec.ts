@@ -26,6 +26,7 @@ import {
   type CreateSubAgentExecutionRequestWireOptions,
   type ReconstructSubAgentExecutionRequestOptions,
   type SubAgentExecutionRequestWire,
+  type SubAgentExecutionRequestReconstruction,
   type SubAgentExecutionRequestWireValidationOptions,
   type SubAgentTransportEnvelope,
   type SubAgentTransportErrorReason,
@@ -66,10 +67,27 @@ interface ResolvedExecutionWireValidationOptions {
   readonly maxBindingBytes: number;
 }
 
+interface ResolvedTransportFrameOptions {
+  readonly maxFrameBytes: number;
+  readonly maxJsonDepth: number;
+  readonly maxJsonNodes: number;
+}
+
 /** Validates an in-memory transport envelope without serializing or invoking an Executor. */
 export function assertSubAgentTransportEnvelope(
   value: unknown,
+  options: SubAgentTransportFrameOptions = {},
 ): asserts value is SubAgentTransportEnvelope {
+  const resolved = resolveFrameOptions(options);
+  assertJsonComplexity(
+    value,
+    resolved.maxJsonDepth,
+    resolved.maxJsonNodes,
+    (message) => {
+      throw transportError('invalid-envelope', message);
+    },
+    'Subagent transport envelope',
+  );
   try {
     assertJsonValue(value);
   } catch (error) {
@@ -109,9 +127,10 @@ export function encodeSubAgentTransportFrame(
   envelope: unknown,
   options: SubAgentTransportFrameOptions = {},
 ): string {
-  assertSubAgentTransportEnvelope(envelope);
+  const resolved = resolveFrameOptions(options);
+  assertSubAgentTransportEnvelope(envelope, resolved);
   const frame = canonicalizeJson(envelope as unknown as JsonValue);
-  assertFrameByteLimit(textEncoder.encode(frame).byteLength, resolveFrameLimit(options));
+  assertFrameByteLimit(textEncoder.encode(frame).byteLength, resolved.maxFrameBytes);
   return frame;
 }
 
@@ -131,7 +150,8 @@ export function decodeSubAgentTransportFrame(
   frame: string | Uint8Array,
   options: SubAgentTransportFrameOptions = {},
 ): SubAgentTransportEnvelope {
-  const maxFrameBytes = resolveFrameLimit(options);
+  const resolved = resolveFrameOptions(options);
+  const maxFrameBytes = resolved.maxFrameBytes;
   let source: string;
 
   if (typeof frame === 'string') {
@@ -153,7 +173,10 @@ export function decodeSubAgentTransportFrame(
 
   let value: JsonValue;
   try {
-    value = parseJsonValue(source);
+    value = parseJsonValue(source, {
+      maxDepth: resolved.maxJsonDepth,
+      maxNodes: resolved.maxJsonNodes,
+    });
   } catch (error) {
     throw transportError(
       'invalid-frame',
@@ -161,7 +184,7 @@ export function decodeSubAgentTransportFrame(
       error,
     );
   }
-  assertSubAgentTransportEnvelope(value);
+  assertSubAgentTransportEnvelope(value, resolved);
   return deepFreezeJson(value) as unknown as SubAgentTransportEnvelope;
 }
 
@@ -266,7 +289,7 @@ export function decodeSubAgentExecutionRequestWire(
 export function reconstructSubAgentExecutionRequest<I extends JsonValue = JsonValue>(
   value: SubAgentExecutionRequestWire<I> | unknown,
   options: ReconstructSubAgentExecutionRequestOptions,
-): SubAgentExecutionRequest<I> {
+): SubAgentExecutionRequestReconstruction<I> {
   const wire = decodeSubAgentExecutionRequestWire(
     value,
     options,
@@ -310,26 +333,35 @@ export function reconstructSubAgentExecutionRequest<I extends JsonValue = JsonVa
       'Subagent execution timeout signal factory must return an AbortSignal.',
     );
   }
-  let signal: AbortSignal;
-  try {
-    signal = AbortSignal.any([options.signal, timeoutSignal]);
-  } catch (error) {
+  const combinedController = new AbortController();
+  const signal = combinedController.signal;
+  let disposed = false;
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
+    options.signal.removeEventListener('abort', onReceiverAbort);
+    timeoutSignal.removeEventListener('abort', onTimeoutAbort);
     disposeTimeout?.();
-    throw transportError(
-      'invalid-execution-request',
-      'Subagent execution cancellation signals could not be combined.',
-      error,
-    );
   }
-  if (disposeTimeout !== undefined) {
-    if (signal.aborted) {
-      disposeTimeout();
-    } else {
-      signal.addEventListener('abort', disposeTimeout, { once: true });
-    }
+  function forwardAbort(source: AbortSignal): void {
+    if (!signal.aborted) combinedController.abort(source.reason);
+    dispose();
   }
-
-  return Object.freeze({
+  function onReceiverAbort(): void {
+    forwardAbort(options.signal);
+  }
+  function onTimeoutAbort(): void {
+    forwardAbort(timeoutSignal);
+  }
+  if (options.signal.aborted) {
+    forwardAbort(options.signal);
+  } else if (timeoutSignal.aborted) {
+    forwardAbort(timeoutSignal);
+  } else {
+    options.signal.addEventListener('abort', onReceiverAbort, { once: true });
+    timeoutSignal.addEventListener('abort', onTimeoutAbort, { once: true });
+  }
+  const request = Object.freeze({
     operation: wire.operation,
     ownerSessionId: wire.ownerSessionId,
     runId: wire.runId,
@@ -349,6 +381,8 @@ export function reconstructSubAgentExecutionRequest<I extends JsonValue = JsonVa
     signal,
     deadlineAt,
   });
+
+  return Object.freeze({ request, dispose });
 }
 
 /**
@@ -1979,7 +2013,13 @@ function resolveExecutionWireValidationOptions(
   });
 }
 
-function assertJsonComplexity(value: unknown, maxDepth: number, maxNodes: number): void {
+function assertJsonComplexity(
+  value: unknown,
+  maxDepth: number,
+  maxNodes: number,
+  reject: (message: string) => never = invalidExecution,
+  label = 'Subagent execution request',
+): void {
   type WorkItem =
     | { readonly type: 'value'; readonly value: unknown; readonly depth: number }
     | { readonly type: 'leave'; readonly value: object };
@@ -1996,17 +2036,17 @@ function assertJsonComplexity(value: unknown, maxDepth: number, maxNodes: number
     }
     nodes += 1;
     if (nodes > maxNodes) {
-      invalidExecution(`Subagent execution request exceeds the ${maxNodes}-node JSON limit.`);
+      reject(`${label} exceeds the ${maxNodes}-node JSON limit.`);
     }
     if (item.depth > maxDepth) {
-      invalidExecution(`Subagent execution request exceeds the JSON depth limit ${maxDepth}.`);
+      reject(`${label} exceeds the JSON depth limit ${maxDepth}.`);
     }
     if (typeof item.value !== 'object' || item.value === null) continue;
     if (nodeTypes.isProxy(item.value)) {
-      invalidExecution('Subagent execution request cannot contain Proxy objects.');
+      reject(`${label} cannot contain Proxy objects.`);
     }
     if (active.has(item.value)) {
-      invalidExecution('Subagent execution request cannot contain cyclic JSON values.');
+      reject(`${label} cannot contain cyclic JSON values.`);
     }
 
     active.add(item.value);
@@ -2059,12 +2099,22 @@ function resolveSequenceWindow(value: number | undefined): number {
   return resolved;
 }
 
-function resolveFrameLimit(options: SubAgentTransportFrameOptions): number {
+function resolveFrameOptions(
+  options: SubAgentTransportFrameOptions,
+): ResolvedTransportFrameOptions {
   const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_SUBAGENT_TRANSPORT_MAX_FRAME_BYTES;
-  if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes < 1) {
-    throw new RangeError('Subagent transport maxFrameBytes must be a positive safe integer.');
+  const maxJsonDepth = options.maxJsonDepth ?? DEFAULT_SUBAGENT_TRANSPORT_MAX_JSON_DEPTH;
+  const maxJsonNodes = options.maxJsonNodes ?? DEFAULT_SUBAGENT_TRANSPORT_MAX_JSON_NODES;
+  for (const [label, value] of [
+    ['maxFrameBytes', maxFrameBytes],
+    ['maxJsonDepth', maxJsonDepth],
+    ['maxJsonNodes', maxJsonNodes],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new RangeError(`Subagent transport ${label} must be a positive safe integer.`);
+    }
   }
-  return maxFrameBytes;
+  return Object.freeze({ maxFrameBytes, maxJsonDepth, maxJsonNodes });
 }
 
 function assertFrameByteLimit(actualBytes: number, maxFrameBytes: number): void {

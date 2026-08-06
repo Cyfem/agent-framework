@@ -312,11 +312,20 @@ function createConsumerSource(packageName) {
 import {
   Agent,
   SUBAGENT_TRANSPORT_VERSION,
+  SubAgentTransportPeer,
   SubAgentTransportSequenceTracker,
+  createSubAgentTransportArtifactSidecar,
+  createSubAgentTransportControlDispatcher,
+  createSubAgentTransportPeerWriterAdmission,
+  createSubAgentTransportRpcEnvelope,
   type AgentRunOutcome,
   type OpenAIChatProtocol,
   type SubAgentExecutionRequestWire,
   type SubAgentExecutorOperationResult,
+  type SubAgentTransportControlRequest,
+  type SubAgentTransportPeerPacket,
+  type SubAgentTransportPeerWriterAdmission,
+  type SubAgentTransportRpcEnvelope,
 } from '${packageName}';
 
 type IsAny<T> = 0 extends 1 & T ? true : false;
@@ -331,21 +340,44 @@ type CoreContractAssertions = [
   AssertFalse<IsAny<ConstructorParameters<typeof Agent>[0]>>,
   AssertFalse<IsAny<typeof SubAgentTransportSequenceTracker>>,
   AssertFalse<IsAny<ConstructorParameters<typeof SubAgentTransportSequenceTracker>>>,
+  AssertFalse<IsAny<typeof SubAgentTransportPeer>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof SubAgentTransportPeer>>>,
+  AssertFalse<IsAny<typeof createSubAgentTransportRpcEnvelope>>,
+  AssertFalse<IsAny<typeof createSubAgentTransportControlDispatcher>>,
+  AssertFalse<IsAny<typeof createSubAgentTransportPeerWriterAdmission>>,
+  AssertFalse<IsAny<typeof createSubAgentTransportArtifactSidecar>>,
   AssertFalse<IsAny<AgentRunOutcome<OpenAIChatProtocol>>>,
   AssertFalse<IsAny<SubAgentExecutionRequestWire>>,
   AssertFalse<IsAny<SubAgentExecutionRequestWire['input']>>,
   AssertFalse<IsAny<SubAgentExecutorOperationResult>>,
+  AssertFalse<IsAny<SubAgentTransportControlRequest>>,
+  AssertFalse<IsAny<SubAgentTransportPeerPacket>>,
+  AssertFalse<IsAny<SubAgentTransportPeerWriterAdmission>>,
+  AssertFalse<IsAny<SubAgentTransportRpcEnvelope>>,
   AssertTrue<Equal<SubAgentExecutionRequestWire['remainingMs'], number>>,
   AssertTrue<Equal<AgentRunOutcome<OpenAIChatProtocol>['status'], 'succeeded' | 'waiting_approval' | 'cancelled' | 'failed'>>,
   AssertTrue<Equal<SubAgentExecutorOperationResult['type'], 'terminal' | 'paused' | 'recovery_required'>>,
 ];
 
 const transportVersion: '1' = SUBAGENT_TRANSPORT_VERSION;
-const publicValues = [Agent, SubAgentTransportSequenceTracker, transportVersion] as const;
+const publicValues = [
+  Agent,
+  SubAgentTransportPeer,
+  SubAgentTransportSequenceTracker,
+  createSubAgentTransportArtifactSidecar,
+  createSubAgentTransportControlDispatcher,
+  createSubAgentTransportPeerWriterAdmission,
+  createSubAgentTransportRpcEnvelope,
+  transportVersion,
+] as const;
 export type PublicContracts =
   | AgentRunOutcome<OpenAIChatProtocol>
   | SubAgentExecutionRequestWire
-  | SubAgentExecutorOperationResult;
+  | SubAgentExecutorOperationResult
+  | SubAgentTransportControlRequest
+  | SubAgentTransportPeerPacket
+  | SubAgentTransportPeerWriterAdmission
+  | SubAgentTransportRpcEnvelope;
 declare const coreContractAssertions: CoreContractAssertions;
 void publicValues;
 void coreContractAssertions;
@@ -422,10 +454,20 @@ type CoreContractAssertions = [
   AssertFalse<IsAny<ConstructorParameters<typeof framework.Agent>[0]>>,
   AssertFalse<IsAny<typeof framework.SubAgentTransportSequenceTracker>>,
   AssertFalse<IsAny<ConstructorParameters<typeof framework.SubAgentTransportSequenceTracker>>>,
+  AssertFalse<IsAny<typeof framework.SubAgentTransportPeer>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof framework.SubAgentTransportPeer>>>,
+  AssertFalse<IsAny<typeof framework.createSubAgentTransportRpcEnvelope>>,
+  AssertFalse<IsAny<typeof framework.createSubAgentTransportControlDispatcher>>,
+  AssertFalse<IsAny<typeof framework.createSubAgentTransportPeerWriterAdmission>>,
+  AssertFalse<IsAny<typeof framework.createSubAgentTransportArtifactSidecar>>,
   AssertFalse<IsAny<framework.AgentRunOutcome<framework.OpenAIChatProtocol>>>,
   AssertFalse<IsAny<framework.SubAgentExecutionRequestWire>>,
   AssertFalse<IsAny<framework.SubAgentExecutionRequestWire['input']>>,
   AssertFalse<IsAny<framework.SubAgentExecutorOperationResult>>,
+  AssertFalse<IsAny<framework.SubAgentTransportControlRequest>>,
+  AssertFalse<IsAny<framework.SubAgentTransportPeerPacket>>,
+  AssertFalse<IsAny<framework.SubAgentTransportPeerWriterAdmission>>,
+  AssertFalse<IsAny<framework.SubAgentTransportRpcEnvelope>>,
   AssertTrue<Equal<framework.SubAgentExecutionRequestWire['remainingMs'], number>>,
   AssertTrue<Equal<framework.AgentRunOutcome<framework.OpenAIChatProtocol>['status'], 'succeeded' | 'waiting_approval' | 'cancelled' | 'failed'>>,
   AssertTrue<Equal<framework.SubAgentExecutorOperationResult['type'], 'terminal' | 'paused' | 'recovery_required'>>,
@@ -434,13 +476,22 @@ type CoreContractAssertions = [
 const transportVersion: '1' = framework.SUBAGENT_TRANSPORT_VERSION;
 const publicValues = [
   framework.Agent,
+  framework.SubAgentTransportPeer,
   framework.SubAgentTransportSequenceTracker,
+  framework.createSubAgentTransportArtifactSidecar,
+  framework.createSubAgentTransportControlDispatcher,
+  framework.createSubAgentTransportPeerWriterAdmission,
+  framework.createSubAgentTransportRpcEnvelope,
   transportVersion,
 ] as const;
 type PublicContracts =
   | framework.AgentRunOutcome<framework.OpenAIChatProtocol>
   | framework.SubAgentExecutionRequestWire
-  | framework.SubAgentExecutorOperationResult;
+  | framework.SubAgentExecutorOperationResult
+  | framework.SubAgentTransportControlRequest
+  | framework.SubAgentTransportPeerPacket
+  | framework.SubAgentTransportPeerWriterAdmission
+  | framework.SubAgentTransportRpcEnvelope;
 declare const coreContractAssertions: CoreContractAssertions;
 declare const publicContract: PublicContracts;
 void publicValues;
@@ -506,8 +557,13 @@ function createRuntimeSmokeSource(packageName, format) {
   if (packageName === '@ruixutong.manee/maneeagent-framework') {
     checks.push(
       `[packageApi.Agent, 'Agent', 'function']`,
+      `[packageApi.SubAgentTransportPeer, 'SubAgentTransportPeer', 'function']`,
       `[packageApi.SubAgentTransportSequenceTracker, 'SubAgentTransportSequenceTracker', 'function']`,
       `[packageApi.createSubAgentRuntime, 'createSubAgentRuntime', 'function']`,
+      `[packageApi.createSubAgentTransportArtifactSidecar, 'createSubAgentTransportArtifactSidecar', 'function']`,
+      `[packageApi.createSubAgentTransportControlDispatcher, 'createSubAgentTransportControlDispatcher', 'function']`,
+      `[packageApi.createSubAgentTransportPeerWriterAdmission, 'createSubAgentTransportPeerWriterAdmission', 'function']`,
+      `[packageApi.createSubAgentTransportRpcEnvelope, 'createSubAgentTransportRpcEnvelope', 'function']`,
     );
     return `${load}
 function expectType([value, name, expected]) {

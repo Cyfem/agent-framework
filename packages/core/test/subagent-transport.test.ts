@@ -427,6 +427,34 @@ describe('Subagent transport v1 envelope codec', () => {
     );
   });
 
+  it('bounds raw and in-memory frame structure before recursive validation', () => {
+    const hostilePayload = `${'['.repeat(10_000)}0${']'.repeat(10_000)}`;
+    const hostileFrame = `{"version":"1","channelId":"channel-1","sequence":1,"messageId":"message-1","kind":"event","payload":${hostilePayload}}`;
+    expectTransportReason(
+      () => decodeSubAgentTransportFrame(hostileFrame, { maxJsonDepth: 128 }),
+      'invalid-frame',
+    );
+
+    const nested = createEnvelope({ payload: { nested: [true] } });
+    expectTransportReason(
+      () => encodeSubAgentTransportFrame(nested, { maxJsonDepth: 2 }),
+      'invalid-envelope',
+    );
+    expectTransportReason(
+      () => decodeSubAgentTransportFrame(encodeSubAgentTransportFrame(nested), { maxJsonNodes: 5 }),
+      'invalid-frame',
+    );
+  });
+
+  it('rejects non-positive structural frame limit configuration', () => {
+    for (const value of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(() => encodeSubAgentTransportFrame(createEnvelope(), { maxJsonDepth: value })).toThrow(
+        RangeError,
+      );
+      expect(() => decodeSubAgentTransportFrame('{}', { maxJsonNodes: value })).toThrow(RangeError);
+    }
+  });
+
   it('recursively freezes decoded envelopes before they reach dispatch code', () => {
     const decoded = decodeSubAgentTransportFrame(
       encodeSubAgentTransportFrame(
@@ -575,7 +603,7 @@ describe('Subagent execution request transport wire', () => {
     const receiverController = new AbortController();
     const timeoutController = new AbortController();
     const timeoutRequests: number[] = [];
-    const reconstructed = reconstructSubAgentExecutionRequest(wire, {
+    const reconstruction = reconstructSubAgentExecutionRequest(wire, {
       signal: receiverController.signal,
       now: () => 50_000,
       timeoutSignalFactory(remainingMs) {
@@ -583,6 +611,7 @@ describe('Subagent execution request transport wire', () => {
         return timeoutController.signal;
       },
     });
+    const reconstructed = reconstruction.request;
     expect(reconstructed.deadlineAt).toBe(170_000);
     expect(timeoutRequests).toEqual([120_000]);
     expect(reconstructed.signal).not.toBe(receiverController.signal);
@@ -592,6 +621,8 @@ describe('Subagent execution request transport wire', () => {
     receiverController.abort('receiver-cancelled');
     expect(reconstructed.signal.aborted).toBe(true);
     expect(reconstructed.signal.reason).toBe('receiver-cancelled');
+    reconstruction.dispose();
+    reconstruction.dispose();
   });
 
   it('round-trips and freezes a resumable rich pending child batch exactly', () => {
@@ -624,11 +655,12 @@ describe('Subagent execution request transport wire', () => {
     expect(decoded.operation.checkpoint).toEqual(checkpoint);
     expect(decoded.operation.checkpoint).not.toBe(wire.operation.checkpoint);
 
-    const reconstructed = reconstructSubAgentExecutionRequest(decoded, {
+    const reconstruction = reconstructSubAgentExecutionRequest(decoded, {
       signal: new AbortController().signal,
       now: () => 5_000,
       timeoutSignalFactory: () => new AbortController().signal,
     });
+    const reconstructed = reconstruction.request;
     if (reconstructed.operation.type !== 'resume') {
       throw new Error('expected reconstructed resume operation');
     }
@@ -636,17 +668,19 @@ describe('Subagent execution request transport wire', () => {
     expect(reconstructed.operation.checkpoint.pendingBatch?.calls).toEqual(
       checkpoint.pendingBatch?.calls,
     );
+    reconstruction.dispose();
   });
 
   it('aborts reconstructed execution when its receiver-local timeout wins', () => {
     const wire = createSubAgentExecutionRequestWire(createExecutionRequest(), { now: () => 1_000 });
     const receiverController = new AbortController();
     const timeoutController = new AbortController();
-    const reconstructed = reconstructSubAgentExecutionRequest(wire, {
+    const reconstruction = reconstructSubAgentExecutionRequest(wire, {
       signal: receiverController.signal,
       now: () => 10_000,
       timeoutSignalFactory: () => timeoutController.signal,
     });
+    const reconstructed = reconstruction.request;
 
     timeoutController.abort(new DOMException('Timed out', 'TimeoutError'));
     expect(reconstructed.signal.aborted).toBe(true);
@@ -658,7 +692,7 @@ describe('Subagent execution request transport wire', () => {
     const cancelled = reconstructSubAgentExecutionRequest(wire, {
       signal: alreadyCancelled.signal,
       timeoutSignalFactory: () => new AbortController().signal,
-    });
+    }).request;
     expect(cancelled.signal.aborted).toBe(true);
     expect(cancelled.signal.reason).toBe('cancelled-before-reconstruction');
     expectTransportReason(
@@ -669,6 +703,49 @@ describe('Subagent execution request transport wire', () => {
         }),
       'invalid-execution-request',
     );
+  });
+
+  it('disposes receiver-local timeout resources idempotently after execution settles', () => {
+    vi.useFakeTimers();
+    try {
+      const wire = createSubAgentExecutionRequestWire(createExecutionRequest(), {
+        now: () => 1_000,
+      });
+      const reconstruction = reconstructSubAgentExecutionRequest(wire, {
+        signal: new AbortController().signal,
+        now: () => 10_000,
+      });
+
+      expect(vi.getTimerCount()).toBe(1);
+      reconstruction.dispose();
+      reconstruction.dispose();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(reconstruction.request.signal.aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('detaches both receiver and timeout cancellation listeners on disposal', () => {
+    const wire = createSubAgentExecutionRequestWire(createExecutionRequest(), {
+      now: () => 1_000,
+    });
+    const receiver = new AbortController();
+    const timeout = new AbortController();
+    const receiverRemoval = vi.spyOn(receiver.signal, 'removeEventListener');
+    const timeoutRemoval = vi.spyOn(timeout.signal, 'removeEventListener');
+    const reconstruction = reconstructSubAgentExecutionRequest(wire, {
+      signal: receiver.signal,
+      now: () => 10_000,
+      timeoutSignalFactory: () => timeout.signal,
+    });
+
+    reconstruction.dispose();
+    expect(receiverRemoval).toHaveBeenCalledWith('abort', expect.any(Function));
+    expect(timeoutRemoval).toHaveBeenCalledWith('abort', expect.any(Function));
+    receiver.abort('late-receiver-abort');
+    timeout.abort('late-timeout-abort');
+    expect(reconstruction.request.signal.aborted).toBe(false);
   });
 
   it('accepts remainingMs at 1 and the resolved timeout, rejecting expired and over-limit values', () => {
@@ -719,10 +796,11 @@ describe('Subagent execution request transport wire', () => {
           }),
           { now: () => 1_000 },
         );
-        const reconstructed = reconstructSubAgentExecutionRequest(wire, {
+        const reconstruction = reconstructSubAgentExecutionRequest(wire, {
           signal: new AbortController().signal,
           now: () => 10_000,
         });
+        const reconstructed = reconstruction.request;
 
         let pendingMs = remainingMs;
         while (pendingMs > maxTimerDelay) {
@@ -739,6 +817,7 @@ describe('Subagent execution request transport wire', () => {
         expect(reconstructed.signal.reason).toEqual(
           expect.objectContaining({ name: 'TimeoutError' }),
         );
+        reconstruction.dispose();
       }
     } finally {
       vi.useRealTimers();

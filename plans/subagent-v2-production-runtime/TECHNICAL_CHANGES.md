@@ -2,14 +2,14 @@
 
 ## 1. 文档状态
 
-- 设计状态：总体方向与 Phase 1 Oracle 已冻结；当前 checkout 已完成 C0～C6，正在实施 C7 Phase 2 transport/placement。
+- 设计状态：总体方向与 Phase 1 Oracle 已冻结；当前 checkout 已完成 C0～C6 和 C7 Core transport/RPC/control/Peer/artifact-sidecar 地基，正在实施 Phase 2 Worker/Process/HTTP placement。
 - 目标版本：Core 与所有公开 Executor/State/Artifact/Observability 包统一首发 `2.0.0`。
 - 实施范围：Phase 1 Core/Local、Phase 2 Worker/Process/HTTP Remote、Phase 3 PostgreSQL/BullMQ/Docker/S3/OTel、Compose、测试、demo 与文档迁移。
 - 明确排除：conversation handoff、active-agent 所有权转移、Core 内置云 transport 或认证系统。
 
 本文件细化 [PLAN.md](./PLAN.md) 中已经确认的设计。接口名称是实施基线；文件名可以在不改变职责边界和公共语义的前提下微调。分层测试、故障注入与真实方舟 Agent Plan 的逐项发布门禁见 [TEST_ACCEPTANCE_PLAN.md](./TEST_ACCEPTANCE_PLAN.md)。
 
-当前实现边界以源码与包 README 为准：Core v2、官方 Local、Memory/Atomic File StateStore、公开 Agent durable loop、跨协议/跨进程 Phase 1 恢复和离线验收已经落地；Worker、Process、HTTP 与 Phase 3 适配器仍按后续章节实施。真实方舟与 Docker live gate 未执行时不得标记为通过。
+当前实现边界以源码与包 README 为准：Core v2、官方 Local、Memory/Atomic File StateStore、公开 Agent durable loop、跨协议/跨进程 Phase 1 恢复和离线验收，以及 C7 Core transport/RPC/control/Peer/artifact-sidecar 已经落地；Worker、Process、HTTP 与 Phase 3 适配器仍按后续章节实施，Phase 2 尚未通过。真实方舟与 Docker live gate 未执行时不得标记为通过。
 
 ## 2. 设计目标与硬性不变量
 
@@ -1207,10 +1207,12 @@ Local factory 接收 SubAgentExecutionControl.delegation 并把它作为 child �
 
 C7 的三个 placement 共用 Core 导出的协议无关 transport v1 contract，不允许各包复制或扩展不兼容 wire：
 
+当前 Core 实现已经冻结并公开该公共层：12-kind strict RPC、16-method control dispatcher/proxy、双向 `SubAgentTransportPeer`、canonical replay/reply cache、同步 writer admission receipt、带 settlement headroom 的 drain/rollover、spawn 的 `accepted → settled` 或 direct `unbound_create` recovery settlement、abort/timeout tombstone，以及默认 32 MiB 的 artifact sidecar。writer 的可选 `settled` 只报告 I/O 完成，不参与下一帧准入排序；非法同步 receipt 在调用返回前失败，准入前 abort 不发送 packet。Peer 对 accepted/settled/events reply 与原 request 做语义关联，超长 timeout 分段调度；soft drain 仍允许所有 reply/replay 和 active executor task 的 control/cancel/snapshot/events continuation，hard sequence bound 才 fail-close。它们通过 closed schema、scope/receipt/outcome 重验和 safe-error 白名单把远端 runner 接回 Core control plane；具体 Worker、Process、HTTP transport、鉴权和 OS/network 生命周期仍未实现，因此不能把本节状态写成 Phase 2 通过。
+
 - JSON envelope 固定为 `{ version: '1', channelId, sequence, messageId, correlationId?, taskId?, operationId?, kind, payload }`，所有 object 都是 closed shape；默认单个 JSON frame 上限 16 MiB。
-- 每个方向的 `sequence` 从 1 连续递增。相同 `messageId + JCS payload hash` 是协议重放并返回原 reply；相同 ID 不同 hash 为冲突；sequence gap、未知字段、错版本、超限或非 JSON-safe payload 都在调用 Executor/Core 前失败。
-- `SubAgentExecutionRequest` 不直接跨 transport 传输 `AbortSignal` 或 control closure。wire 使用 `remainingMs`，接收端按本地时钟创建 signal 和绝对 deadline；不得信任远端绝对时间。超过 Node 单个 timer 上限 `2^31-1 ms` 的长 deadline 必须分段调度，不得溢出、静默截短或退化为近即时 timeout。
-- artifact reference 继续走 closed JSON；bytes 使用 transport sidecar，Worker 使用 transferable `ArrayBuffer`，Process 使用 advanced serialization 的 `Uint8Array`，HTTP 使用单独 raw body。sidecar 必须重新校验声明 size 与明文 SHA-256，不以 base64 塞入 JSON frame。
+- 每个方向的 `sequence` 从 1 连续递增。相同 `messageId + canonical decoded envelope` 是协议重放并返回原 reply，sidecar 以 `sidecarId` 无序比较；相同 ID 不同语义或 bytes 为冲突；sequence gap、未知字段、错版本、超限或非 JSON-safe payload 都在调用 Executor/Core 前失败。
+- `SubAgentExecutionRequest` 不直接跨 transport 传输 `AbortSignal` 或 control closure。wire 使用 `remainingMs`，接收端按本地时钟创建 signal 和绝对 deadline；`reconstructSubAgentExecutionRequest()` 返回 `{ request, dispose }`，adapter 必须在处理 settle 后调用幂等 `dispose()` 释放接收端 timer/listener。不得信任远端绝对时间。超过 Node 单个 timer 上限 `2^31-1 ms` 的长 deadline 必须分段调度，不得溢出、静默截短或退化为近即时 timeout。
+- artifact reference 继续走 closed JSON；bytes 使用 transport sidecar，Worker 使用 transferable `ArrayBuffer`，Process 使用 advanced serialization 的 `Uint8Array`，HTTP 使用单独 raw body。sidecar 必须拒绝 Proxy，使用 internal slots 固定源长度并复制到普通 owned buffer，再校验声明 size 与明文 SHA-256；不能调用源对象可覆写的 getter、iterator、`slice()` 或 `Symbol.species`，也不以 base64 塞入 JSON frame。当前 remote execution-control proxy 不提供 artifact `put`；它只接受已有 reference 对应的 sidecar，写入 reserve/stage 语义留给后续 adapter 设计。
 - 目标节点只能按宿主预注册的 `definition name + version` 和 runner identity 解析 factory/Zod schema；factory、Zod object、模块路径和凭证都不进入 wire。
 
 Executor 可以返回内部 `recovery_required` settle marker，但它不是公开 task state 或 Agent outcome。Core 只在以下条件接受：authoritative task 仍为 running、marker operation 与当前 epoch 一致，并且不存在 outcome-unknown provider intent。`checkpoint` recovery 必须已有合法 binding、完整 child checkpoint 和精确 runner/codec compatibility；`unbound_create` 只允许在 binding/checkpoint 均未提交时用原 idempotency operation 重放。每次 live dispatch 最多自动恢复一次，继续失败后等待 host 显式 `recover()`/retry；绝不创建替代 task/job。provider 已 `in_flight` 时固定 `failed + outcomeUnknown`，`result_submitted` 崩溃固定 `failed + partial`，terminal 只读且不可逆。

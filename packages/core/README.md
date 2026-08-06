@@ -32,23 +32,27 @@ npm install @ruixutong.manee/maneeagent-framework zod
 - 事件系统：可观察模型响应、工具调用、工具错误、Agent 状态和 Agent 错误。
 - Context compact：active-only 工具 payload 压缩、外部摘要策略与 context-length 恢复，raw history 保留原文。
 - Skills：通过内置 `skill` 工具按名称渐进加载 instructions、文本资源和显式启用的脚本。
-- Subagent v2：typed definition、显式 Executor placement、跨协议 child Agent、审批/嵌套审批、持久 resume、typed result、树级取消，以及 C7 transport/recovery contract。
+- Subagent v2：typed definition、显式 Executor placement、跨协议 child Agent、审批/嵌套审批、持久 resume、typed result、树级取消，以及 C7 transport/RPC/control/Peer/recovery contract。
 
 ## 公开入口
 
-| 根入口导出                                                       | 用途                                                                         |
-| ---------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `Agent` / `AgentRunOutcome`                                      | 协议无关的任务循环与四类 durable run outcome。                               |
-| `Tool` / `ToolRuntimeContext`                                    | 装饰器/运行时 Tool，以及可信的 call、signal、deadline、run/task metadata。   |
-| `Model` / `OpenAIResponsesModel` / `OpenAIChatModel`             | 自定义协议抽象与两个 OpenAI-compatible adapter。                             |
-| `defineSubAgent` / `SubAgentDefinition` / `SubAgentRuntime`      | typed definition、Catalog/Router、持久状态与控制面 Runtime。                 |
-| `SubAgentExecutor` / `ExecutorTaskHandle`                        | placement adapter 与 Core 包装前的 Executor task SPI。                       |
-| `SubAgentTransportEnvelope` / execution wire codec               | Worker、Process、HTTP 共用的 closed JSON transport v1 与本地 deadline 重建。 |
-| `SubAgentExecutorRecoveryRequired`                               | Executor crash settle marker；只由 Core 消费并按持久状态决定是否恢复。       |
-| `AgentRuntimeStateStore` / `ArtifactStore`                       | durable run/task state 与 opaque artifact 的 adapter SPI。                   |
-| `SubAgentChildRunner` / `AgentProtocolCheckpointCodec`           | 协议无关 child loop bridge 与版本化协议 checkpoint codec。                   |
-| `AgentTelemetrySink` 及 Subagent state/result/approval contracts | Executor、StateStore、telemetry adapter 共用的稳定控制面契约。               |
-| `createSubAgentRuntime`                                          | 同步创建 session-bound Runtime；异步校验由 `runtime.init()` 完成。           |
+| 根入口导出                                                                          | 用途                                                                       |
+| ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `Agent` / `AgentRunOutcome`                                                         | 协议无关的任务循环与四类 durable run outcome。                             |
+| `Tool` / `ToolRuntimeContext`                                                       | 装饰器/运行时 Tool，以及可信的 call、signal、deadline、run/task metadata。 |
+| `Model` / `OpenAIResponsesModel` / `OpenAIChatModel`                                | 自定义协议抽象与两个 OpenAI-compatible adapter。                           |
+| `defineSubAgent` / `SubAgentDefinition` / `SubAgentRuntime`                         | typed definition、Catalog/Router、持久状态与控制面 Runtime。               |
+| `SubAgentExecutor` / `ExecutorTaskHandle`                                           | placement adapter 与 Core 包装前的 Executor task SPI。                     |
+| `SubAgentTransportEnvelope` / execution wire codec                                  | placement 共用的 closed JSON transport v1 与本地 deadline 重建。           |
+| `SubAgentTransportRpcEnvelope` / RPC frame codec                                    | 12-kind strict request/reply/outcome/control 语义层。                      |
+| `SubAgentTransportPeer` / `createSubAgentTransportPeerWriterAdmission()`            | 双向交换、同步写入准入、精确 replay 与带 settlement headroom 的 rollover。 |
+| `SubAgentTransportArtifactSidecar`                                                  | closed descriptor 与校验后、独立于 JSON frame 的 artifact bytes。          |
+| `createSubAgentTransportControlDispatcher` / `createRemoteSubAgentExecutionControl` | 16-method closed control 面、scope/receipt 校验与安全错误映射。            |
+| `SubAgentExecutorRecoveryRequired`                                                  | Executor crash settle marker；只由 Core 消费并按持久状态决定是否恢复。     |
+| `AgentRuntimeStateStore` / `ArtifactStore`                                          | durable run/task state 与 opaque artifact 的 adapter SPI。                 |
+| `SubAgentChildRunner` / `AgentProtocolCheckpointCodec`                              | 协议无关 child loop bridge 与版本化协议 checkpoint codec。                 |
+| `AgentTelemetrySink` 及 Subagent state/result/approval contracts                    | Executor、StateStore、telemetry adapter 共用的稳定控制面契约。             |
+| `createSubAgentRuntime`                                                             | 同步创建 session-bound Runtime；异步校验由 `runtime.init()` 完成。         |
 
 包根入口同时导出 Agent、Model、Responses、Chat 与 Subagent v2 的配套 TypeScript 类型、常量和 adapter-facing state/control records。当前只公开 `.`，不提供子路径入口或 CLI `bin`。
 
@@ -669,7 +673,17 @@ Core 使用 RFC 8785/JCS hash、run/task 独立 revision、lease/fencing、opera
 
 Core 根入口导出 transport v1 的 closed envelope、frame codec、sequence tracker 和 `SubAgentExecutionRequestWire`。默认单帧上限是 16 MiB，按实际 UTF-8 bytes 计；frame 和 payload 使用 RFC 8785/JCS，sequence 按 channel/方向从 1 连续推进，同 `messageId` 只有在 payload 与 routing identity 都一致时才是 replay。tracker 默认最多保留 4096 个连续 sequence；窗口耗尽时返回 `sequence-window-exhausted`，调用方必须创建新 channel，不能淘汰旧 receipt 后继续接受可能重复的 ID。错版本、额外字段、sequence gap、未知旧 sequence、同 ID 冲突、非 JSON-safe 或超限值会在调用 Executor/Core callback 前失败。
 
-`createSubAgentExecutionRequestWire()` 显式复制协议字段，不会把 `AbortSignal`、宿主绝对时间或意外 closure 跨边界传输；wire 只携带 `remainingMs`。接收端用 `reconstructSubAgentExecutionRequest()` 把 transport cancel signal 与本地 timeout signal 合并，并以接收端时钟重建绝对 deadline；超过 Node 单个 timer 上限 `2^31-1 ms` 的合法长 deadline 会被拆成连续 timer，不会溢出、缩短或退化成近即时超时。decoder 会递归冻结返回值，默认限制 canonical payload 为 16 MiB、JSON 深度为 128、展开节点为 1,000,000，并重验 binding、checkpoint hash/状态/provenance、projection 和 parent path；目标侧仍必须通过受信任 registry 精确解析 definition/runner 及 codec。schema、factory、模块路径和 credential 不是 execution wire 的一部分。当前 transport 只冻结 envelope 和 execution request，不承诺某个具体 Worker、Process 或 HTTP RPC kind；完整 control/outcome/sidecar union 随 C7 placement 实现交付。
+`createSubAgentExecutionRequestWire()` 显式复制协议字段，不会把 `AbortSignal`、宿主绝对时间或意外 closure 跨边界传输；wire 只携带 `remainingMs`。接收端的 `reconstructSubAgentExecutionRequest()` 返回 `{ request, dispose }`：`request` 把 transport cancel signal 与本地 timeout signal 合并，并以接收端时钟重建绝对 deadline；超过 Node 单个 timer 上限 `2^31-1 ms` 的合法长 deadline 会被拆成连续 timer，不会溢出、缩短或退化成近即时超时。adapter 必须在 execute/spawn/wait 处理 settle 后（包括失败或取消）调用幂等的 `dispose()`，释放接收端 timer 与 listener；不能只取出 `request` 后遗忘生命周期。decoder 会递归冻结返回值，默认限制 canonical payload 为 16 MiB、JSON 深度为 128、展开节点为 1,000,000，并重验 binding、checkpoint hash/状态/provenance、projection 和 parent path；目标侧仍必须通过受信任 registry 精确解析 definition/runner 及 codec。schema、factory、模块路径和 credential 不是 execution wire 的一部分。
+
+strict RPC 语义层固定为 12 个 kind：`executor.request/accepted/settled`、`control.request/reply`、`cancel.request/ack`、`snapshot.request/reply`、`events.request/page` 与 `protocol.error`。codec 对 request/reply routing、execute/spawn/wait mode、binding、snapshot、outcome、event page 和 safe error 做 closed-union 重验；routing 与嵌套 identifier 都拒绝 C0/DEL，且 `maxCanonicalBytes` 不能大于 `maxFrameBytes`。raw error、stack、provider body、binding metadata 与 `eventCursor` 不能进入跨边界错误。
+
+control 面固定为 16 个 method：execution 7 个、completion 3 个、delegation 3 个、task 3 个。`createSubAgentTransportControlDispatcher()` 在调用可信 Core control closure 前重验 task/session scope、operation identity、binding、checkpoint、approval/result/completion receipt、budget、event 和 child handle；`createRemoteSubAgentExecutionControl()` 只向远端 runner 暴露对应的 typed proxy，并把受信任本地 catalog 与 delegation snapshot 取保守交集，不从远端加载 definition、schema 或权限。两端会在构造时复制并冻结同一组 JSON boundary options，后续修改调用方对象不能放宽限制；每次 exchange 同时携带原 `signal` 与非负绝对 `deadlineAt`。当前 proxy 暂不暴露 `artifacts.put`：sidecar 只能搬运已有 `ArtifactReference` 对应的 bytes，远程 artifact 写入要等独立 reserve/stage 语义落地。
+
+`SubAgentTransportPeer` 在同一 channel 上提供双向 request/reply、每方向连续 sequence、correlation/task/operation 校验和精确 replay cache。writer 必须同步返回 `createSubAgentTransportPeerWriterAdmission()` 生成的准入 receipt；同步 throw、Promise、void 或非法 receipt 会让 `openRequest()`/`request()`/`reply()` 在返回前失败并关闭 channel。可选 `settled` 只报告稍后的 I/O 完成，Peer 不等待它来串行下一次准入，因此反向 control 不会被 Promise mutex 锁死。准备请求期间发生 abort/timeout 时不会调用 writer、提交 sequence 或留下 tombstone；已准入请求的迟到 reply 才通过 tombstone 完成协议校验。大于 `2^31-1 ms` 的 timeout 会分段调度，不会被 Node 压缩成近即时超时。
+
+spawn 只接受 `executor.accepted` 后同一 exchange 的 `executor.settled(mode: 'spawn')`，或在尚未绑定时直接返回 `unbound_create` recovery settlement；accepted 之后不能再伪装成 unbound create。Peer 会把 accepted binding、terminal/paused task identity 和已知 executor 与原 execution request 交叉校验；events page 必须遵守请求的 cursor/limit，`nextSequence` 精确等于最后返回事件或空页的原 cursor，不能跳过事件。入站 replay 按解码后的 canonical envelope 判断，sidecar 按 `sidecarId` 无序比较；语义相同的 replay 复用缓存 reply 而不重复运行 handler，sequence gap、同 ID 冲突、错 reply 或超限会 fail closed。sequence 默认预留 256 个 settlement headroom（最多为 window - 1）；soft drain 后只允许所有 reply/replay 以及 active executor task 的 control/cancel/snapshot/events continuation，达到 hard bound 则关闭 channel。`maxTrackedSequences` 最大为 1,000,000，pending、cache 或 sequence window 到达边界时必须 drain/rollover，不能淘汰 receipt 后继续复用。
+
+artifact sidecar 使用 closed v1 descriptor，默认单件上限 32 MiB；Peer 默认每个 packet 最多 8 个 sidecar。descriptor 会把已有 `ArtifactReference` 的 size/SHA-256 与独立 `byteLength`/`sha256` 交叉校验；入站 `Uint8Array`/`ArrayBuffer` 会拒绝 Proxy，通过原生 internal-slot getter 固定长度并复制到普通 `Uint8Array`，不调用可覆写的 getter、iterator、`slice()` 或 `Symbol.species`，再校验实际长度和明文 SHA-256。因此源 buffer 后续变更不能修改已验收 bytes，数据也不会以 base64 塞进 JSON frame 或在校验前交给 handler。Core transport/RPC/control/Peer/sidecar 已公开，但它们是 placement adapter 的共用地基；当前 checkout 仍没有 Worker、Process 或 HTTP Executor 包，Phase 2 尚未通过。
 
 Executor 的 `execute()`、`spawn()` 或 raw handle `wait()` 可以返回 `SubAgentExecutorRecoveryRequired`。该 marker 不是 task state、host handle outcome 或 Agent outcome；Core 会校验 live operation identity、attempt/epoch/fencing、binding、checkpoint、runner/codec compatibility 和持久 result/provider 状态。合法 marker 会先原子 settle 当前 operation、释放 active slot，再至多自动恢复一次：`unbound_create` 保持原 `operationId` 与 idempotency key，只推进 attempt/epoch/fencing；`checkpoint` 使用原 task/binding 和完整 checkpoint，不伪装成 reconnect。第二个 marker 保留 `running + recoveryRequired`，等待 host 显式 `recover()`。provider 已 `in_flight` 时固定为 `failed + outcomeUnknown`，result receipt 已提交时固定为带 `partialOutput` 的 `failed`，authoritative terminal 永远只读。
 

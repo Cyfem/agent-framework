@@ -6,7 +6,7 @@
 
 本次是明确的 2.0 breaking change：删除旧 `AgentOptions.subAgents`、`AgentConstructor`、动态 `RuntimeSubAgent` 和旧 `agentName/input/outputDescription` Tool 协议，不提供兼容适配层。官方本地 Executor 作为独立 workspace 包交付，核心包只保留协议无关的语义、路由和状态控制面。
 
-实施状态：当前 checkout 已完成 C0～C6（Core v2、官方 Local、公开 Agent durable loop、v1 原子切换与 Phase 1 离线/进程恢复门禁），正在实施 C7 Worker/Process/HTTP placement；C8/C9、Docker live gate 与完整真实方舟验收仍未完成。下文“背景与现状”保留立项时的 v1 问题陈述，不代表当前源码仍存在这些旧接口。
+实施状态：当前 checkout 已完成 C0～C6（Core v2、官方 Local、公开 Agent durable loop、v1 原子切换与 Phase 1 离线/进程恢复门禁），并交付 C7 的 Core transport/RPC/control/Peer/artifact-sidecar 公共地基；Worker/Process/HTTP placement 仍在实施，Phase 2 尚未通过。C8/C9、Docker live gate 与完整真实方舟验收仍未完成。下文“背景与现状”保留立项时的 v1 问题陈述，不代表当前源码仍存在这些旧接口。
 
 ## 背景与现状
 
@@ -57,7 +57,7 @@
 ### Core 与 Executor 职责
 
 - Core 负责 Subagent 定义、注册、模型可见目录、Executor 过滤与选择校验、任务状态机、会话绑定、预算、审批协调、事件和错误契约。
-- Core 不执行具体 child Agent 循环，不拥有远程 transport、容器、队列或模型客户端。
+- Core 不执行具体 child Agent 循环，也不拥有 Worker/Process/HTTP endpoint、认证、部署 transport、容器、队列或模型客户端；Core 只提供 placement-neutral 的 transport/RPC/Peer contract。
 - Executor 适配器完整承载 child task 的模型、Tools、Skills、上下文、checkpoint 与运行循环。
 - 官方本地 Executor 独立成包；后续 Worker Thread、Child Process 与远程 Executor 继续以独立包或模板扩展。
 - 定义采用 local-object-first，不强制函数、Zod schema 或本地 factory 可序列化。跨进程/远程执行通过 `definitionName + definitionVersion` 在目标 Executor 注册表中重新解析。
@@ -197,6 +197,8 @@ Phase 1 退出标准：
 - 默认事件不泄露 payload 或 recovery data。
 
 ### Phase 2：进程隔离与远程 Executor 模板
+
+当前增量状态：Core 已公开 closed transport v1、12-kind strict RPC、16-method control dispatcher/proxy、双向 Peer、canonical replay、同步 writer admission、带 settlement headroom 的 channel rollover、spawn 的 accepted-or-direct-unbound 生命周期、abort tombstone 与默认 32 MiB artifact sidecar。`reconstructSubAgentExecutionRequest()` 返回 `{ request, dispose }`，placement adapter 必须在 settle 后清理接收端 timer/listener。Remote proxy 暂不提供 artifact `put`；下列 Worker、Process、HTTP 包与各自的认证、进程/网络生命周期和 conformance 仍是 Phase 2 待交付内容。
 
 交付内容：
 

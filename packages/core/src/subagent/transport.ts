@@ -69,6 +69,10 @@ export interface SubAgentTransportEnvelope<
 export interface SubAgentTransportFrameOptions {
   /** Defaults to 16 MiB and is measured against the actual UTF-8 frame, not canonical payload size. */
   readonly maxFrameBytes?: number;
+  /** Defaults to 128, where the envelope root has depth zero. */
+  readonly maxJsonDepth?: number;
+  /** Defaults to 1,000,000 expanded JSON values. */
+  readonly maxJsonNodes?: number;
 }
 
 export interface SubAgentExecutionRequestWireValidationOptions {
@@ -111,6 +115,13 @@ export interface ReconstructSubAgentExecutionRequestOptions extends SubAgentExec
   readonly now?: () => number;
   /** Defaults to a chunked, overflow-safe Node timer and is injectable for deterministic tests/hosts. */
   readonly timeoutSignalFactory?: (remainingMs: number) => AbortSignal;
+}
+
+/** Receiver-local request plus deterministic timeout/listener cleanup after execution settles. */
+export interface SubAgentExecutionRequestReconstruction<I extends JsonValue = JsonValue> {
+  readonly request: SubAgentExecutionRequest<I>;
+  /** Idempotent; releases receiver-local timers/listeners without changing the request outcome. */
+  dispose(): void;
 }
 
 export interface SubAgentTransportSequenceTrackerOptions {
