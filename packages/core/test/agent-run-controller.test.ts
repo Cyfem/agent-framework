@@ -26,6 +26,8 @@ import {
 } from '../src/subagent/state-controller';
 import { transitionSubAgentTask } from '../src/subagent/state-machine';
 import type {
+  AgentRuntimeStateStore,
+  StateLease,
   StoredAgentRun,
   StoredPendingToolBatch,
   StoredTask,
@@ -199,6 +201,36 @@ function createLegacyMigrators(
 }
 
 describe('AgentRunCheckpointController', () => {
+  it('rejects and releases a root StateStore lease with an opaque fencing token', async () => {
+    let releases = 0;
+    const invalidLease: StateLease = {
+      key: 'agent-run:owner-1:run-invalid-fence',
+      fencingToken: 'opaque-fence',
+      expiresAt: 10_000,
+      renew: async () => invalidLease,
+      release: async () => {
+        releases += 1;
+      },
+    };
+    class InvalidFencingStore extends RecordingRuntimeStateStore {
+      override async acquireLease(): Promise<StateLease> {
+        return invalidLease;
+      }
+    }
+    const stateStore: AgentRuntimeStateStore = new InvalidFencingStore();
+    const controller = new AgentRunCheckpointController<TestProtocol>({
+      ownerSessionId: 'owner-1',
+      stateStore,
+      checkpointCodec: TEST_CODEC,
+      now: () => 1_000,
+    });
+
+    await expect(controller.acquire('run-invalid-fence')).rejects.toThrow(
+      'canonical unsigned decimal string',
+    );
+    expect(releases).toBe(1);
+  });
+
   it('exposes the exact built-in checkpoint codec from each OpenAI protocol Model', () => {
     expect(new OpenAIChatModel({ apiKey: 'test-only', model: 'chat-model' }).checkpointCodec).toBe(
       OPENAI_CHAT_CHECKPOINT_CODEC,
@@ -670,7 +702,11 @@ describe('AgentRunCheckpointController', () => {
     const store = new RecordingRuntimeStateStore();
     const controller = createController(store);
     const contextStore = new ContextStore<TestProtocol>([{ kind: 'user', content: 'seed' }]);
-    const limits = resolveSubAgentLimits({ maxProviderCalls: 2 });
+    const limits = resolveSubAgentLimits({
+      maxProviderCalls: 2,
+      maxInputTokens: 100,
+      maxOutputTokens: 50,
+    });
     const active = await controller.beginCreate({ contextStore, limits, maxIterations: 4 });
 
     await controller.prepareModelOperation(
@@ -693,21 +729,44 @@ describe('AgentRunCheckpointController', () => {
       budget: { providerCalls: 1 },
       limits: { maxProviderCalls: 2 },
     });
-    await controller.commitModelOperationResult(
+    const beforeMalformedUsage = await store.loadRun('owner-1', 'run-1');
+    await expect(
+      controller.commitModelOperationResult(
+        {
+          runId: 'run-1',
+          operationId: 'provider-1',
+          messages: [{ kind: 'assistant', content: 'invalid usage', calls: [] }],
+          usage: { inputTokens: -1 } as never,
+        },
+        active.lease,
+      ),
+    ).rejects.toThrow('usage.inputTokens must be a non-negative safe integer');
+    expect(await store.loadRun('owner-1', 'run-1')).toEqual(beforeMalformedUsage);
+
+    const resultReadyCommit = await controller.commitModelOperationResult(
       {
         runId: 'run-1',
         operationId: 'provider-1',
         messages: [{ kind: 'assistant', content: 'durable provider result', calls: [] }],
+        usage: { inputTokens: 31, outputTokens: 7, totalTokens: 38 },
       },
       active.lease,
     );
+    expect(resultReadyCommit.record.budget).toMatchObject({
+      providerCalls: 1,
+      inputTokens: 31,
+      outputTokens: 7,
+    });
     await active.lease.release();
 
     const replacement = createController(store);
     const resultReady = await replacement.beginResume('run-1');
     expect(resultReady.checkpoint).toMatchObject({
       recovery: { action: 'apply_model' },
-      record: { budget: { providerCalls: 1 }, modelOperation: { phase: 'result_ready' } },
+      record: {
+        budget: { providerCalls: 1, inputTokens: 31, outputTokens: 7 },
+        modelOperation: { phase: 'result_ready' },
+      },
     });
     const beforeReplayMark = await store.loadRun('owner-1', 'run-1');
     await expect(
@@ -758,7 +817,7 @@ describe('AgentRunCheckpointController', () => {
     expect(await store.loadRun('owner-1', 'run-1')).toEqual(beforeOverLimit);
     expect(beforeOverLimit).toMatchObject({
       modelOperation: { operationId: 'provider-3', phase: 'prepared' },
-      budget: { providerCalls: 2 },
+      budget: { providerCalls: 2, inputTokens: 31, outputTokens: 7 },
     });
     await resultReady.lease.release();
   });

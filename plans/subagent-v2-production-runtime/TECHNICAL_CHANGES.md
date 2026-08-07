@@ -2,14 +2,14 @@
 
 ## 1. 文档状态
 
-- 设计状态：总体方向与 Phase 1 Oracle 已冻结；当前 checkout 已完成 C0～C6 和 C7 Core transport/RPC/control/Peer/artifact-sidecar 地基，正在实施 Phase 2 Worker/Process/HTTP placement。
+- 设计状态：总体方向与 Phase 1 Oracle 已冻结；当前 checkout 已完成 C0～C6、C7a/C7b 和 C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway 地基，正在实施 Phase 2 Worker/Process/HTTP placement。
 - 目标版本：Core 与所有公开 Executor/State/Artifact/Observability 包统一首发 `2.0.0`。
 - 实施范围：Phase 1 Core/Local、Phase 2 Worker/Process/HTTP Remote、Phase 3 PostgreSQL/BullMQ/Docker/S3/OTel、Compose、测试、demo 与文档迁移。
 - 明确排除：conversation handoff、active-agent 所有权转移、Core 内置云 transport 或认证系统。
 
 本文件细化 [PLAN.md](./PLAN.md) 中已经确认的设计。接口名称是实施基线；文件名可以在不改变职责边界和公共语义的前提下微调。分层测试、故障注入与真实方舟 Agent Plan 的逐项发布门禁见 [TEST_ACCEPTANCE_PLAN.md](./TEST_ACCEPTANCE_PLAN.md)。
 
-当前实现边界以源码与包 README 为准：Core v2、官方 Local、Memory/Atomic File StateStore、公开 Agent durable loop、跨协议/跨进程 Phase 1 恢复和离线验收，以及 C7 Core transport/RPC/control/Peer/artifact-sidecar 已经落地；Worker、Process、HTTP 与 Phase 3 适配器仍按后续章节实施，Phase 2 尚未通过。真实方舟与 Docker live gate 未执行时不得标记为通过。
+当前实现边界以源码与包 README 为准：Core v2、官方 Local、Memory/Atomic File StateStore、公开 Agent durable loop、跨协议/跨进程 Phase 1 恢复和离线验收，以及 C7 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway 已经落地；Worker、Process、HTTP 与 Phase 3 适配器仍按后续章节实施，Phase 2 尚未通过。真实方舟与 Docker live gate 未执行时不得标记为通过。
 
 ## 2. 设计目标与硬性不变量
 
@@ -943,7 +943,7 @@ resume 只适用于两种明确情况：waiting_approval 的审批继续，或 r
 - 加载原 task、root run checkpoint、binding 和 definition version。
 - 校验 session、lease、state revision、Executor descriptor 与 adapter state。
 - approval resume 原子写入 decisions，reason = approval；checkpoint resume 要求 task 为 running + recoveryRequired、旧 lease 已失效且 reason = checkpoint。
-- Memory same_process 只能在原进程内恢复审批，不能用于进程故障；Atomic File 本地恢复固定使用 checkpoint resume。
+- 官方 Local Executor 的 Memory 与 Atomic File 变体都声明 `recovery.resume = checkpoint`；Memory Store 的 checkpoint 只存在于当前进程，进程退出后仍会因权威状态丢失而返回 `RECOVERY_TARGET_LOST`，Atomic File 才能在新进程执行 checkpoint resume。
 - 不改变 taskId、subagentSessionId、runId 或 definition version。
 
 ### 13.3 reconnect
@@ -958,13 +958,13 @@ reconnect 用于外部任务仍在运行、暂停或已完成，但当前进程�
 
 唯一恢复矩阵：
 
-| descriptor                   | operation          | 允许源状态/条件                                    | 典型实现                  | 不满足时                   |
-| ---------------------------- | ------------------ | -------------------------------------------------- | ------------------------- | -------------------------- |
-| resume = none                | 无                 | 不可恢复                                           | 纯一次性 Executor         | RECOVERY_UNSUPPORTED       |
-| resume = same_process        | resume(approval)   | waiting_approval，原进程和 Handle 仍存活           | Memory Local              | RECOVERY_TARGET_LOST       |
-| resume = checkpoint          | resume(approval)   | waiting_approval + checkpoint                      | File/DB Local             | BINDING_INVALID 或版本错误 |
-| resume = checkpoint          | resume(checkpoint) | running + recoveryRequired + 旧 lease 失效         | File/DB Local、可重建进程 | BINDING_INVALID 或版本错误 |
-| reconnect = external_binding | reconnect          | running/waiting_approval/terminal，外部 job 仍存在 | Remote/queue job          | RECOVERY_TARGET_LOST       |
+| descriptor                   | operation          | 允许源状态/条件                                    | 典型实现                                  | 不满足时                   |
+| ---------------------------- | ------------------ | -------------------------------------------------- | ----------------------------------------- | -------------------------- |
+| resume = none                | 无                 | 不可恢复                                           | 纯一次性 Executor                         | RECOVERY_UNSUPPORTED       |
+| resume = same_process        | resume(approval)   | waiting_approval，原进程和 Handle 仍存活           | 自定义进程内 placement；官方 Local 不声明 | RECOVERY_TARGET_LOST       |
+| resume = checkpoint          | resume(approval)   | waiting_approval + checkpoint                      | Memory/File/DB Local                      | BINDING_INVALID 或版本错误 |
+| resume = checkpoint          | resume(checkpoint) | running + recoveryRequired + 旧 lease 失效         | File/DB Local、可重建进程                 | BINDING_INVALID 或版本错误 |
+| reconnect = external_binding | reconnect          | running/waiting_approval/terminal，外部 job 仍存在 | Remote/queue job                          | RECOVERY_TARGET_LOST       |
 
 同一 Executor 可以同时声明 checkpoint resume 与 external reconnect；两项能力正交。reconnect 到 waiting_approval 后仍由 host 提交 decision，再走 approval resume。descriptor 与 binding 不一致在 init/恢复时失败，绝不 fallback。
 
@@ -1196,7 +1196,7 @@ Local factory 接收 SubAgentExecutionControl.delegation 并把它作为 child �
 
 ### 16.3 恢复等级
 
-- 仅 Memory Store：recovery.resume = same_process；只可在原进程内从审批暂停继续，进程退出后返回 RECOVERY_TARGET_LOST。
+- Memory Store：官方 Local 仍声明 `recovery.resume = checkpoint` 并按同一 checkpoint contract 恢复审批；但状态仅驻留当前进程，进程退出后无法提供 durable checkpoint，固定返回 `RECOVERY_TARGET_LOST`。
 - Atomic File Store + 可重建 definition/model/tool registry：recovery.resume = checkpoint；可在新进程用 resume(checkpoint) 重建 child 上下文并继续。
 - 任意不可重放的 Tool 副作用仍需业务 idempotency key。
 - 本地 Executor 的 recovery.reconnect 固定为 none，不应把 checkpoint 能力声明成 external_binding。
@@ -1207,7 +1207,7 @@ Local factory 接收 SubAgentExecutionControl.delegation 并把它作为 child �
 
 C7 的三个 placement 共用 Core 导出的协议无关 transport v1 contract，不允许各包复制或扩展不兼容 wire：
 
-当前 Core 实现已经冻结并公开该公共层：C7b 基线的 12-kind strict RPC、16-method control dispatcher/proxy、双向 `SubAgentTransportPeer`、canonical replay/reply cache、同步 writer admission receipt、带 settlement headroom 的 drain/rollover、spawn 的 `accepted → settled` 或 direct `unbound_create` recovery settlement、abort/timeout tombstone，以及默认 32 MiB 的 artifact sidecar。writer 的可选 `settled` 只报告 I/O 完成，不参与下一帧准入排序；非法同步 receipt 在调用返回前失败，准入前 abort 不发送 packet。Peer 对 accepted/settled/events reply 与原 request 做语义关联，超长 timeout 分段调度；soft drain 仍允许所有 reply/replay 和 active executor task 的 control/cancel/snapshot/events continuation，hard sequence bound 才 fail-close。它们通过 closed schema、scope/receipt/outcome 重验和 safe-error 白名单把远端 runner 接回 Core control plane。C7c 在这套 wire 上原子增加下文冻结的 controller/target bridge 与 `model.request`/`model.reply`，完成后 RPC kind 总数固定为 14；具体 Worker、Process、HTTP transport、鉴权和 OS/network 生命周期仍未实现，因此不能把本节状态写成 Phase 2 通过。
+当前 Core 实现已经冻结并公开该公共层：C7b 基线与 C7c-1 扩展后的 14-kind strict RPC、16-method control dispatcher/proxy、双向 `SubAgentTransportPeer`、canonical replay/reply cache、同步 writer admission receipt、带 settlement headroom 的 drain/rollover、spawn 的 `accepted → settled` 或 direct `unbound_create` recovery settlement、有界 abort/timeout tombstone、默认 32 MiB artifact sidecar、controller/target bridge 与 `model.request`/`model.reply` gateway。writer 的可选 `settled` 只报告 I/O 完成，不参与下一帧准入排序；非法同步 receipt 在调用返回前失败，准入前 abort 不发送 packet。Peer 对 accepted/settled/events/model reply 与原 request 做语义关联，超长 timeout 分段调度；soft drain 仍允许所有 reply/replay 和 active executor task 的 control/cancel/snapshot/events continuation，hard sequence bound 才 fail-close。它们通过 closed schema、scope/receipt/outcome 重验、owner partition 和 safe-error 白名单把远端 runner 接回 Core control plane。具体 Worker、Process、HTTP transport、鉴权和 OS/network 生命周期仍未实现，因此不能把本节状态写成 Phase 2 通过。
 
 - JSON envelope 固定为 `{ version: '1', channelId, sequence, messageId, correlationId?, taskId?, operationId?, kind, payload }`，所有 object 都是 closed shape；默认单个 JSON frame 上限 16 MiB。
 - 每个方向的 `sequence` 从 1 连续递增。相同 `messageId + canonical decoded envelope` 是协议重放并返回原 reply，sidecar 以 `sidecarId` 无序比较；相同 ID 不同语义或 bytes 为冲突；sequence gap、未知字段、错版本、超限或非 JSON-safe payload 都在调用 Executor/Core 前失败。

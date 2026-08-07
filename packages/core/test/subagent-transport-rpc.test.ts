@@ -30,6 +30,7 @@ const requestKinds = [
   'cancel.request',
   'snapshot.request',
   'events.request',
+  'model.request',
 ] as const satisfies readonly SubAgentTransportRpcKind[];
 
 const replyKinds = [
@@ -39,6 +40,7 @@ const replyKinds = [
   'cancel.ack',
   'snapshot.reply',
   'events.page',
+  'model.reply',
 ] as const satisfies readonly SubAgentTransportRpcKind[];
 
 function createBinding(overrides: Partial<SubAgentExecutorBinding> = {}): SubAgentExecutorBinding {
@@ -74,7 +76,7 @@ function createExecutionRequest(
     path: ['task-1'],
     attempt: 1,
     executionEpoch: 'epoch-1',
-    executionFencingToken: 'fencing-1',
+    executionFencingToken: '1',
     definition: { name: 'researcher', version: '2' },
     input: { query: 'hello' },
     projectedContext: [{ kind: 'text', name: 'brief', text: 'Use primary sources.' }],
@@ -119,6 +121,7 @@ function createRpcEnvelope(
     readonly response?: boolean;
     readonly sequence?: number;
     readonly messageId?: string;
+    readonly operationId?: string;
   } = {},
 ): SubAgentTransportRpcEnvelope {
   return {
@@ -128,7 +131,7 @@ function createRpcEnvelope(
     messageId: options.messageId ?? `message-${kind}`,
     ...(options.response ? { correlationId: 'request-message-1' } : {}),
     taskId: 'task-1',
-    operationId: 'operation-1',
+    operationId: options.operationId ?? 'operation-1',
     kind,
     payload,
   } as unknown as SubAgentTransportRpcEnvelope;
@@ -168,6 +171,9 @@ function createRpcFixtures(): Record<SubAgentTransportRpcKind, SubAgentTransport
       { response: true },
     ),
     'control.request': createRpcEnvelope('control.request', {
+      executionAttempt: 1,
+      executionEpoch: 'epoch-1',
+      executionFencingToken: '1',
       method: 'execution.reportProgress',
       args: {
         update: { message: 'halfway', percent: 50, data: { phase: 'research' } },
@@ -205,6 +211,50 @@ function createRpcFixtures(): Record<SubAgentTransportRpcKind, SubAgentTransport
       'events.page',
       { events: [createTaskEvent()], nextSequence: 1, done: false },
       { response: true },
+    ),
+    'model.request': createRpcEnvelope(
+      'model.request',
+      {
+        providerOperationId: 'provider-operation-1',
+        gatewayId: 'controller-gateway-1',
+        protocol: 'openai-chat',
+        codecVersion: '1',
+        runId: 'run-1',
+        executionAttempt: 1,
+        executionEpoch: 'epoch-1',
+        executionFencingToken: '7',
+        checkpointOperationId: 'child-checkpoint-1',
+        checkpointDigest: 'c'.repeat(64),
+        purpose: 'agent',
+        iteration: 2,
+        requestAttempt: 1,
+        requestHash: 'a'.repeat(64),
+        context: [{ role: 'user', content: 'hello' }],
+        tools: [{ type: 'function', function: { name: 'proof', parameters: {} } }],
+        remainingMs: 30_000,
+      },
+      { operationId: 'provider-operation-1' },
+    ),
+    'model.reply': createRpcEnvelope(
+      'model.reply',
+      {
+        providerOperationId: 'provider-operation-1',
+        gatewayId: 'controller-gateway-1',
+        protocol: 'openai-chat',
+        codecVersion: '1',
+        runId: 'run-1',
+        executionAttempt: 1,
+        executionEpoch: 'epoch-1',
+        executionFencingToken: '7',
+        checkpointOperationId: 'child-checkpoint-1',
+        checkpointDigest: 'c'.repeat(64),
+        requestHash: 'a'.repeat(64),
+        ok: true,
+        resultHash: 'b'.repeat(64),
+        messages: [{ role: 'assistant', content: 'done' }],
+        usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+      },
+      { response: true, operationId: 'provider-operation-1' },
     ),
     'protocol.error': createRpcEnvelope(
       'protocol.error',
@@ -245,6 +295,8 @@ describe('Subagent transport v1 semantic RPC codec', () => {
       'snapshot.reply',
       'events.request',
       'events.page',
+      'model.request',
+      'model.reply',
       'protocol.error',
     ]);
 
@@ -351,6 +403,32 @@ describe('Subagent transport v1 semantic RPC codec', () => {
     });
   });
 
+  it('requires an exact execution scope on every reverse control request', () => {
+    const control = createRpcFixtures()['control.request'];
+    if (control.kind !== 'control.request') throw new Error('Expected a control request fixture.');
+    const { executionAttempt: _attempt, ...withoutAttempt } = control.payload;
+    const { executionEpoch: _epoch, ...withoutEpoch } = control.payload;
+    const { executionFencingToken: _fencing, ...withoutFencing } = control.payload;
+    expect([_attempt, _epoch, _fencing]).toEqual([1, 'epoch-1', '1']);
+
+    for (const payload of [
+      withoutAttempt,
+      withoutEpoch,
+      withoutFencing,
+      { ...control.payload, executionAttempt: 0 },
+      { ...control.payload, executionEpoch: '' },
+      { ...control.payload, executionFencingToken: '01' },
+      { ...control.payload, generation: 1 },
+    ]) {
+      expectInvalidRpc(() =>
+        assertSubAgentTransportRpcEnvelope({
+          ...control,
+          payload,
+        } as unknown as SubAgentTransportRpcEnvelope),
+      );
+    }
+  });
+
   it('enforces request/reply correlation and task/operation routing identity', () => {
     const fixtures = createRpcFixtures();
 
@@ -429,6 +507,54 @@ describe('Subagent transport v1 semantic RPC codec', () => {
       assertSubAgentTransportRpcEnvelope({
         ...fixtures['events.page'],
         taskId: 'different-task',
+      }),
+    );
+    expectInvalidRpc(() =>
+      assertSubAgentTransportRpcEnvelope({
+        ...fixtures['model.request'],
+        operationId: 'different-provider-operation',
+      }),
+    );
+    expectInvalidRpc(() =>
+      assertSubAgentTransportRpcEnvelope({
+        ...fixtures['model.reply'],
+        payload: {
+          ...fixtures['model.reply'].payload,
+          providerOperationId: 'different-provider-operation',
+        },
+      }),
+    );
+  });
+
+  it('keeps Model gateway payloads closed and provider-safe', () => {
+    const fixtures = createRpcFixtures();
+    const request = fixtures['model.request'];
+    const reply = fixtures['model.reply'];
+
+    for (const payload of [
+      { ...request.payload, apiKey: 'secret' },
+      { ...request.payload, headers: { authorization: 'secret' } },
+      { ...request.payload, baseURL: 'https://provider.invalid' },
+      { ...reply.payload, raw: { providerResponse: true } },
+    ]) {
+      expectInvalidRpc(() =>
+        assertSubAgentTransportRpcEnvelope({
+          ...(Object.hasOwn(payload, 'raw') ? reply : request),
+          payload,
+        }),
+      );
+    }
+
+    expectInvalidRpc(() =>
+      assertSubAgentTransportRpcEnvelope({
+        ...request,
+        payload: { ...request.payload, requestHash: 'A'.repeat(64) },
+      }),
+    );
+    expectInvalidRpc(() =>
+      assertSubAgentTransportRpcEnvelope({
+        ...reply,
+        payload: { ...reply.payload, messages: { not: 'an-array' } },
       }),
     );
   });
@@ -824,6 +950,9 @@ describe('Subagent transport v1 semantic RPC codec', () => {
     const explicitlyDeeper = {
       ...fixtures['control.request'],
       payload: {
+        executionAttempt: 1,
+        executionEpoch: 'epoch-1',
+        executionFencingToken: '1',
         method: 'completion.submitResult',
         args: { callId: 'call-deep', candidate: deepCandidate },
       },

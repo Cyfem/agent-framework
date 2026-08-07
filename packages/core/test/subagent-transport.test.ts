@@ -63,7 +63,7 @@ function createExecutionRequest(
     path: ['task-1'],
     attempt: 1,
     executionEpoch: 'epoch-1',
-    executionFencingToken: 'fence-1',
+    executionFencingToken: '1',
     definition: { name: 'researcher', version: '2' },
     input: { query: 'hello' },
     projectedContext: [
@@ -625,6 +625,26 @@ describe('Subagent execution request transport wire', () => {
     reconstruction.dispose();
   });
 
+  acceptanceIt('C7-GATEWAY-16.l1.fencing-contract', 'decimal-fencing-contract', () => {
+    for (const executionFencingToken of ['opaque', '-1', '+1', '01', '1.0']) {
+      expectTransportReason(
+        () =>
+          createSubAgentExecutionRequestWire(createExecutionRequest({ executionFencingToken }), {
+            now: () => 1_000,
+          }),
+        'invalid-execution-request',
+      );
+    }
+    expect(
+      createSubAgentExecutionRequestWire(
+        createExecutionRequest({
+          executionFencingToken: '340282366920938463463374607431768211456',
+        }),
+        { now: () => 1_000 },
+      ).executionFencingToken,
+    ).toBe('340282366920938463463374607431768211456');
+  });
+
   it('round-trips and freezes a resumable rich pending child batch exactly', () => {
     const checkpoint = createRestorablePendingCheckpoint();
     const wire = createSubAgentExecutionRequestWire(
@@ -941,6 +961,7 @@ describe('Subagent execution request transport wire', () => {
         operationId: 'model-operation-1',
         iteration: 1,
         purpose: 'agent',
+        requestAttempt: 2,
         requestHash: canonicalJsonSha256({ request: 'child-model' }),
         phase: 'result_ready',
         result: modelResult,
@@ -949,13 +970,28 @@ describe('Subagent execution request transport wire', () => {
       },
     });
 
-    expect(() => createResumeWire(modelCheckpoint)).not.toThrow();
+    const decodedModelCheckpoint = decodeSubAgentExecutionRequestWire(
+      createResumeWire(modelCheckpoint),
+    );
+    expect(decodedModelCheckpoint.operation.type).toBe('resume');
+    if (decodedModelCheckpoint.operation.type !== 'resume') {
+      throw new Error('Expected a decoded resume operation.');
+    }
+    expect(decodedModelCheckpoint.operation.checkpoint.modelOperation?.requestAttempt).toBe(2);
     const invalidCheckpoints: readonly unknown[] = [
       {
         ...baseCheckpoint,
         contextStore: { ...baseCheckpoint.contextStore, protocol: 'openai-responses' },
       },
       { ...baseCheckpoint, modelIteration: 7 },
+      {
+        ...modelCheckpoint,
+        modelOperation: { ...modelCheckpoint.modelOperation, requestAttempt: 0 },
+      },
+      {
+        ...modelCheckpoint,
+        modelOperation: { ...modelCheckpoint.modelOperation, requestAttempt: undefined },
+      },
       {
         ...modelCheckpoint,
         modelOperation: { ...modelCheckpoint.modelOperation, iteration: 0 },

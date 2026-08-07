@@ -18,6 +18,8 @@ import type {
   ToolPayloadReplacements,
 } from '../../agent/types';
 import { OPENAI_CHAT_CHECKPOINT_CODEC } from '../../subagent/checkpoint';
+import type { SubAgentTransportModelProtocolSurface } from '../../subagent/transport-model-gateway';
+import { markAuditedSubAgentTransportModelProtocolSurface } from '../../subagent/transport-model-protocol-surface';
 import { createAbortScope, throwIfAborted } from '../base/abort';
 import { Model, type ModelGenerateRequest, type ModelGenerateResult } from '../base';
 import { classifyOpenAICompatibleError } from '../openai-error';
@@ -48,6 +50,7 @@ export type * from './types';
  */
 export class OpenAIChatModel extends Model<OpenAIChatProtocol> {
   override readonly checkpointCodec = OPENAI_CHAT_CHECKPOINT_CODEC;
+  override readonly providerMaxRetries = 0;
 
   #openai: OpenAI;
   #model: string;
@@ -97,13 +100,23 @@ export class OpenAIChatModel extends Model<OpenAIChatProtocol> {
     const signal = request.signal ?? deadlineScope?.signal;
 
     try {
-      const response = signal
-        ? await this.#openai.chat.completions.create(params, { signal })
-        : await this.#openai.chat.completions.create(params);
+      const response = await this.#openai.chat.completions.create(params, {
+        maxRetries: 0,
+        ...(signal === undefined ? {} : { signal }),
+      });
       const message = response.choices[0]?.message;
 
       return {
         messages: message ? [message as unknown as OpenAIChatContext] : [],
+        ...(response.usage === undefined
+          ? {}
+          : {
+              usage: {
+                inputTokens: response.usage.prompt_tokens,
+                outputTokens: response.usage.completion_tokens,
+                totalTokens: response.usage.total_tokens,
+              },
+            }),
         raw: response,
       };
     } finally {
@@ -392,6 +405,32 @@ export class OpenAIChatModel extends Model<OpenAIChatProtocol> {
   classifyError(error: unknown): ModelErrorDescriptor {
     return classifyOpenAICompatibleError(error);
   }
+}
+
+/** Credential-free Chat protocol surface for Worker/Process/remote Model proxies. */
+export function createOpenAIChatProtocolSurface(): SubAgentTransportModelProtocolSurface<OpenAIChatProtocol> {
+  const prototype = OpenAIChatModel.prototype;
+  const protocolSurface: SubAgentTransportModelProtocolSurface<OpenAIChatProtocol> = {
+    checkpointCodec: OPENAI_CHAT_CHECKPOINT_CODEC,
+    buildUserMessage: (input) => prototype.buildUserMessage(input),
+    buildSystemMessage: (input) => prototype.buildSystemMessage(input),
+    buildToolCallOutputMessage: (input) => prototype.buildToolCallOutputMessage(input),
+    buildToolMessage: (input) => prototype.buildToolMessage(input),
+    parseUserMessages: (context) => prototype.parseUserMessages(context),
+    parseSystemMessages: (context) => prototype.parseSystemMessages(context),
+    parseAssistantMessages: (context) => prototype.parseAssistantMessages(context),
+    parseToolCalls: (context) => prototype.parseToolCalls(context),
+    parseToolCallOutputMessages: (context) => prototype.parseToolCallOutputMessages(context),
+    rewriteToolPayloads: (context, replacements) =>
+      prototype.rewriteToolPayloads(context, replacements),
+    extractAssistantText: (context) =>
+      prototype.parseAssistantMessages(context).flatMap(({ message }) => {
+        const text = message.content.map((part) => part.text).join('');
+        return text.length === 0 ? [] : [text];
+      }),
+    classifyError: (error) => prototype.classifyError(error),
+  };
+  return markAuditedSubAgentTransportModelProtocolSurface(Object.freeze(protocolSurface));
 }
 
 function deleteToolOnlyChatParams(params: ChatCompletionCreateParamsNonStreaming): void {

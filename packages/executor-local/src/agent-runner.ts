@@ -7,14 +7,12 @@ import type {
   SubAgentChildRunner,
   SubAgentDefinition,
   SubAgentExecutionControl,
+  SubAgentTargetRunnerFactoryContext,
   UserMessageOf,
 } from '@ruixutong.manee/maneeagent-framework';
 import { canonicalJsonSha256 } from '@ruixutong.manee/maneeagent-framework';
 
-import type {
-  LocalSubAgentRunnerFactoryContext,
-  LocalSubAgentRunnerRegistration,
-} from './local-runner-registry';
+import type { LocalSubAgentRunnerRegistration } from './local-runner-registry';
 
 /** Minimal public Agent bridge consumed by Local without accessing Agent internals. */
 export interface LocalSubAgentAgent<P extends AgentProtocol> {
@@ -55,7 +53,7 @@ export function createLocalAgentRunnerRegistration<
   P extends AgentProtocol,
   I extends JsonValue,
   O extends JsonValue,
->(registration: LocalSubAgentAgentRegistration<P, I, O>): LocalSubAgentRunnerRegistration {
+>(registration: LocalSubAgentAgentRegistration<P, I, O>): LocalSubAgentRunnerRegistration<I, O> {
   assertAgentRegistration(registration);
   const childCheckpointVersions = Object.freeze([
     ...(registration.childCheckpointVersions ?? ['1']),
@@ -63,20 +61,19 @@ export function createLocalAgentRunnerRegistration<
   const issuedAgents = new WeakSet<object>();
 
   return Object.freeze({
-    definition: Object.freeze({
-      name: registration.definition.name,
-      version: registration.definition.version,
-    }),
+    definition: registration.definition,
     runnerId: registration.runnerId,
     runnerVersion: registration.runnerVersion,
     childCheckpointVersions,
-    create: async (context: LocalSubAgentRunnerFactoryContext): Promise<SubAgentChildRunner> => {
-      const { request, executorName } = context;
+    create: async (
+      context: SubAgentTargetRunnerFactoryContext<I, O>,
+    ): Promise<SubAgentChildRunner> => {
+      const { request, definition, executorName } = context;
       const capturedRequest = request as SubAgentChildRunRequest<I>;
       const agent = await registration.createAgent(
         Object.freeze({
           request: capturedRequest,
-          definition: registration.definition,
+          definition,
         }),
       );
       assertAgentBridge(agent);
@@ -84,7 +81,7 @@ export function createLocalAgentRunnerRegistration<
         throw new TypeError('A Local Agent factory must return a fresh Agent for every task.');
       }
       issuedAgents.add(agent);
-      const input = registration.buildInput(capturedRequest, registration.definition);
+      const input = registration.buildInput(capturedRequest, definition);
       let previousRequest = capturedRequest;
 
       return Object.freeze({
@@ -101,7 +98,7 @@ export function createLocalAgentRunnerRegistration<
             executorName,
             checkpointMode: 'durable',
             input,
-            outputSchema: registration.definition.outputSchema,
+            outputSchema: definition.outputSchema,
           });
         },
       });

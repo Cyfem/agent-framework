@@ -3,9 +3,10 @@ export type {
   ModelGeneratePurpose,
   ModelGenerateRequest,
   ModelGenerateResult,
+  ModelGenerateUsage,
   ModelRuntimeMetadata,
 } from './base';
-export { OpenAIChatModel } from './chat';
+export { OpenAIChatModel, createOpenAIChatProtocolSurface } from './chat';
 export type {
   OpenAIChatContext,
   OpenAIChatAssistantContextMessage,
@@ -33,7 +34,7 @@ export type {
   OpenAIChatUserContextMessage,
   OpenAIChatUserMessage,
 } from './chat';
-export { OpenAIResponsesModel } from './responses';
+export { OpenAIResponsesModel, createOpenAIResponsesProtocolSurface } from './responses';
 export type {
   OpenAIFileObject,
   OpenAIFileUploadOptions,

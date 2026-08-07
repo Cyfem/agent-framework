@@ -26,9 +26,14 @@ import type {
   DurableAgentModelOperationV1,
   EncodedAgentProtocolCheckpoint,
   SubAgentChildCheckpoint,
+  SubAgentChildModelOperationV1,
   SubAgentChildPendingBatchV1,
 } from '../subagent/checkpoint';
 import { SubAgentRuntimeError, type SubAgentErrorDescriptor } from '../subagent/errors';
+import {
+  assertCanonicalFencingToken,
+  compareCanonicalFencingTokens,
+} from '../subagent/fencing-token';
 import type { SubAgentDelegationPauseCall } from '../subagent/executor';
 import {
   assertJsonValue,
@@ -51,6 +56,7 @@ import type {
 } from '../subagent/runtime';
 import type { StoredPendingToolBatch, StoredPendingToolCall } from '../subagent/state-store';
 import type { RuntimeTaskCreateMutation } from '../subagent/state-controller';
+import { isSubAgentTransportModelProxy } from '../subagent/transport-model-gateway';
 import {
   beginCompactTransactionCheckpoint,
   completeCompactTransactionCheckpoint,
@@ -80,6 +86,7 @@ import {
   ModelErrorRecoveryError,
   resolveModelErrorRecoveryLimits,
 } from './model-error-recovery';
+import { normalizeModelGenerateResultUsage } from './model-usage';
 import { AgentRunCheckpointController, type AgentRunLease } from './run-controller';
 import { getDefaultToolParametersSchema } from './schema';
 import { renderSkillDiscoveryCatalog } from './skill-command';
@@ -154,6 +161,9 @@ interface ActiveAgentExecution extends AbortScope {
     sessionId: string;
     runId: string;
     taskId?: string;
+    executionAttempt?: number;
+    executionEpoch?: string;
+    executionFencingToken?: string;
   }>;
 }
 
@@ -171,7 +181,7 @@ interface AgentToolBatchLoopResult<P extends AgentProtocol> {
 interface ActiveChildExecution<P extends AgentProtocol> {
   options: AgentSubAgentRunOptions<P>;
   modelIteration: number;
-  modelOperation: DurableAgentModelOperationV1 | undefined;
+  modelOperation: SubAgentChildModelOperationV1 | undefined;
   compactTransaction: DurableCompactTransaction | undefined;
   pendingBatch: StoredPendingToolBatch | undefined;
   result: JsonValue | undefined;
@@ -181,6 +191,8 @@ interface ActiveChildExecution<P extends AgentProtocol> {
   endCallId: string | undefined;
   completed: boolean;
   pauseCheckpointRevision: number | undefined;
+  checkpointOperationId: string | undefined;
+  checkpointDigest: string | undefined;
 }
 
 const beforeToolErrorPrefix = '函数调用的前置工作出现异常，异常为：';
@@ -1246,12 +1258,13 @@ export class Agent<P extends AgentProtocol> {
     const checkpoint = this.#buildChildCheckpoint();
     const value = checkpoint as unknown as JsonValue;
     assertJsonValue(value);
-    await child.options.control.commitCheckpoint(
-      `child-checkpoint-${createHash('sha256')
-        .update(canonicalizeJson(value), 'utf8')
-        .digest('hex')}`,
-      checkpoint,
-    );
+    const checkpointDigest = createHash('sha256')
+      .update(canonicalizeJson(value), 'utf8')
+      .digest('hex');
+    const checkpointOperationId = `child-checkpoint-${checkpointDigest}`;
+    await child.options.control.commitCheckpoint(checkpointOperationId, checkpoint);
+    child.checkpointOperationId = checkpointOperationId;
+    child.checkpointDigest = checkpointDigest;
   }
 
   async #persistCompactTransaction(
@@ -1293,6 +1306,20 @@ export class Agent<P extends AgentProtocol> {
       turns: purpose === 'agent' ? 1 : 0,
       providerCalls: 1,
     });
+  }
+
+  async #settleChildProviderUsage(
+    operationId: string,
+    response: ModelGenerateResult<P>,
+  ): Promise<ModelGenerateResult<P>> {
+    const normalized = normalizeModelGenerateResultUsage(response);
+    const child = this.#activeChildExecution;
+    if (child === undefined || normalized.usage === undefined) return normalized;
+    await child.options.control.consumeBudget(`provider-usage-${operationId}`, {
+      inputTokens: normalized.usage.inputTokens ?? 0,
+      outputTokens: normalized.usage.outputTokens ?? 0,
+    });
+    return normalized;
   }
 
   /**
@@ -1648,6 +1675,8 @@ export class Agent<P extends AgentProtocol> {
         endCallId: undefined,
         completed: false,
         pauseCheckpointRevision: undefined,
+        checkpointOperationId: undefined,
+        checkpointDigest: undefined,
       };
       this.#installChildResultTool(options);
     } else {
@@ -1661,6 +1690,8 @@ export class Agent<P extends AgentProtocol> {
       }
       existing.options = options;
       existing.pauseCheckpointRevision = undefined;
+      existing.checkpointOperationId = undefined;
+      existing.checkpointDigest = undefined;
     }
 
     this.#sessionId = options.request.ownerSessionId;
@@ -1674,6 +1705,9 @@ export class Agent<P extends AgentProtocol> {
         sessionId: options.request.ownerSessionId,
         runId: options.request.runId,
         taskId: options.request.taskId,
+        executionAttempt: options.request.attempt,
+        executionEpoch: options.request.executionEpoch,
+        executionFencingToken: options.request.executionFencingToken,
       },
     );
 
@@ -1883,7 +1917,16 @@ export class Agent<P extends AgentProtocol> {
     }
     this.#contextStore = restored;
     child.modelIteration = checkpoint.modelIteration;
-    child.modelOperation = checkpoint.modelOperation;
+    child.modelOperation =
+      checkpoint.modelOperation === undefined
+        ? undefined
+        : requireChildModelOperation(checkpoint.modelOperation);
+    const checkpointValue = checkpoint as unknown as JsonValue;
+    const checkpointDigest = createHash('sha256')
+      .update(canonicalizeJson(checkpointValue), 'utf8')
+      .digest('hex');
+    child.checkpointDigest = checkpointDigest;
+    child.checkpointOperationId = `child-checkpoint-${checkpointDigest}`;
     child.compactTransaction = checkpoint.compactTransaction;
     child.pendingBatch =
       checkpoint.pendingBatch === undefined
@@ -1940,7 +1983,7 @@ export class Agent<P extends AgentProtocol> {
     const child = this.#activeChildExecution!;
     const operation = child.modelOperation;
     if (operation === undefined) return undefined;
-    if (operation.phase === 'in_flight') {
+    if (operation.phase === 'in_flight' && !isSubAgentTransportModelProxy(this.#llm)) {
       throw new SubAgentRuntimeError({
         code: 'EXECUTOR_FAILED',
         message: 'The child provider request outcome could not be confirmed.',
@@ -3242,10 +3285,17 @@ export class Agent<P extends AgentProtocol> {
   ): Promise<ModelGenerateResult<P>> {
     let pendingInitialRequest = initialRequest;
     let pendingPreparedOperation = preparedOperation;
+    const childPreparedOperation =
+      this.#activeChildExecution === undefined || preparedOperation === undefined
+        ? undefined
+        : requireChildModelOperation(preparedOperation);
 
-    return generateWithModelErrorRecovery({
+    const response = await generateWithModelErrorRecovery({
       model: this.#llm,
       purpose,
+      ...(childPreparedOperation === undefined
+        ? {}
+        : { initialRequestAttempts: childPreparedOperation.requestAttempt - 1 }),
       buildRequest: () => {
         if (pendingInitialRequest !== undefined) {
           const request = pendingInitialRequest;
@@ -3258,7 +3308,10 @@ export class Agent<P extends AgentProtocol> {
       ...(this.#activeChildExecution !== undefined
         ? {
             generate: async (request: ModelGenerateRequest<P>) => {
-              const operation = pendingPreparedOperation;
+              const operation =
+                pendingPreparedOperation === undefined
+                  ? undefined
+                  : requireChildModelOperation(pendingPreparedOperation);
               pendingPreparedOperation = undefined;
               return this.#generateChildOnce(purpose, request, iteration, operation);
             },
@@ -3300,13 +3353,14 @@ export class Agent<P extends AgentProtocol> {
         return { outcome: compacted ? 'succeeded' : 'unavailable' };
       },
     });
+    return normalizeModelGenerateResultUsage(response);
   }
 
   async #generateChildOnce(
     purpose: ModelGeneratePurpose,
     requestInput: ModelGenerateRequest<P>,
     iteration: number,
-    preparedOperation?: DurableAgentModelOperationV1,
+    preparedOperation?: SubAgentChildModelOperationV1,
   ): Promise<ModelGenerateResult<P>> {
     const child = this.#activeChildExecution!;
     if (
@@ -3318,22 +3372,35 @@ export class Agent<P extends AgentProtocol> {
     }
     const operationId =
       preparedOperation?.operationId ?? createEphemeralId('child-model-operation');
-    const request: ModelGenerateRequest<P> = Object.freeze({ ...requestInput });
+    const request: ModelGenerateRequest<P> = Object.freeze({
+      ...requestInput,
+      runtime: Object.freeze({
+        ...requestInput.runtime,
+        providerOperationId: operationId,
+      }),
+    });
+    const requestAttempt = requirePositiveRequestAttempt(request.runtime?.requestAttempt);
     throwIfAborted(request.signal, request.deadlineAt);
 
     if (child.options.checkpointMode === 'same_process') {
-      await this.#consumeChildProviderBudget(operationId, purpose);
+      if (!isSubAgentTransportModelProxy(this.#llm)) {
+        await this.#consumeChildProviderBudget(operationId, purpose);
+      }
       throwIfAborted(request.signal, request.deadlineAt);
+      let response: ModelGenerateResult<P>;
       try {
-        return await awaitWithAbort(this.#llm.generate(request), request.signal);
+        response = await awaitWithAbort(this.#llm.generate(request), request.signal);
       } catch (error) {
         if (this.#isExplicitProviderRejection(error, purpose, request)) throw error;
         throw modelOutcomeUnknownRuntimeError('child');
       }
+      return await this.#settleChildProviderUsage(operationId, response);
     }
 
     const codec = this.#llm.checkpointCodec!;
     const requestHash = hashDurableModelRequest(codec, purpose, request);
+    const replayInFlight =
+      preparedOperation?.phase === 'in_flight' && isSubAgentTransportModelProxy(this.#llm);
     if (preparedOperation === undefined) {
       const now = Date.now();
       child.modelIteration = iteration;
@@ -3342,6 +3409,7 @@ export class Agent<P extends AgentProtocol> {
         operationId,
         iteration,
         purpose,
+        requestAttempt,
         requestHash,
         phase: 'prepared' as const,
         preparedAt: now,
@@ -3349,33 +3417,52 @@ export class Agent<P extends AgentProtocol> {
       });
       await this.#commitChildCheckpoint();
     } else if (
-      preparedOperation.phase !== 'prepared' ||
+      (preparedOperation.phase !== 'prepared' && !replayInFlight) ||
       preparedOperation.iteration !== iteration ||
       preparedOperation.purpose !== purpose ||
+      preparedOperation.requestAttempt !== requestAttempt ||
       preparedOperation.requestHash !== requestHash ||
       child.modelOperation?.operationId !== preparedOperation.operationId
     ) {
       throw checkpointMismatchError('The prepared child Model operation is incompatible.');
     }
-    await this.#consumeChildProviderBudget(operationId, purpose);
-    child.modelOperation = Object.freeze({
-      ...child.modelOperation!,
-      phase: 'in_flight' as const,
-      updatedAt: Date.now(),
+    if (!replayInFlight) {
+      if (!isSubAgentTransportModelProxy(this.#llm)) {
+        await this.#consumeChildProviderBudget(operationId, purpose);
+      }
+      child.modelOperation = Object.freeze({
+        ...child.modelOperation!,
+        phase: 'in_flight' as const,
+        updatedAt: Date.now(),
+      });
+      await this.#commitChildCheckpoint();
+    }
+    const checkpointOperationId = child.checkpointOperationId;
+    const checkpointDigest = child.checkpointDigest;
+    if (checkpointOperationId === undefined || checkpointDigest === undefined) {
+      throw new Error('A durable child Model request requires an acknowledged checkpoint.');
+    }
+    const providerRequest: ModelGenerateRequest<P> = Object.freeze({
+      ...request,
+      runtime: Object.freeze({
+        ...request.runtime,
+        checkpointOperationId,
+        checkpointDigest,
+      }),
     });
-    await this.#commitChildCheckpoint();
 
     let response: ModelGenerateResult<P>;
     try {
-      response = await awaitWithAbort(this.#llm.generate(request), request.signal);
+      response = await awaitWithAbort(this.#llm.generate(providerRequest), providerRequest.signal);
     } catch (error) {
-      if (this.#isExplicitProviderRejection(error, purpose, request)) {
+      if (this.#isExplicitProviderRejection(error, purpose, providerRequest)) {
         child.modelOperation = undefined;
         await this.#commitChildCheckpoint();
         throw error;
       }
       throw modelOutcomeUnknownRuntimeError('child');
     }
+    response = await this.#settleChildProviderUsage(operationId, response);
     child.modelOperation = resultReadyChildModelOperation(
       child.modelOperation,
       response.messages,
@@ -3403,7 +3490,13 @@ export class Agent<P extends AgentProtocol> {
     }
 
     const operationId = preparedOperation?.operationId ?? createEphemeralId('model-operation');
-    const request: ModelGenerateRequest<P> = Object.freeze({ ...requestInput });
+    const request: ModelGenerateRequest<P> = Object.freeze({
+      ...requestInput,
+      runtime: Object.freeze({
+        ...requestInput.runtime,
+        providerOperationId: operationId,
+      }),
+    });
     const requestHash =
       this.#llm.checkpointCodec === undefined
         ? hashSameProcessModelRequest(codec, purpose, request)
@@ -3454,8 +3547,15 @@ export class Agent<P extends AgentProtocol> {
       );
     }
 
+    response = normalizeModelGenerateResultUsage(response);
+
     await controller.commitModelOperationResult(
-      { runId: lease.runId, operationId, messages: response.messages },
+      {
+        runId: lease.runId,
+        operationId,
+        messages: response.messages,
+        ...(response.usage === undefined ? {} : { usage: response.usage }),
+      },
       lease,
     );
     this.#activeModelOperation = Object.freeze({ operationId, iteration, purpose });
@@ -4032,7 +4132,7 @@ function normalizeAgentSubAgentRunOptions<P extends AgentProtocol>(
   assertNonEmptyIdentifier(request.taskId, 'taskId');
   assertNonEmptyIdentifier(request.subagentSessionId, 'subagentSessionId');
   assertNonEmptyIdentifier(request.executionEpoch, 'executionEpoch');
-  assertNonEmptyIdentifier(request.executionFencingToken, 'executionFencingToken');
+  assertCanonicalFencingToken(request.executionFencingToken, 'executionFencingToken');
   assertNonEmptyIdentifier(request.definition.name, 'definition.name');
   assertNonEmptyIdentifier(request.definition.version, 'definition.version');
   if (!Number.isSafeInteger(request.attempt) || request.attempt < 1) {
@@ -4080,8 +4180,7 @@ function assertChildRebind<P extends AgentProtocol>(
     stableIdentity &&
     right.attempt > left.attempt &&
     right.executionEpoch !== left.executionEpoch &&
-    parseChildFencingToken(right.executionFencingToken) >
-      parseChildFencingToken(left.executionFencingToken) &&
+    compareCanonicalFencingTokens(right.executionFencingToken, left.executionFencingToken) > 0 &&
     Number.isSafeInteger(right.limits.timeoutMs) &&
     right.limits.timeoutMs > 0 &&
     right.limits.timeoutMs <= left.limits.timeoutMs;
@@ -4123,17 +4222,6 @@ function sameChildStableLimits(
     left.maxOutputTokens === right.maxOutputTokens &&
     left.maxCost === right.maxCost
   );
-}
-
-function parseChildFencingToken(value: string): bigint {
-  if (!/^(?:0|[1-9][0-9]*)$/u.test(value)) {
-    throw new SubAgentRuntimeError({
-      code: 'RECOVERY_TARGET_LOST',
-      message: 'A child Agent execution requires a decimal fencing token.',
-      retryable: false,
-    });
-  }
-  return BigInt(value);
 }
 
 function isSubAgentDelegationClient(
@@ -4350,10 +4438,10 @@ function projectAuthoritativeResultSubmission(
 }
 
 function resultReadyChildModelOperation<P extends AgentProtocol>(
-  operation: DurableAgentModelOperationV1,
+  operation: SubAgentChildModelOperationV1,
   messages: readonly ContextOf<P>[],
   codec: AgentProtocolCheckpointCodec<P>,
-): DurableAgentModelOperationV1 {
+): SubAgentChildModelOperationV1 {
   return Object.freeze({
     ...operation,
     phase: 'result_ready' as const,
@@ -4364,6 +4452,24 @@ function resultReadyChildModelOperation<P extends AgentProtocol>(
     }),
     updatedAt: Date.now(),
   });
+}
+
+function requireChildModelOperation(
+  operation: DurableAgentModelOperationV1,
+): SubAgentChildModelOperationV1 {
+  requirePositiveRequestAttempt(
+    (operation as Partial<SubAgentChildModelOperationV1>).requestAttempt,
+  );
+  return operation as SubAgentChildModelOperationV1;
+}
+
+function requirePositiveRequestAttempt(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw checkpointMismatchError(
+      'A child Model operation requires a positive requestAttempt identity.',
+    );
+  }
+  return value as number;
 }
 
 function childTaskIdentity<P extends AgentProtocol>(options: AgentSubAgentRunOptions<P>) {

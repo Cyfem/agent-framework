@@ -12,6 +12,33 @@ import {
 } from '../src/subagent/runtime-support';
 
 describe('subagent execution lease support', () => {
+  it('rejects and releases a StateStore lease with a non-canonical fencing token', async () => {
+    let releases = 0;
+    const invalidLease: StateLease = {
+      key: 'subagent-task:session-1:task-invalid-fence',
+      fencingToken: 'opaque-fence',
+      expiresAt: Date.now() + 1_000,
+      renew: async () => invalidLease,
+      release: async () => {
+        releases += 1;
+      },
+    };
+    const store = {
+      acquireLease: async () => invalidLease,
+    } as unknown as AgentRuntimeStateStore;
+
+    await expect(
+      acquireRuntimeLease(
+        store,
+        invalidLease.key,
+        new AbortController().signal,
+        Date.now() + 1_000,
+      ),
+    ).rejects.toThrow('canonical unsigned decimal string');
+    await waitImmediate();
+    expect(releases).toBe(1);
+  });
+
   it('uses a host-monotonic proof boundary instead of the StateStore clock domain', async () => {
     const scheduler = new ManualLeaseScheduler(100);
     const signal = new AbortController().signal;
@@ -276,6 +303,46 @@ describe('subagent execution lease support', () => {
     );
 
     scheduler.advanceTo(3_010);
+    await waitImmediate();
+    expect(lease.signal.reason).toMatchObject({
+      code: 'RECOVERY_TARGET_LOST',
+      descriptor: { causeCode: 'EXECUTION_LEASE_LOST' },
+    });
+    expect(invalidRenewalReleases).toBe(1);
+    await lease.stop();
+  });
+
+  it('rejects and releases a renewal with a non-canonical fencing token', async () => {
+    const scheduler = new ManualLeaseScheduler(4_000);
+    let invalidRenewalReleases = 0;
+    const original: StateLease = {
+      key: 'subagent-task:session-1:task-invalid-renewed-fence',
+      fencingToken: '48',
+      expiresAt: 17_000,
+      renew: async () => invalid,
+      release: async () => undefined,
+    };
+    const invalid: StateLease = {
+      ...original,
+      fencingToken: '048',
+      release: async () => {
+        invalidRenewalReleases += 1;
+      },
+    };
+    const store = {
+      acquireLease: async () => original,
+    } as unknown as AgentRuntimeStateStore;
+    const lease = await acquireRenewingRuntimeLease(
+      store,
+      original.key,
+      new AbortController().signal,
+      Date.now() + 1_000,
+      30,
+      scheduler,
+      scheduler.now,
+    );
+
+    scheduler.advanceTo(4_010);
     await waitImmediate();
     expect(lease.signal.reason).toMatchObject({
       code: 'RECOVERY_TARGET_LOST',

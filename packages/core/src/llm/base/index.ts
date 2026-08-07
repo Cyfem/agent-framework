@@ -23,6 +23,7 @@ export type {
   ModelGeneratePurpose,
   ModelGenerateRequest,
   ModelGenerateResult,
+  ModelGenerateUsage,
   ModelRuntimeMetadata,
 } from './types';
 
@@ -33,6 +34,12 @@ export type {
  * `generate()` 负责实际模型请求。
  */
 export abstract class Model<P extends AgentProtocol> {
+  /**
+   * Declared SDK/provider retry ceiling for one `generate()` dispatch. Transport gateways accept
+   * only Models that explicitly declare zero; custom Models remain responsible for honoring it.
+   */
+  readonly providerMaxRetries: number | undefined = undefined;
+
   /**
    * Optional durable-context codec associated with this protocol adapter.
    *

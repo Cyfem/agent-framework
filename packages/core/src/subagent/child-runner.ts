@@ -15,6 +15,7 @@ export interface SubAgentChildRunRequest<I extends JsonValue = JsonValue> {
   readonly path: readonly string[];
   readonly attempt: number;
   readonly executionEpoch: string;
+  /** Canonical unsigned base-10 fencing token for the active child execution lease. */
   readonly executionFencingToken: string;
   readonly definition: SubAgentDefinitionRef;
   readonly input: I;

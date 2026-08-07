@@ -157,6 +157,7 @@ export interface StoredTask {
   readonly depth: number;
   readonly attempt: number;
   readonly executionEpoch?: string;
+  /** Canonical unsigned base-10 fencing token when an execution epoch is active. */
   readonly executionFencingToken?: string;
   readonly executorOperation?: StoredExecutorOperationV1;
   readonly retryOf?: string;
@@ -189,9 +190,11 @@ export type CreateStoredTaskResult =
   | { readonly status: 'existing'; readonly task: StoredTask };
 
 /**
- * Monotonic lease; a takeover increments fencingToken while renew does not. `expiresAt` belongs to
- * the issuing StateStore's logical clock domain and must not be compared with an unrelated host
- * wall clock.
+ * Monotonic lease; a takeover increments fencingToken while renew does not. `fencingToken` is a
+ * canonical unsigned base-10 integer string (`0` or a non-zero digit followed by digits). This
+ * representation is part of the public Store contract so placement recovery can compare tokens
+ * without a Store-specific comparator. `expiresAt` belongs to the issuing StateStore's logical
+ * clock domain and must not be compared with an unrelated host wall clock.
  */
 export interface StateLease {
   readonly key: string;

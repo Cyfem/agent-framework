@@ -1,7 +1,17 @@
 import { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -9,6 +19,8 @@ import { clearTimeout, setTimeout } from 'node:timers';
 import { fileURLToPath } from 'node:url';
 
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
+const MAX_PACK_CONTENT_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_PACK_CONTENT_TOTAL_BYTES = 256 * 1024 * 1024;
 const NPM_PACK_TIMEOUT_MS = 120_000;
 const PACK_CHILD_TIMEOUT_MS = 60_000;
 const FORBIDDEN_PATH_SEGMENTS = new Set(['plans', 'source', 'src', 'test', 'testkit', 'tests']);
@@ -37,6 +49,32 @@ const SENSITIVE_PACKAGE_PATH_PATTERNS = [
   /(?:^|\/)(?:access[._-]?token|auth|refresh[._-]?token|token)\.(?:ini|json|toml|txt|ya?ml)$/iu,
   /\.(?:cer|cert|crt|jks|key|keystore|log|p12|pem|pfx)$/iu,
 ];
+const SENSITIVE_PACKAGE_CONTENT_PATTERNS = Object.freeze([
+  Object.freeze({
+    label: 'private-key material',
+    pattern: /-----BEGIN (?:EC |OPENSSH |PGP |RSA )?PRIVATE KEY-----/iu,
+  }),
+  Object.freeze({
+    label: 'AWS access key ID',
+    pattern: /(?:^|[^A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?:[^A-Z0-9]|$)/u,
+  }),
+  Object.freeze({
+    label: 'provider API token',
+    pattern: /(?:^|[^A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{20,}(?:[^A-Za-z0-9_-]|$)/u,
+  }),
+  Object.freeze({
+    label: 'GitHub access token',
+    pattern: /(?:^|[^A-Za-z0-9_])gh[oprsu]_[A-Za-z0-9]{36,}(?:[^A-Za-z0-9]|$)/u,
+  }),
+  Object.freeze({
+    label: 'Slack access token',
+    pattern: /(?:^|[^A-Za-z0-9-])xox[aboprs]-[A-Za-z0-9-]{20,}(?:[^A-Za-z0-9-]|$)/u,
+  }),
+  Object.freeze({
+    label: 'pack-validator secret marker',
+    pattern: /\bMANEE_PACK_CONTENT_SECRET_[A-Z0-9]{16,}\b/u,
+  }),
+]);
 const RELEASE_PACKAGE_CONTRACTS = Object.freeze({
   '@ruixutong.manee/maneeagent-framework': Object.freeze({
     peerDependencies: Object.freeze({}),
@@ -311,13 +349,25 @@ function createConsumerSource(packageName) {
     return `import * as frameworkNamespace from '${packageName}';
 import {
   Agent,
+  MemoryProviderOperationLedgerStore,
+  ProviderOperationLedger,
   SUBAGENT_TRANSPORT_VERSION,
+  SubAgentTargetRunnerRegistry,
+  SubAgentTransportExecutorBridge,
+  SubAgentTransportModelGatewayHandler,
+  SubAgentTransportModelGatewayRegistry,
   SubAgentTransportPeer,
   SubAgentTransportSequenceTracker,
+  SubAgentTransportTargetBridge,
+  SubAgentTransportTaskHandleRegistry,
+  createOpenAIChatProtocolSurface,
+  createOpenAIResponsesProtocolSurface,
   createSubAgentTransportArtifactSidecar,
   createSubAgentTransportControlDispatcher,
+  createSubAgentTransportExecutorBridge,
   createSubAgentTransportPeerWriterAdmission,
   createSubAgentTransportRpcEnvelope,
+  createSubAgentTransportTargetBridge,
   type AgentRunOutcome,
   type OpenAIChatProtocol,
   type SubAgentExecutionRequestWire,
@@ -326,6 +376,7 @@ import {
   type SubAgentTransportPeerPacket,
   type SubAgentTransportPeerWriterAdmission,
   type SubAgentTransportRpcEnvelope,
+  type SubAgentTransportRpcKind,
 } from '${packageName}';
 
 type IsAny<T> = 0 extends 1 & T ? true : false;
@@ -338,6 +389,14 @@ type CoreContractAssertions = [
   AssertFalse<IsAny<typeof Agent>>,
   AssertFalse<IsAny<ConstructorParameters<typeof Agent>>>,
   AssertFalse<IsAny<ConstructorParameters<typeof Agent>[0]>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof ProviderOperationLedger>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof MemoryProviderOperationLedgerStore>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof SubAgentTargetRunnerRegistry>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof SubAgentTransportExecutorBridge>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof SubAgentTransportModelGatewayHandler>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof SubAgentTransportModelGatewayRegistry>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof SubAgentTransportTargetBridge>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof SubAgentTransportTaskHandleRegistry>>>,
   AssertFalse<IsAny<typeof SubAgentTransportSequenceTracker>>,
   AssertFalse<IsAny<ConstructorParameters<typeof SubAgentTransportSequenceTracker>>>,
   AssertFalse<IsAny<typeof SubAgentTransportPeer>>,
@@ -346,6 +405,10 @@ type CoreContractAssertions = [
   AssertFalse<IsAny<typeof createSubAgentTransportControlDispatcher>>,
   AssertFalse<IsAny<typeof createSubAgentTransportPeerWriterAdmission>>,
   AssertFalse<IsAny<typeof createSubAgentTransportArtifactSidecar>>,
+  AssertFalse<IsAny<typeof createOpenAIChatProtocolSurface>>,
+  AssertFalse<IsAny<typeof createOpenAIResponsesProtocolSurface>>,
+  AssertFalse<IsAny<typeof createSubAgentTransportExecutorBridge>>,
+  AssertFalse<IsAny<typeof createSubAgentTransportTargetBridge>>,
   AssertFalse<IsAny<AgentRunOutcome<OpenAIChatProtocol>>>,
   AssertFalse<IsAny<SubAgentExecutionRequestWire>>,
   AssertFalse<IsAny<SubAgentExecutionRequestWire['input']>>,
@@ -355,6 +418,7 @@ type CoreContractAssertions = [
   AssertFalse<IsAny<SubAgentTransportPeerWriterAdmission>>,
   AssertFalse<IsAny<SubAgentTransportRpcEnvelope>>,
   AssertTrue<Equal<SubAgentExecutionRequestWire['remainingMs'], number>>,
+  AssertTrue<Equal<SubAgentTransportRpcKind, 'executor.request' | 'executor.accepted' | 'executor.settled' | 'control.request' | 'control.reply' | 'cancel.request' | 'cancel.ack' | 'snapshot.request' | 'snapshot.reply' | 'events.request' | 'events.page' | 'model.request' | 'model.reply' | 'protocol.error'>>,
   AssertTrue<Equal<AgentRunOutcome<OpenAIChatProtocol>['status'], 'succeeded' | 'waiting_approval' | 'cancelled' | 'failed'>>,
   AssertTrue<Equal<SubAgentExecutorOperationResult['type'], 'terminal' | 'paused' | 'recovery_required'>>,
 ];
@@ -362,12 +426,24 @@ type CoreContractAssertions = [
 const transportVersion: '1' = SUBAGENT_TRANSPORT_VERSION;
 const publicValues = [
   Agent,
+  MemoryProviderOperationLedgerStore,
+  ProviderOperationLedger,
+  SubAgentTargetRunnerRegistry,
+  SubAgentTransportExecutorBridge,
+  SubAgentTransportModelGatewayHandler,
+  SubAgentTransportModelGatewayRegistry,
   SubAgentTransportPeer,
   SubAgentTransportSequenceTracker,
+  SubAgentTransportTargetBridge,
+  SubAgentTransportTaskHandleRegistry,
+  createOpenAIChatProtocolSurface,
+  createOpenAIResponsesProtocolSurface,
   createSubAgentTransportArtifactSidecar,
   createSubAgentTransportControlDispatcher,
+  createSubAgentTransportExecutorBridge,
   createSubAgentTransportPeerWriterAdmission,
   createSubAgentTransportRpcEnvelope,
+  createSubAgentTransportTargetBridge,
   transportVersion,
 ] as const;
 export type PublicContracts =
@@ -377,12 +453,31 @@ export type PublicContracts =
   | SubAgentTransportControlRequest
   | SubAgentTransportPeerPacket
   | SubAgentTransportPeerWriterAdmission
-  | SubAgentTransportRpcEnvelope;
+  | SubAgentTransportRpcEnvelope
+  | SubAgentTransportRpcKind;
 declare const coreContractAssertions: CoreContractAssertions;
 void publicValues;
 void coreContractAssertions;
 // @ts-expect-error The packed declaration surface must not degrade to any.
 frameworkNamespace.__maneeMissingExport;
+// @ts-expect-error Test-only ledger failpoints must not be exported from the package root.
+frameworkNamespace.setProviderOperationFailpointForTest;
+// @ts-expect-error Test-only ledger failpoint readers must not be exported from the package root.
+frameworkNamespace.providerOperationFailpointForTest;
+// @ts-expect-error Internal protocol-surface audit markers must not be exported from the package root.
+frameworkNamespace.markAuditedSubAgentTransportModelProtocolSurface;
+// @ts-expect-error Internal protocol-surface audit readers must not be exported from the package root.
+frameworkNamespace.isAuditedSubAgentTransportModelProtocolSurface;
+// @ts-expect-error Internal fencing validators must not be exported from the package root.
+frameworkNamespace.assertCanonicalFencingToken;
+// @ts-expect-error Internal fencing predicates must not be exported from the package root.
+frameworkNamespace.isCanonicalFencingToken;
+// @ts-expect-error Internal fencing comparators must not be exported from the package root.
+frameworkNamespace.compareCanonicalFencingTokens;
+// @ts-expect-error Test-only ledger failpoint types must not be exported from the package root.
+type ForbiddenProviderOperationFailpoint = frameworkNamespace.ProviderOperationFailpoint;
+// @ts-expect-error Test-only ledger failpoint phase types must not be exported from the package root.
+type ForbiddenProviderOperationFailpointPhase = frameworkNamespace.ProviderOperationFailpointPhase;
 `;
   }
   if (packageName === '@ruixutong.manee/maneeagent-executor-local') {
@@ -452,6 +547,14 @@ type CoreContractAssertions = [
   AssertFalse<IsAny<typeof framework.Agent>>,
   AssertFalse<IsAny<ConstructorParameters<typeof framework.Agent>>>,
   AssertFalse<IsAny<ConstructorParameters<typeof framework.Agent>[0]>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof framework.ProviderOperationLedger>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof framework.MemoryProviderOperationLedgerStore>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof framework.SubAgentTargetRunnerRegistry>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof framework.SubAgentTransportExecutorBridge>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof framework.SubAgentTransportModelGatewayHandler>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof framework.SubAgentTransportModelGatewayRegistry>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof framework.SubAgentTransportTargetBridge>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof framework.SubAgentTransportTaskHandleRegistry>>>,
   AssertFalse<IsAny<typeof framework.SubAgentTransportSequenceTracker>>,
   AssertFalse<IsAny<ConstructorParameters<typeof framework.SubAgentTransportSequenceTracker>>>,
   AssertFalse<IsAny<typeof framework.SubAgentTransportPeer>>,
@@ -460,6 +563,10 @@ type CoreContractAssertions = [
   AssertFalse<IsAny<typeof framework.createSubAgentTransportControlDispatcher>>,
   AssertFalse<IsAny<typeof framework.createSubAgentTransportPeerWriterAdmission>>,
   AssertFalse<IsAny<typeof framework.createSubAgentTransportArtifactSidecar>>,
+  AssertFalse<IsAny<typeof framework.createOpenAIChatProtocolSurface>>,
+  AssertFalse<IsAny<typeof framework.createOpenAIResponsesProtocolSurface>>,
+  AssertFalse<IsAny<typeof framework.createSubAgentTransportExecutorBridge>>,
+  AssertFalse<IsAny<typeof framework.createSubAgentTransportTargetBridge>>,
   AssertFalse<IsAny<framework.AgentRunOutcome<framework.OpenAIChatProtocol>>>,
   AssertFalse<IsAny<framework.SubAgentExecutionRequestWire>>,
   AssertFalse<IsAny<framework.SubAgentExecutionRequestWire['input']>>,
@@ -469,6 +576,7 @@ type CoreContractAssertions = [
   AssertFalse<IsAny<framework.SubAgentTransportPeerWriterAdmission>>,
   AssertFalse<IsAny<framework.SubAgentTransportRpcEnvelope>>,
   AssertTrue<Equal<framework.SubAgentExecutionRequestWire['remainingMs'], number>>,
+  AssertTrue<Equal<framework.SubAgentTransportRpcKind, 'executor.request' | 'executor.accepted' | 'executor.settled' | 'control.request' | 'control.reply' | 'cancel.request' | 'cancel.ack' | 'snapshot.request' | 'snapshot.reply' | 'events.request' | 'events.page' | 'model.request' | 'model.reply' | 'protocol.error'>>,
   AssertTrue<Equal<framework.AgentRunOutcome<framework.OpenAIChatProtocol>['status'], 'succeeded' | 'waiting_approval' | 'cancelled' | 'failed'>>,
   AssertTrue<Equal<framework.SubAgentExecutorOperationResult['type'], 'terminal' | 'paused' | 'recovery_required'>>,
 ];
@@ -476,12 +584,24 @@ type CoreContractAssertions = [
 const transportVersion: '1' = framework.SUBAGENT_TRANSPORT_VERSION;
 const publicValues = [
   framework.Agent,
+  framework.MemoryProviderOperationLedgerStore,
+  framework.ProviderOperationLedger,
+  framework.SubAgentTargetRunnerRegistry,
+  framework.SubAgentTransportExecutorBridge,
+  framework.SubAgentTransportModelGatewayHandler,
+  framework.SubAgentTransportModelGatewayRegistry,
   framework.SubAgentTransportPeer,
   framework.SubAgentTransportSequenceTracker,
+  framework.SubAgentTransportTargetBridge,
+  framework.SubAgentTransportTaskHandleRegistry,
+  framework.createOpenAIChatProtocolSurface,
+  framework.createOpenAIResponsesProtocolSurface,
   framework.createSubAgentTransportArtifactSidecar,
   framework.createSubAgentTransportControlDispatcher,
+  framework.createSubAgentTransportExecutorBridge,
   framework.createSubAgentTransportPeerWriterAdmission,
   framework.createSubAgentTransportRpcEnvelope,
+  framework.createSubAgentTransportTargetBridge,
   transportVersion,
 ] as const;
 type PublicContracts =
@@ -491,7 +611,8 @@ type PublicContracts =
   | framework.SubAgentTransportControlRequest
   | framework.SubAgentTransportPeerPacket
   | framework.SubAgentTransportPeerWriterAdmission
-  | framework.SubAgentTransportRpcEnvelope;
+  | framework.SubAgentTransportRpcEnvelope
+  | framework.SubAgentTransportRpcKind;
 declare const coreContractAssertions: CoreContractAssertions;
 declare const publicContract: PublicContracts;
 void publicValues;
@@ -499,6 +620,24 @@ void publicContract;
 void coreContractAssertions;
 // @ts-expect-error The packed declaration surface must not degrade to any.
 framework.__maneeMissingExport;
+// @ts-expect-error Test-only ledger failpoints must not be exported from the package root.
+framework.setProviderOperationFailpointForTest;
+// @ts-expect-error Test-only ledger failpoint readers must not be exported from the package root.
+framework.providerOperationFailpointForTest;
+// @ts-expect-error Internal protocol-surface audit markers must not be exported from the package root.
+framework.markAuditedSubAgentTransportModelProtocolSurface;
+// @ts-expect-error Internal protocol-surface audit readers must not be exported from the package root.
+framework.isAuditedSubAgentTransportModelProtocolSurface;
+// @ts-expect-error Internal fencing validators must not be exported from the package root.
+framework.assertCanonicalFencingToken;
+// @ts-expect-error Internal fencing predicates must not be exported from the package root.
+framework.isCanonicalFencingToken;
+// @ts-expect-error Internal fencing comparators must not be exported from the package root.
+framework.compareCanonicalFencingTokens;
+// @ts-expect-error Test-only ledger failpoint types must not be exported from the package root.
+type ForbiddenProviderOperationFailpoint = framework.ProviderOperationFailpoint;
+// @ts-expect-error Test-only ledger failpoint phase types must not be exported from the package root.
+type ForbiddenProviderOperationFailpointPhase = framework.ProviderOperationFailpointPhase;
 `;
   }
   if (packageName === '@ruixutong.manee/maneeagent-executor-local') {
@@ -557,13 +696,25 @@ function createRuntimeSmokeSource(packageName, format) {
   if (packageName === '@ruixutong.manee/maneeagent-framework') {
     checks.push(
       `[packageApi.Agent, 'Agent', 'function']`,
+      `[packageApi.MemoryProviderOperationLedgerStore, 'MemoryProviderOperationLedgerStore', 'function']`,
+      `[packageApi.ProviderOperationLedger, 'ProviderOperationLedger', 'function']`,
+      `[packageApi.SubAgentTargetRunnerRegistry, 'SubAgentTargetRunnerRegistry', 'function']`,
+      `[packageApi.SubAgentTransportExecutorBridge, 'SubAgentTransportExecutorBridge', 'function']`,
+      `[packageApi.SubAgentTransportModelGatewayHandler, 'SubAgentTransportModelGatewayHandler', 'function']`,
+      `[packageApi.SubAgentTransportModelGatewayRegistry, 'SubAgentTransportModelGatewayRegistry', 'function']`,
       `[packageApi.SubAgentTransportPeer, 'SubAgentTransportPeer', 'function']`,
       `[packageApi.SubAgentTransportSequenceTracker, 'SubAgentTransportSequenceTracker', 'function']`,
+      `[packageApi.SubAgentTransportTargetBridge, 'SubAgentTransportTargetBridge', 'function']`,
+      `[packageApi.SubAgentTransportTaskHandleRegistry, 'SubAgentTransportTaskHandleRegistry', 'function']`,
+      `[packageApi.createOpenAIChatProtocolSurface, 'createOpenAIChatProtocolSurface', 'function']`,
+      `[packageApi.createOpenAIResponsesProtocolSurface, 'createOpenAIResponsesProtocolSurface', 'function']`,
       `[packageApi.createSubAgentRuntime, 'createSubAgentRuntime', 'function']`,
       `[packageApi.createSubAgentTransportArtifactSidecar, 'createSubAgentTransportArtifactSidecar', 'function']`,
       `[packageApi.createSubAgentTransportControlDispatcher, 'createSubAgentTransportControlDispatcher', 'function']`,
+      `[packageApi.createSubAgentTransportExecutorBridge, 'createSubAgentTransportExecutorBridge', 'function']`,
       `[packageApi.createSubAgentTransportPeerWriterAdmission, 'createSubAgentTransportPeerWriterAdmission', 'function']`,
       `[packageApi.createSubAgentTransportRpcEnvelope, 'createSubAgentTransportRpcEnvelope', 'function']`,
+      `[packageApi.createSubAgentTransportTargetBridge, 'createSubAgentTransportTargetBridge', 'function']`,
     );
     return `${load}
 function expectType([value, name, expected]) {
@@ -572,6 +723,29 @@ function expectType([value, name, expected]) {
 for (const check of [${checks.join(', ')}]) expectType(check);
 if (packageApi.SUBAGENT_TRANSPORT_VERSION !== '1') {
   throw new Error('${packageName} SUBAGENT_TRANSPORT_VERSION must equal "1"');
+}
+const expectedRpcKinds = ['executor.request', 'executor.accepted', 'executor.settled', 'control.request', 'control.reply', 'cancel.request', 'cancel.ack', 'snapshot.request', 'snapshot.reply', 'events.request', 'events.page', 'model.request', 'model.reply', 'protocol.error'];
+if (JSON.stringify(packageApi.SUBAGENT_TRANSPORT_RPC_KINDS) !== JSON.stringify(expectedRpcKinds)) {
+  throw new Error('${packageName} must expose the exact 14-kind Subagent RPC vocabulary');
+}
+for (const surface of [packageApi.createOpenAIChatProtocolSurface(), packageApi.createOpenAIResponsesProtocolSurface()]) {
+  if (!Object.isFrozen(surface) || 'generate' in surface) {
+    throw new Error('${packageName} protocol surfaces must be frozen and credential-free');
+  }
+}
+const forbiddenRootExports = [
+  'setProviderOperationFailpointForTest',
+  'providerOperationFailpointForTest',
+  'markAuditedSubAgentTransportModelProtocolSurface',
+  'isAuditedSubAgentTransportModelProtocolSurface',
+  'assertCanonicalFencingToken',
+  'isCanonicalFencingToken',
+  'compareCanonicalFencingTokens',
+];
+for (const name of forbiddenRootExports) {
+  if (Object.prototype.hasOwnProperty.call(packageApi, name)) {
+    throw new Error(\`${packageName} must not expose internal root export \${name}\`);
+  }
 }
 `;
   }
@@ -804,6 +978,50 @@ function assertSafePackageFiles(fileList, packageName) {
   return files;
 }
 
+async function assertSafePackedArchiveContents(archive, fileList, packageName) {
+  assert(Buffer.isBuffer(archive), `${packageName} npm pack archive is required for content scan`);
+  const scanDirectory = await mkdtemp(path.join(tmpdir(), 'manee-pack-content-'));
+  try {
+    const archivePath = path.join(scanDirectory, 'package.tgz');
+    const unpackDirectory = path.join(scanDirectory, 'unpacked');
+    await mkdir(unpackDirectory, { recursive: true });
+    await writeFile(archivePath, archive);
+    await runChild(
+      'tar',
+      ['-xzf', archivePath, '-C', unpackDirectory, '--strip-components=1'],
+      { cwd: scanDirectory },
+      `extracting npm pack archive for ${packageName} content scan failed; a system tar executable with gzip support is required`,
+    );
+
+    let totalBytes = 0;
+    for (const file of fileList) {
+      const unpackedPath = path.join(unpackDirectory, ...file.split('/'));
+      const metadata = await lstat(unpackedPath).catch(() => null);
+      assert(metadata !== null, `${packageName} packed content is missing: ${file}`);
+      assert(metadata.isFile(), `${packageName} packed content must be a regular file: ${file}`);
+      assert(
+        metadata.size <= MAX_PACK_CONTENT_FILE_BYTES,
+        `${packageName} packed content exceeds the per-file scan limit: ${file}`,
+      );
+      totalBytes += metadata.size;
+      assert(
+        totalBytes <= MAX_PACK_CONTENT_TOTAL_BYTES,
+        `${packageName} packed content exceeds the aggregate scan limit`,
+      );
+
+      const source = await readFile(unpackedPath, 'utf8');
+      for (const { label, pattern } of SENSITIVE_PACKAGE_CONTENT_PATTERNS) {
+        assert(
+          !pattern.test(source),
+          `${packageName} npm pack output contains secret-like content (${label}) in ${file}`,
+        );
+      }
+    }
+  } finally {
+    await rm(scanDirectory, { force: true, maxRetries: 5, recursive: true, retryDelay: 100 });
+  }
+}
+
 function parseSemver(value, field) {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/u.exec(value);
   assert(match !== null, `${field} must be a simple semantic version`);
@@ -945,6 +1163,7 @@ async function createPackageArtifact({ packageDirectory, expectedPackageName, ex
     JSON.stringify(actualFiles) === JSON.stringify([...fileList].sort()),
     'actual npm pack file list differs from dry-run',
   );
+  await assertSafePackedArchiveContents(actual.archive, actualFiles, packageJson.name);
   return {
     archive: actual.archive,
     packageDirectory: resolvedDirectory,

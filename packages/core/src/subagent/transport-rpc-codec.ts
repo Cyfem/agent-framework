@@ -36,6 +36,7 @@ const REQUEST_KINDS = new Set<string>([
   'cancel.request',
   'snapshot.request',
   'events.request',
+  'model.request',
 ]);
 const REPLY_KINDS = new Set<string>([
   'executor.accepted',
@@ -44,6 +45,7 @@ const REPLY_KINDS = new Set<string>([
   'cancel.ack',
   'snapshot.reply',
   'events.page',
+  'model.reply',
 ]);
 const TASK_STATES = new Set<string>([
   'queued',
@@ -95,6 +97,7 @@ const SUBAGENT_ERROR_CODE_SET = new Set<string>(SUBAGENT_ERROR_CODES);
 const PROTOCOL_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/+-]*$/u;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/u;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const MAX_SAFE_MESSAGE_BYTES = 4_096;
 const MAX_EVENTS_PER_PAGE = 256;
 
@@ -279,7 +282,16 @@ function assertRpcPayload(
       return;
     }
     case 'control.request': {
-      const record = closedRecord(payload, kind, ['method', 'args']);
+      const record = closedRecord(payload, kind, [
+        'executionAttempt',
+        'executionEpoch',
+        'executionFencingToken',
+        'method',
+        'args',
+      ]);
+      assertPositiveSafeInteger(record.executionAttempt, `${kind}.executionAttempt`);
+      assertIdentifier(record.executionEpoch, `${kind}.executionEpoch`);
+      assertDecimalFencingToken(record.executionFencingToken, `${kind}.executionFencingToken`);
       try {
         assertSubAgentTransportControlRequest(
           {
@@ -395,10 +407,155 @@ function assertRpcPayload(
       }
       return;
     }
+    case 'model.request': {
+      const record = closedRecord(
+        payload,
+        kind,
+        [
+          'providerOperationId',
+          'gatewayId',
+          'protocol',
+          'codecVersion',
+          'runId',
+          'executionAttempt',
+          'executionEpoch',
+          'executionFencingToken',
+          'checkpointOperationId',
+          'checkpointDigest',
+          'purpose',
+          'iteration',
+          'requestAttempt',
+          'requestHash',
+          'context',
+          'tools',
+        ],
+        ['remainingMs'],
+      );
+      assertIdentifier(record.providerOperationId, `${kind}.providerOperationId`);
+      if (record.providerOperationId !== envelope.operationId) {
+        throw rpcError(
+          'invalid-rpc-routing',
+          'model.request providerOperationId must match envelope operationId.',
+        );
+      }
+      assertIdentifier(record.gatewayId, `${kind}.gatewayId`);
+      assertProtocolToken(record.protocol, `${kind}.protocol`);
+      assertProtocolToken(record.codecVersion, `${kind}.codecVersion`);
+      assertIdentifier(record.runId, `${kind}.runId`);
+      assertPositiveSafeInteger(record.executionAttempt, `${kind}.executionAttempt`);
+      assertIdentifier(record.executionEpoch, `${kind}.executionEpoch`);
+      assertDecimalFencingToken(record.executionFencingToken, `${kind}.executionFencingToken`);
+      assertIdentifier(record.checkpointOperationId, `${kind}.checkpointOperationId`);
+      assertSha256(record.checkpointDigest, `${kind}.checkpointDigest`);
+      if (record.purpose !== 'agent' && record.purpose !== 'context-summary') {
+        throw rpcError('invalid-rpc-payload', `${kind}.purpose is invalid.`);
+      }
+      assertNonNegativeSafeInteger(record.iteration, `${kind}.iteration`);
+      assertPositiveSafeInteger(record.requestAttempt, `${kind}.requestAttempt`);
+      assertSha256(record.requestHash, `${kind}.requestHash`);
+      if (!Array.isArray(record.context)) {
+        throw rpcError('invalid-rpc-payload', `${kind}.context must be an encoded context array.`);
+      }
+      if (!Array.isArray(record.tools)) {
+        throw rpcError('invalid-rpc-payload', `${kind}.tools must be an encoded tools array.`);
+      }
+      if (record.remainingMs !== undefined) {
+        assertNonNegativeSafeInteger(record.remainingMs, `${kind}.remainingMs`);
+      }
+      return;
+    }
+    case 'model.reply': {
+      const record = recordValue(payload, kind);
+      const common = [
+        'providerOperationId',
+        'gatewayId',
+        'protocol',
+        'codecVersion',
+        'runId',
+        'executionAttempt',
+        'executionEpoch',
+        'executionFencingToken',
+        'checkpointOperationId',
+        'checkpointDigest',
+        'requestHash',
+        'ok',
+      ];
+      if (record.ok === true) {
+        assertKeys(record, kind, [...common, 'resultHash', 'messages'], ['usage']);
+      } else if (record.ok === false) {
+        assertKeys(record, kind, [...common, 'error'], ['classification']);
+      } else {
+        throw rpcError('invalid-rpc-payload', `${kind}.ok must be a boolean literal.`);
+      }
+      assertIdentifier(record.providerOperationId, `${kind}.providerOperationId`);
+      if (record.providerOperationId !== envelope.operationId) {
+        throw rpcError(
+          'invalid-rpc-routing',
+          'model.reply providerOperationId must match envelope operationId.',
+        );
+      }
+      assertIdentifier(record.gatewayId, `${kind}.gatewayId`);
+      assertProtocolToken(record.protocol, `${kind}.protocol`);
+      assertProtocolToken(record.codecVersion, `${kind}.codecVersion`);
+      assertIdentifier(record.runId, `${kind}.runId`);
+      assertPositiveSafeInteger(record.executionAttempt, `${kind}.executionAttempt`);
+      assertIdentifier(record.executionEpoch, `${kind}.executionEpoch`);
+      assertDecimalFencingToken(record.executionFencingToken, `${kind}.executionFencingToken`);
+      assertIdentifier(record.checkpointOperationId, `${kind}.checkpointOperationId`);
+      assertSha256(record.checkpointDigest, `${kind}.checkpointDigest`);
+      assertSha256(record.requestHash, `${kind}.requestHash`);
+      if (record.ok === false) {
+        assertSafeError(record.error, `${kind}.error`);
+        if (record.classification !== undefined) {
+          assertModelErrorClassification(record.classification, `${kind}.classification`);
+        }
+        return;
+      }
+      assertSha256(record.resultHash, `${kind}.resultHash`);
+      if (!Array.isArray(record.messages)) {
+        throw rpcError('invalid-rpc-payload', `${kind}.messages must be an encoded context array.`);
+      }
+      if (record.usage !== undefined) assertModelUsage(record.usage, `${kind}.usage`);
+      return;
+    }
     case 'protocol.error': {
       const record = closedRecord(payload, kind, ['error']);
       assertSafeError(record.error, `${kind}.error`);
     }
+  }
+}
+
+function assertModelUsage(value: unknown, label: string): void {
+  const record = closedRecord(value, label, [], ['inputTokens', 'outputTokens', 'totalTokens']);
+  if (Object.keys(record).length === 0) {
+    throw rpcError('invalid-rpc-payload', `${label} must contain at least one token count.`);
+  }
+  for (const key of ['inputTokens', 'outputTokens', 'totalTokens'] as const) {
+    if (record[key] !== undefined) assertNonNegativeSafeInteger(record[key], `${label}.${key}`);
+  }
+}
+
+function assertModelErrorClassification(value: unknown, label: string): void {
+  const record = closedRecord(value, label, ['kind', 'status']);
+  assertProtocolToken(record.kind, `${label}.kind`);
+  if (
+    !Number.isSafeInteger(record.status) ||
+    (record.status as number) < 400 ||
+    (record.status as number) > 599
+  ) {
+    throw rpcError('invalid-rpc-payload', `${label}.status must be an HTTP 4xx/5xx status.`);
+  }
+}
+
+function assertSha256(value: unknown, label: string): asserts value is string {
+  if (typeof value !== 'string' || !SHA256_PATTERN.test(value)) {
+    throw rpcError('invalid-rpc-payload', `${label} must be a lowercase SHA-256 digest.`);
+  }
+}
+
+function assertDecimalFencingToken(value: unknown, label: string): asserts value is string {
+  if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)$/u.test(value)) {
+    throw rpcError('invalid-rpc-payload', `${label} must be a canonical decimal token.`);
   }
 }
 
@@ -514,19 +671,24 @@ function assertApproval(value: unknown): string {
 }
 
 function assertBinding(value: unknown, label: string): UnknownRecord {
-  const record = closedRecord(value, label, [
-    'version',
-    'executorName',
-    'ownerSessionId',
-    'taskId',
-    'subagentSessionId',
-    'definitionName',
-    'definitionVersion',
-    'runnerId',
-    'runnerVersion',
-    'adapterStateVersion',
-    'recoveryData',
-  ]);
+  const record = closedRecord(
+    value,
+    label,
+    [
+      'version',
+      'executorName',
+      'ownerSessionId',
+      'taskId',
+      'subagentSessionId',
+      'definitionName',
+      'definitionVersion',
+      'runnerId',
+      'runnerVersion',
+      'adapterStateVersion',
+      'recoveryData',
+    ],
+    ['modelBinding'],
+  );
   if (record.version !== '1') throw rpcError('invalid-rpc-payload', `${label}.version must be 1.`);
   for (const key of ['ownerSessionId', 'taskId', 'subagentSessionId'] as const) {
     assertIdentifier(record[key], `${label}.${key}`);
@@ -541,6 +703,20 @@ function assertBinding(value: unknown, label: string): UnknownRecord {
     maxBytes: DEFAULT_EXECUTOR_MAX_BINDING_BYTES,
     label: `${label}.recoveryData`,
   });
+  if (record.modelBinding !== undefined) {
+    const modelBinding = closedRecord(record.modelBinding, `${label}.modelBinding`, [
+      'gatewayId',
+      'protocol',
+      'codecVersion',
+    ]);
+    assertPatternToken(modelBinding.gatewayId, `${label}.modelBinding.gatewayId`, NAME_PATTERN);
+    assertPatternToken(modelBinding.protocol, `${label}.modelBinding.protocol`, NAME_PATTERN);
+    assertPatternToken(
+      modelBinding.codecVersion,
+      `${label}.modelBinding.codecVersion`,
+      VERSION_PATTERN,
+    );
+  }
   return record;
 }
 

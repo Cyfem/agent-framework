@@ -6,7 +6,7 @@
 
 本次是明确的 2.0 breaking change：删除旧 `AgentOptions.subAgents`、`AgentConstructor`、动态 `RuntimeSubAgent` 和旧 `agentName/input/outputDescription` Tool 协议，不提供兼容适配层。官方本地 Executor 作为独立 workspace 包交付，核心包只保留协议无关的语义、路由和状态控制面。
 
-实施状态：当前 checkout 已完成 C0～C6（Core v2、官方 Local、公开 Agent durable loop、v1 原子切换与 Phase 1 离线/进程恢复门禁），并交付 C7 的 Core transport/RPC/control/Peer/artifact-sidecar 公共地基；Worker/Process/HTTP placement 仍在实施，Phase 2 尚未通过。C8/C9、Docker live gate 与完整真实方舟验收仍未完成。下文“背景与现状”保留立项时的 v1 问题陈述，不代表当前源码仍存在这些旧接口。
+实施状态：当前 checkout 已完成 C0～C6（Core v2、官方 Local、公开 Agent durable loop、v1 原子切换与 Phase 1 离线/进程恢复门禁），并交付 C7a/C7b 及 C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway 公共地基；Worker/Process/HTTP placement 仍在实施，Phase 2 尚未通过。C8/C9、Docker live gate 与完整真实方舟验收仍未完成。下文“背景与现状”保留立项时的 v1 问题陈述，不代表当前源码仍存在这些旧接口。
 
 ## 背景与现状
 
@@ -198,11 +198,11 @@ Phase 1 退出标准：
 
 ### Phase 2：进程隔离与远程 Executor 模板
 
-当前增量状态：Core 已公开 closed transport v1、12-kind strict RPC、16-method control dispatcher/proxy、双向 Peer、canonical replay、同步 writer admission、带 settlement headroom 的 channel rollover、spawn 的 accepted-or-direct-unbound 生命周期、abort tombstone 与默认 32 MiB artifact sidecar。`reconstructSubAgentExecutionRequest()` 返回 `{ request, dispose }`，placement adapter 必须在 settle 后清理接收端 timer/listener。Remote proxy 暂不提供 artifact `put`；下列 Worker、Process、HTTP 包与各自的认证、进程/网络生命周期和 conformance 仍是 Phase 2 待交付内容。
+当前增量状态：Core 已公开 closed transport v1、14-kind strict RPC、16-method control dispatcher/proxy、双向 Peer、canonical replay、同步 writer admission、带 settlement headroom 的 channel rollover、spawn 的 accepted-or-direct-unbound 生命周期、有界 abort tombstone、默认 32 MiB artifact sidecar、target registry、controller/target bridge 与 controller-owned Model gateway。`reconstructSubAgentExecutionRequest()` 返回 `{ request, dispose }`，placement adapter 必须在 settle 后清理接收端 timer/listener。Remote proxy 暂不提供 artifact `put`；下列 Worker、Process、HTTP 包与各自的认证、进程/网络生命周期和 conformance 仍是 Phase 2 待交付内容。
 
-#### C7c 实施前冻结决策（尚未实现）
+#### C7c 实施前冻结决策（C7c-1 已实现，其余待交付）
 
-以下决策是 Worker、Process 与 HTTP placement 开工前的固定 Oracle，不表示当前 checkout 已具备这些能力；在 C7c 全部门禁通过前，Phase 2 状态仍为未完成：
+以下决策是 Worker、Process 与 HTTP placement 开工前的固定 Oracle。当前 checkout 只具备 C7c-1 的 Core bridge/Model gateway 地基，不表示已经具备 Worker、Process 或 HTTP placement；在 C7c 全部门禁通过前，Phase 2 状态仍为未完成：
 
 - Core 新增受信任的 target registry，按精确的 `definition name + definition version + runner identity` 解析 target-local child runner factory、schema/codec 与模型绑定。registry 在 `init()` 时拒绝重复或不完整条目，并生成不可变 snapshot；factory、Zod object、模块路径、环境变量与凭证都不能来自 wire，也不能在目标侧做动态加载或版本 fallback。
 - Core 提供一对 placement-neutral controller/target bridge。controller bridge 把 `SubAgentExecutor` 的 execute/spawn/control 操作接入现有 Peer/RPC，并托管反向 control 与 Model gateway；target bridge 只在完整解码、scope 校验和 registry 命中后重建 execution request、创建独立 child runner，并在唯一 settle 路径的 `finally` 中调用 `dispose()`。Worker、Process、HTTP 包只负责各自的 I/O、生命周期与认证，不复制 Core 状态机、RPC union 或 control dispatcher。

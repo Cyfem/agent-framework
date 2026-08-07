@@ -320,6 +320,7 @@ function childModelCheckpoint(
       operationId: 'child-model-operation',
       iteration: 1,
       purpose: 'agent',
+      requestAttempt: 1,
       requestHash: 'a'.repeat(64),
       phase,
       ...(phase === 'result_ready'
@@ -1368,6 +1369,14 @@ describe('SubAgentRuntime execution contract', () => {
       persistedPhases.push(
         store.snapshot(SESSION_ID).tasks[0]?.childCheckpoint?.modelOperation?.phase,
       );
+
+      const changedAttempt = childModelCheckpoint('in_flight');
+      await expect(
+        control.commitCheckpoint('child-model-invalid-attempt', {
+          ...changedAttempt,
+          modelOperation: { ...changedAttempt.modelOperation!, requestAttempt: 2 },
+        }),
+      ).rejects.toMatchObject({ code: 'INVALID_STATE_TRANSITION' });
 
       await control.commitCheckpoint('child-model-in-flight', childModelCheckpoint('in_flight'));
       persistedPhases.push(

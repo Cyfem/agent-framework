@@ -485,6 +485,10 @@
         "chat-chat-approval-resume",
         "chat-chat-chat",
         "local-agent-child-exact-limit",
+        "root-result-ready-atomic",
+        "root-malformed-no-token-mutation",
+        "child-idempotent-result-ready-replay",
+        "child-malformed-no-token-settlement",
         "explicit-400-summary-hook-safe-retry",
         "in-flight-abort-fails-without-recovery-progress"
       ],
@@ -652,6 +656,50 @@
             "type": "vitest",
             "file": "packages/core/test/agent-v2-recovery.test.ts",
             "testName": "[acceptance:ARK-12A.l1.shared-provider-budget][variant:root-child-exact-limit-and-idempotent-ledger]"
+          }
+        },
+        {
+          "caseId": "BUD-02.l1.root-model-usage-settlement",
+          "variant": "root-result-ready-atomic",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-model-usage-settlement.test.ts",
+            "testName": "[acceptance:BUD-02.l1.root-model-usage-settlement][variant:root-result-ready-atomic]"
+          }
+        },
+        {
+          "caseId": "BUD-02.l1.root-model-usage-malformed",
+          "variant": "root-malformed-no-token-mutation",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-model-usage-settlement.test.ts",
+            "testName": "[acceptance:BUD-02.l1.root-model-usage-malformed][variant:root-malformed-no-token-mutation]"
+          }
+        },
+        {
+          "caseId": "BUD-02.l1.child-model-usage-settlement",
+          "variant": "child-idempotent-result-ready-replay",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-model-usage-settlement.test.ts",
+            "testName": "[acceptance:BUD-02.l1.child-model-usage-settlement][variant:child-idempotent-result-ready-replay]"
+          }
+        },
+        {
+          "caseId": "BUD-02.l1.child-model-usage-malformed",
+          "variant": "child-malformed-no-token-settlement",
+          "phase": "phase-1",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/agent-model-usage-settlement.test.ts",
+            "testName": "[acceptance:BUD-02.l1.child-model-usage-malformed][variant:child-malformed-no-token-settlement]"
           }
         },
         {
@@ -1118,6 +1166,353 @@
           }
         }
       ]
+    },
+    {
+      "requirementId": "C7-BRIDGE",
+      "status": "implemented",
+      "phase": "phase-2",
+      "requiredLayers": ["L0", "L1"],
+      "requiredVariants": [
+        "gateway-public-api",
+        "handle-registry",
+        "transport-bridge",
+        "rpc-14-kind",
+        "target-session-scope",
+        "bridge-lifecycle-bounds",
+        "decimal-fencing-contract",
+        "host-model-cancel-deadline-scope",
+        "stale-control-execution-scope",
+        "parent-scoped-nested-handle-reconnect",
+        "distinct-operation-single-initialization"
+      ],
+      "cases": [
+        {
+          "caseId": "C7-GATEWAY-01.l0.public-contracts",
+          "variant": "gateway-public-api",
+          "phase": "phase-2",
+          "layer": "L0",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-public-api.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-01.l0.public-contracts][variant:gateway-public-api]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-04.l1.handle-registry",
+          "variant": "handle-registry",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-task-handle-registry.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-04.l1.handle-registry][variant:handle-registry]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-06.l1.transport-bridge",
+          "variant": "transport-bridge",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-bridge.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-06.l1.transport-bridge][variant:transport-bridge]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-07.l1.rpc-14-kind",
+          "variant": "rpc-14-kind",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-public-api.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-07.l1.rpc-14-kind][variant:rpc-14-kind]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-14.l1.target-session-scope",
+          "variant": "target-session-scope",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-bridge.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-14.l1.target-session-scope][variant:target-session-scope]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-15.l1.bridge-lifecycle",
+          "variant": "bridge-lifecycle-bounds",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-bridge.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-15.l1.bridge-lifecycle][variant:bridge-lifecycle-bounds]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-16.l1.fencing-contract",
+          "variant": "decimal-fencing-contract",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-16.l1.fencing-contract][variant:decimal-fencing-contract]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-18.l1.host-model-scope",
+          "variant": "host-model-cancel-deadline-scope",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-bridge.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-18.l1.host-model-scope][variant:host-model-cancel-deadline-scope]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-19.l1.control-execution-scope",
+          "variant": "stale-control-execution-scope",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-bridge.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-19.l1.control-execution-scope][variant:stale-control-execution-scope]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-20.l1.nested-handle-registry",
+          "variant": "parent-scoped-nested-handle-reconnect",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-control.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-20.l1.nested-handle-registry][variant:parent-scoped-nested-handle-reconnect]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-22.l1.target-task-initialization",
+          "variant": "distinct-operation-single-initialization",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-bridge.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-22.l1.target-task-initialization][variant:distinct-operation-single-initialization]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C7-TARGET-REGISTRY",
+      "status": "implemented",
+      "phase": "phase-2",
+      "requiredLayers": ["L1"],
+      "requiredVariants": ["target-registry", "gateway-binding-recovery-fence"],
+      "cases": [
+        {
+          "caseId": "C7-GATEWAY-02.l1.target-registry",
+          "variant": "target-registry",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-target-runner-registry.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-02.l1.target-registry][variant:target-registry]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-21.l1.durable-model-binding",
+          "variant": "gateway-binding-recovery-fence",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-target-runner-registry.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-21.l1.durable-model-binding][variant:gateway-binding-recovery-fence]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C7-MODEL-GATEWAY",
+      "status": "implemented",
+      "phase": "phase-2",
+      "requiredLayers": ["L1", "L4"],
+      "requiredVariants": [
+        "provider-ledger",
+        "model-gateway",
+        "chat-peer-reply-loss-new-execution-scope",
+        "responses-peer-reply-loss-new-execution-scope",
+        "chat-peer-recovery-oracle-no-provider-resend",
+        "cross-handler-singleflight",
+        "explicit-inflight-recovery",
+        "official-credential-free-surface",
+        "chat-responses-one-http-attempt",
+        "attempt-two-completed-reply-loss"
+      ],
+      "cases": [
+        {
+          "caseId": "C7-GATEWAY-03.l1.provider-ledger",
+          "variant": "provider-ledger",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-provider-operation-ledger.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-03.l1.provider-ledger][variant:provider-ledger]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-05.l1.model-gateway",
+          "variant": "model-gateway",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-model-gateway.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-05.l1.model-gateway][variant:model-gateway]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-09.l4.chat-completed-replay",
+          "variant": "chat-peer-reply-loss-new-execution-scope",
+          "phase": "phase-2",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-model-reply-loss-recovery.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-09.l4.chat-completed-replay][variant:chat-peer-reply-loss-new-execution-scope]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-10.l4.responses-completed-replay",
+          "variant": "responses-peer-reply-loss-new-execution-scope",
+          "phase": "phase-2",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-model-reply-loss-recovery.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-10.l4.responses-completed-replay][variant:responses-peer-reply-loss-new-execution-scope]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-11.l4.provider-in-flight-unknown",
+          "variant": "chat-peer-recovery-oracle-no-provider-resend",
+          "phase": "phase-2",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-model-reply-loss-recovery.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-11.l4.provider-in-flight-unknown][variant:chat-peer-recovery-oracle-no-provider-resend]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-12.l1.cross-handler-singleflight",
+          "variant": "cross-handler-singleflight",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-model-gateway.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-12.l1.cross-handler-singleflight][variant:cross-handler-singleflight]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-13.l1.explicit-inflight-recovery",
+          "variant": "explicit-inflight-recovery",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-provider-operation-ledger.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-13.l1.explicit-inflight-recovery][variant:explicit-inflight-recovery]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-17.l1.credential-free-surface",
+          "variant": "official-credential-free-surface",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-model-gateway.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-17.l1.credential-free-surface][variant:official-credential-free-surface]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-23.l1.provider-zero-retry",
+          "variant": "chat-responses-one-http-attempt",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/llm-provider-policy.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-23.l1.provider-zero-retry][variant:chat-responses-one-http-attempt]"
+          }
+        },
+        {
+          "caseId": "C7-GATEWAY-24.l4.attempt-two-replay",
+          "variant": "attempt-two-completed-reply-loss",
+          "phase": "phase-2",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/core/test/subagent-transport-model-reply-loss-recovery.test.ts",
+            "testName": "[acceptance:C7-GATEWAY-24.l4.attempt-two-replay][variant:attempt-two-completed-reply-loss]"
+          }
+        }
+      ]
+    },
+    {
+      "requirementId": "C7-WORKER",
+      "status": "planned",
+      "phase": "phase-2",
+      "requiredLayers": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"],
+      "requiredVariants": ["worker-conformance", "worker-crash-recovery", "worker-ark-placement"],
+      "cases": []
+    },
+    {
+      "requirementId": "C7-PROCESS",
+      "status": "planned",
+      "phase": "phase-2",
+      "requiredLayers": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"],
+      "requiredVariants": [
+        "process-conformance",
+        "process-crash-recovery",
+        "process-ark-placement"
+      ],
+      "cases": []
+    },
+    {
+      "requirementId": "C7-HTTP",
+      "status": "planned",
+      "phase": "phase-2",
+      "requiredLayers": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"],
+      "requiredVariants": ["http-conformance", "http-loopback-reconnect", "http-ark-placement"],
+      "cases": []
+    },
+    {
+      "requirementId": "C7-AUTH",
+      "status": "planned",
+      "phase": "phase-2",
+      "requiredLayers": ["L0", "L1", "L2", "L6"],
+      "requiredVariants": ["tls-hmac-v1", "session-authorization", "replay-cache"],
+      "cases": []
+    },
+    {
+      "requirementId": "C7-PACK",
+      "status": "planned",
+      "phase": "phase-2",
+      "requiredLayers": ["L0"],
+      "requiredVariants": ["phase2-package-contracts", "phase2-secret-scan"],
+      "cases": []
     },
     {
       "requirementId": "PHASE-1",

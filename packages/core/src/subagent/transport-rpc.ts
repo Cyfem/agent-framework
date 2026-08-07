@@ -1,4 +1,5 @@
 import type { ExecutorTaskSnapshot, SubAgentExecutorBinding } from './executor';
+import type { JsonValue } from './json';
 import type { SubAgentTaskEvent } from './telemetry';
 import type {
   SubAgentTransportControlReplyPayload,
@@ -32,6 +33,8 @@ export const SUBAGENT_TRANSPORT_RPC_KINDS = Object.freeze([
   'snapshot.reply',
   'events.request',
   'events.page',
+  'model.request',
+  'model.reply',
   'protocol.error',
 ] as const);
 
@@ -79,6 +82,66 @@ export interface SubAgentTransportRpcPayloadMap {
     readonly nextSequence: number;
     readonly done: boolean;
   };
+  readonly 'model.request': {
+    readonly providerOperationId: string;
+    readonly gatewayId: string;
+    readonly protocol: string;
+    readonly codecVersion: string;
+    readonly runId: string;
+    readonly executionAttempt: number;
+    readonly executionEpoch: string;
+    readonly executionFencingToken: string;
+    readonly checkpointOperationId: string;
+    readonly checkpointDigest: string;
+    readonly purpose: 'agent' | 'context-summary';
+    readonly iteration: number;
+    readonly requestAttempt: number;
+    readonly requestHash: string;
+    readonly context: JsonValue;
+    readonly tools: readonly JsonValue[];
+    readonly remainingMs?: number;
+  };
+  readonly 'model.reply':
+    | {
+        readonly providerOperationId: string;
+        readonly gatewayId: string;
+        readonly protocol: string;
+        readonly codecVersion: string;
+        readonly runId: string;
+        readonly executionAttempt: number;
+        readonly executionEpoch: string;
+        readonly executionFencingToken: string;
+        readonly checkpointOperationId: string;
+        readonly checkpointDigest: string;
+        readonly requestHash: string;
+        readonly ok: true;
+        readonly resultHash: string;
+        readonly messages: JsonValue;
+        readonly usage?: {
+          readonly inputTokens?: number;
+          readonly outputTokens?: number;
+          readonly totalTokens?: number;
+        };
+      }
+    | {
+        readonly providerOperationId: string;
+        readonly gatewayId: string;
+        readonly protocol: string;
+        readonly codecVersion: string;
+        readonly runId: string;
+        readonly executionAttempt: number;
+        readonly executionEpoch: string;
+        readonly executionFencingToken: string;
+        readonly checkpointOperationId: string;
+        readonly checkpointDigest: string;
+        readonly requestHash: string;
+        readonly ok: false;
+        readonly error: SubAgentTransportSafeError;
+        readonly classification?: {
+          readonly kind: string;
+          readonly status: number;
+        };
+      };
   readonly 'protocol.error': {
     readonly error: SubAgentTransportSafeError;
   };
@@ -117,7 +180,8 @@ export type SubAgentTransportRpcRequestKind =
   | 'control.request'
   | 'cancel.request'
   | 'snapshot.request'
-  | 'events.request';
+  | 'events.request'
+  | 'model.request';
 
 export type SubAgentTransportRpcReplyKind = Exclude<
   SubAgentTransportRpcKind,

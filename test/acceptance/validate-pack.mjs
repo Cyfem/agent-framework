@@ -69,6 +69,8 @@ async function expectFailure(action, pattern, label) {
 async function selfTest() {
   const directory = await mkdtemp(path.join(tmpdir(), 'manee-pack-validator-'));
   try {
+    const safeEnvironmentNameSource =
+      "export const documentedEnvironmentNames = ['ARK_API_KEY', 'OPENAI_API_KEY', 'AWS_ACCESS_KEY_ID'];\n";
     await mkdir(path.join(directory, 'dist'), { recursive: true });
     await writeFile(
       path.join(directory, 'package.json'),
@@ -96,7 +98,7 @@ async function selfTest() {
       'utf8',
     );
     await writeFile(path.join(directory, 'README.md'), '# pack validator fixture\n', 'utf8');
-    await writeFile(path.join(directory, 'dist', 'index.js'), 'export {};\n', 'utf8');
+    await writeFile(path.join(directory, 'dist', 'index.js'), safeEnvironmentNameSource, 'utf8');
     await writeFile(path.join(directory, 'dist', 'index.cjs'), 'module.exports = {};\n', 'utf8');
     await mkdir(path.join(directory, 'dist', 'internal'), { recursive: true });
     await writeFile(
@@ -150,6 +152,40 @@ async function selfTest() {
     );
     await rm(sourcePath, { force: true });
 
+    const esmPath = path.join(directory, 'dist', 'index.js');
+    await writeFile(
+      esmPath,
+      'export const fixtureSecret = "MANEE_PACK_CONTENT_SECRET_0123456789ABCDEF";\n',
+      'utf8',
+    );
+    await expectFailure(
+      validateFixture,
+      /secret-like content \(pack-validator secret marker\) in dist\/index\.js/iu,
+      'secret content rejection',
+    );
+    await writeFile(esmPath, safeEnvironmentNameSource, 'utf8');
+
+    const esmMapPath = path.join(directory, 'dist', 'index.js.map');
+    await writeFile(
+      esmMapPath,
+      `${JSON.stringify({
+        version: 3,
+        sources: ['fixture.ts'],
+        names: [],
+        mappings: '',
+        sourcesContent: [
+          'export const fixtureSecret = "MANEE_PACK_CONTENT_SECRET_ABCDEF0123456789";',
+        ],
+      })}\n`,
+      'utf8',
+    );
+    await expectFailure(
+      validateFixture,
+      /secret-like content \(pack-validator secret marker\) in dist\/index\.js\.map/iu,
+      'source map sourcesContent secret rejection',
+    );
+    await writeFile(esmMapPath, '{}\n', 'utf8');
+
     const cjsMapPath = path.join(directory, 'dist', 'index.cjs.map');
     await rm(cjsMapPath, { force: true });
     await expectFailure(validateFixture, /CJS source map is missing/iu, 'missing map rejection');
@@ -161,6 +197,8 @@ async function selfTest() {
         'sensitive-dist-artifact',
         'sensitive-path-pattern',
         'typescript-source',
+        'secret-content',
+        'source-map-secret-content',
         'missing-source-map',
       ],
       childTermination: await validatePackChildTerminationSelfTest(),

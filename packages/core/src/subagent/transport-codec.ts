@@ -3,6 +3,7 @@ import { isDeepStrictEqual, types as nodeTypes } from 'node:util';
 import { parseAgentResultReceipt } from './agent-result-receipt';
 import { assertArtifactReference } from './artifact';
 import { DEFAULT_EXECUTOR_MAX_BINDING_BYTES, type SubAgentExecutionRequest } from './executor';
+import { assertCanonicalFencingToken } from './fencing-token';
 import {
   assertJsonValue,
   canonicalJsonSha256,
@@ -552,9 +553,17 @@ function assertExecutionRequestWireShape(
     'taskId',
     'subagentSessionId',
     'executionEpoch',
-    'executionFencingToken',
   ] as const) {
     assertTransportIdentifier(record[key], key, 'invalid-execution-request');
+  }
+  try {
+    assertCanonicalFencingToken(record.executionFencingToken, 'executionFencingToken');
+  } catch (error) {
+    throw transportError(
+      'invalid-execution-request',
+      'Subagent executionFencingToken must be a canonical unsigned decimal string.',
+      error,
+    );
   }
   for (const key of ['parentTaskId', 'retryOf'] as const) {
     if (record[key] !== undefined) {
@@ -768,7 +777,7 @@ function assertExecutorBinding(value: unknown, options: ResolvedExecutionWireVal
       'adapterStateVersion',
       'recoveryData',
     ],
-    [],
+    ['modelBinding'],
     'invalid-execution-request',
   );
   assertVersionOne(record.version, 'Executor binding');
@@ -781,6 +790,22 @@ function assertExecutorBinding(value: unknown, options: ResolvedExecutionWireVal
   assertProtocolName(record.runnerId, 'binding.runnerId', NAME_PATTERN);
   assertProtocolName(record.runnerVersion, 'binding.runnerVersion', VERSION_PATTERN);
   assertProtocolName(record.adapterStateVersion, 'binding.adapterStateVersion', VERSION_PATTERN);
+  if (record.modelBinding !== undefined) {
+    const modelBinding = assertClosedRecord(
+      record.modelBinding,
+      'binding.modelBinding',
+      ['gatewayId', 'protocol', 'codecVersion'],
+      [],
+      'invalid-execution-request',
+    );
+    assertProtocolName(modelBinding.gatewayId, 'binding.modelBinding.gatewayId', NAME_PATTERN);
+    assertProtocolName(modelBinding.protocol, 'binding.modelBinding.protocol', NAME_PATTERN);
+    assertProtocolName(
+      modelBinding.codecVersion,
+      'binding.modelBinding.codecVersion',
+      VERSION_PATTERN,
+    );
+  }
   if (measureCanonicalJsonBytes(record as JsonValue) > options.maxBindingBytes) {
     invalidExecution('Subagent Executor binding exceeds the configured binding byte limit.');
   }
@@ -1005,6 +1030,7 @@ function assertDurableModelOperation(
       'operationId',
       'iteration',
       'purpose',
+      'requestAttempt',
       'requestHash',
       'phase',
       'preparedAt',
@@ -1026,6 +1052,11 @@ function assertDurableModelOperation(
   if (record.purpose !== 'agent' && record.purpose !== 'context-summary') {
     invalidExecution('checkpoint.modelOperation.purpose is invalid.');
   }
+  assertPositiveSafeInteger(
+    record.requestAttempt,
+    'checkpoint.modelOperation.requestAttempt',
+    'invalid-execution-request',
+  );
   if (!['prepared', 'in_flight', 'result_ready'].includes(record.phase as string)) {
     invalidExecution('checkpoint.modelOperation.phase is invalid.');
   }

@@ -21,6 +21,8 @@ import type {
   ToolPayloadReplacements,
 } from '../../agent/types';
 import { OPENAI_RESPONSES_CHECKPOINT_CODEC } from '../../subagent/checkpoint';
+import type { SubAgentTransportModelProtocolSurface } from '../../subagent/transport-model-gateway';
+import { markAuditedSubAgentTransportModelProtocolSurface } from '../../subagent/transport-model-protocol-surface';
 import { createAbortScope, throwIfAborted } from '../base/abort';
 import { Model, type ModelGenerateRequest, type ModelGenerateResult } from '../base';
 import { classifyOpenAICompatibleError } from '../openai-error';
@@ -52,6 +54,7 @@ export type * from './types';
  */
 export class OpenAIResponsesModel extends Model<OpenAIResponsesProtocol> {
   override readonly checkpointCodec = OPENAI_RESPONSES_CHECKPOINT_CODEC;
+  override readonly providerMaxRetries = 0;
 
   #openai: OpenAI;
   #model: string;
@@ -101,12 +104,22 @@ export class OpenAIResponsesModel extends Model<OpenAIResponsesProtocol> {
     const signal = request.signal ?? deadlineScope?.signal;
 
     try {
-      const response = signal
-        ? await this.#openai.responses.create(params, { signal })
-        : await this.#openai.responses.create(params);
+      const response = await this.#openai.responses.create(params, {
+        maxRetries: 0,
+        ...(signal === undefined ? {} : { signal }),
+      });
 
       return {
         messages: response.output as unknown as readonly OpenAIResponsesContext[],
+        ...(response.usage === undefined
+          ? {}
+          : {
+              usage: {
+                inputTokens: response.usage.input_tokens,
+                outputTokens: response.usage.output_tokens,
+                totalTokens: response.usage.total_tokens,
+              },
+            }),
         raw: response,
       };
     } finally {
@@ -366,6 +379,32 @@ export class OpenAIResponsesModel extends Model<OpenAIResponsesProtocol> {
       purpose: options.purpose ?? 'user_data',
     } as FileCreateParams);
   }
+}
+
+/** Credential-free Responses protocol surface for Worker/Process/remote Model proxies. */
+export function createOpenAIResponsesProtocolSurface(): SubAgentTransportModelProtocolSurface<OpenAIResponsesProtocol> {
+  const prototype = OpenAIResponsesModel.prototype;
+  const protocolSurface: SubAgentTransportModelProtocolSurface<OpenAIResponsesProtocol> = {
+    checkpointCodec: OPENAI_RESPONSES_CHECKPOINT_CODEC,
+    buildUserMessage: (input) => prototype.buildUserMessage(input),
+    buildSystemMessage: (input) => prototype.buildSystemMessage(input),
+    buildToolCallOutputMessage: (input) => prototype.buildToolCallOutputMessage(input),
+    buildToolMessage: (input) => prototype.buildToolMessage(input),
+    parseUserMessages: (context) => prototype.parseUserMessages(context),
+    parseSystemMessages: (context) => prototype.parseSystemMessages(context),
+    parseAssistantMessages: (context) => prototype.parseAssistantMessages(context),
+    parseToolCalls: (context) => prototype.parseToolCalls(context),
+    parseToolCallOutputMessages: (context) => prototype.parseToolCallOutputMessages(context),
+    rewriteToolPayloads: (context, replacements) =>
+      prototype.rewriteToolPayloads(context, replacements),
+    extractAssistantText: (context) =>
+      prototype.parseAssistantMessages(context).flatMap(({ message }) => {
+        const text = message.content.map((part) => part.text).join('');
+        return text.length === 0 ? [] : [text];
+      }),
+    classifyError: (error) => prototype.classifyError(error),
+  };
+  return markAuditedSubAgentTransportModelProtocolSurface(Object.freeze(protocolSurface));
 }
 
 function deleteToolOnlyResponsesParams(params: ResponseCreateParamsNonStreaming): void {

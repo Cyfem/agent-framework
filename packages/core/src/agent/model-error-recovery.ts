@@ -58,6 +58,12 @@ export interface GenerateWithModelErrorRecoveryOptions<P extends AgentProtocol> 
    * requestAttempt and retry policy; callers can fence each provider dispatch around it.
    */
   readonly generate?: (request: ModelGenerateRequest<P>) => Promise<ModelGenerateResult<P>>;
+  /**
+   * Number of request attempts already durably observed before this invocation. The next
+   * generated request uses `initialRequestAttempts + 1` so resumed provider identities and
+   * recovery telemetry remain continuous. Defaults to zero.
+   */
+  readonly initialRequestAttempts?: number;
   readonly purpose: ModelGeneratePurpose;
   readonly buildRequest: () => ModelGenerateRequest<P>;
   readonly limits: Readonly<ResolvedModelErrorRecoveryLimits>;
@@ -165,8 +171,12 @@ export function resolveModelErrorRecoveryLimits(input?: {
 export async function generateWithModelErrorRecovery<P extends AgentProtocol>(
   options: GenerateWithModelErrorRecoveryOptions<P>,
 ): Promise<ModelGenerateResult<P>> {
+  const initialRequestAttempts = options.initialRequestAttempts ?? 0;
+  if (!Number.isSafeInteger(initialRequestAttempts) || initialRequestAttempts < 0) {
+    throw new TypeError('initialRequestAttempts must be a non-negative safe integer.');
+  }
   const ledger: MutableModelRetryLedger = {
-    requestAttempts: 0,
+    requestAttempts: initialRequestAttempts,
     totalRetries: 0,
     forcedRetries: 0,
     unhandledRetries: 0,

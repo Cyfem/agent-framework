@@ -64,6 +64,8 @@ const executor = new MemorySubAgentExecutor({ registry });
 
 `runAsSubAgent()` 会在 child 专用初始化阶段注入 typed `agent-result` 与 standalone `end-agent`、校验保留名冲突，并把 request 的 signal、deadline、task runtime metadata 与完整 checkpoint 交给独立 Agent loop。Local 不会调用普通 `init()`，也不会隐式继承父 Agent 的 Model、Tools、Skills、system prompts 或 context；这些能力必须在 `createAgent()` 中显式配置。`buildInput()` 是必填的协议映射，框架不会猜测 `JSON.stringify(input)`。
 
+`MemorySubAgentExecutor` 对同一 create operation 的重放会先重新运行 registry/schema 校验，再比较 operation ID、idempotency key 和完整 owned child request hash；input、path、projection、delegation、limits 或其他稳定字段发生漂移都会返回 `IDEMPOTENCY_CONFLICT`，并发重复也只创建一个 runner。`LocalSubAgentRunnerRegistry.create()` 仅保留为无 checkpoint 的兼容入口，首次调用会 seal registry；传入 checkpoint 时会明确返回 `RECOVERY_UNSUPPORTED`，不会静默丢弃 checkpoint 或从头运行。新的 Executor/adapter 应直接使用 Core `prepareExecution()` 和完整 create/resume operation。
+
 Child Tool 可以声明固定的 `approval: { summary, expiresInMs? }`。Core 会在 handler 前保存包含原 call 的 checkpoint，再通过 Local 透传的 `SubAgentExecutionControl.authorizeTool()` 请求宿主审批：首次返回 `suspend` 时 handler 不执行；宿主提交持久 decision 后，原 task、callId 和 checkpoint 恢复，只有 `approved` 才会执行一次 handler。`summary` 必须来自受信任配置，不能拼接模型参数；Local 本身不替宿主做授权判断。child 还可按 definition 的 delegation allowlist 调度下一层 Subagent；多 leaf approval 会和父 checkpoint 原子保存并按原 task identity 恢复。并发 leaf 的审批可以先后到达：每轮恢复都会重新核对 authoritative task 与父 pending batch，只暴露尚未决定的审批，已完成 sibling、Tool handler 和 provider 结果不会重放。
 
 Local child 的普通 Model 请求、`context-summary` 和父 Agent 请求使用同一 root-run provider ledger，并在 SDK dispatch 前原子预留；达到 `maxProviderCalls` 时不会调用 provider。已明确返回的 HTTP 4xx/5xx 可以清除本次 in-flight intent，再进入配置的 model-error recovery；例如 `context_length_exceeded` 可执行 durable summary 与安全 retry。相反，provider intent 已持久化为 `in_flight` 后发生 abort、超时或连接结果不确定时，checkpoint 比同时到达的取消更权威：task 固定进入 `failed + MODEL_OUTCOME_UNKNOWN`，不能自动恢复或重发。
@@ -78,7 +80,7 @@ Registry 只接受宿主代码注册的受信任工厂，不会根据模型输�
 - `subagent-task:<ownerSessionId>:<taskId>`
 - 根 run 使用的 canonical JSON scope：`agent-run:[<ownerSessionId>,<runId>]`
 
-它们都会拒绝来自其他 owner session 的 lease，并在 transaction commit 时重新校验 lease 与 fencing ownership。
+它们都会拒绝来自其他 owner session 的 lease，并在 transaction commit 时重新校验 lease 与 fencing ownership。公开 fencing token 使用 canonical unsigned base-10 字符串（`0` 或无前导零的正整数）；Memory/Atomic File Store 都按严格单调的大整数语义生成，Core 会在 acquire、renew、恢复及 transport 边界重验。
 
 ## Atomic File 安全与一致性边界
 

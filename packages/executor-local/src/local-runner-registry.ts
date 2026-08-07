@@ -1,214 +1,84 @@
-import type {
-  SubAgentChildRunRequest,
-  SubAgentChildRunner,
-  SubAgentDefinitionRef,
+import {
+  SubAgentRuntimeError,
+  SubAgentTargetRunnerRegistry,
+  type JsonValue,
+  type SubAgentChildRunRequest,
+  type SubAgentChildRunner,
+  type SubAgentExecutionRequest,
+  type SubAgentTargetRunnerFactoryContext,
+  type SubAgentTargetRunnerRegistration,
+  type SubAgentTargetRunnerRegistrationEntry,
 } from '@ruixutong.manee/maneeagent-framework';
 
-export interface LocalSubAgentRunnerFactoryContext {
-  readonly request: SubAgentChildRunRequest;
-  readonly executorName: string;
-}
+/** @deprecated Prefer the protocol-neutral Core target-runner factory context. */
+export type LocalSubAgentRunnerFactoryContext<
+  I extends JsonValue = JsonValue,
+  O extends JsonValue = JsonValue,
+> = SubAgentTargetRunnerFactoryContext<I, O>;
 
-export interface LocalSubAgentRunnerRegistration {
-  readonly definition: SubAgentDefinitionRef;
-  readonly runnerId: string;
-  readonly runnerVersion: string;
-  readonly childCheckpointVersions: readonly string[];
-  create(
-    context: LocalSubAgentRunnerFactoryContext,
-  ): SubAgentChildRunner | Promise<SubAgentChildRunner>;
-}
+/** Local compatibility name for a full trusted Core definition/runner registration. */
+export type LocalSubAgentRunnerRegistration<
+  I extends JsonValue = JsonValue,
+  O extends JsonValue = JsonValue,
+> = JsonValue extends I
+  ? SubAgentTargetRunnerRegistrationEntry
+  : SubAgentTargetRunnerRegistration<I, O>;
 
-/** Exact definition-version registry. A factory creates one isolated runner for each child task. */
-export class LocalSubAgentRunnerRegistry {
-  readonly #registrations = new Map<string, LocalSubAgentRunnerRegistration>();
-  readonly #runners = new Map<
-    string,
-    Readonly<{
-      runnerId: string;
-      runnerVersion: string;
-      childCheckpointVersions: readonly string[];
-    }>
-  >();
-  #sealed = false;
-
-  constructor(registrations: readonly LocalSubAgentRunnerRegistration[] = []) {
-    for (const registration of registrations) this.register(registration);
+/**
+ * Compatibility facade over Core's exact target-side registry. New Executor code should call
+ * `prepareExecution()` so schema transforms, binding/checkpoint checks and owned snapshots all
+ * happen before a runner factory is invoked.
+ */
+export class LocalSubAgentRunnerRegistry extends SubAgentTargetRunnerRegistry {
+  constructor(registrations: readonly SubAgentTargetRunnerRegistrationEntry[] = []) {
+    super(registrations);
   }
 
-  register(registration: LocalSubAgentRunnerRegistration): this {
-    if (this.#sealed) throw new Error('The Local Subagent runner registry is sealed.');
-    assertDefinition(registration.definition);
-    assertIdentifier('runnerId', registration.runnerId);
-    assertVersion('runnerVersion', registration.runnerVersion);
-    const childCheckpointVersions = validateVersions(registration.childCheckpointVersions);
-    if (typeof registration.create !== 'function') {
-      throw new TypeError('A Local Subagent registration requires a create() factory.');
-    }
-    const key = definitionKey(registration.definition);
-    if (this.#registrations.has(key)) {
-      throw new TypeError(
-        `A Local Subagent runner is already registered for ${registration.definition.name}@${registration.definition.version}.`,
-      );
-    }
-    const runnerKey = definitionKey({
-      name: registration.runnerId,
-      version: registration.runnerVersion,
-    });
-    const existingRunner = this.#runners.get(runnerKey);
-    if (
-      existingRunner !== undefined &&
-      existingRunner.childCheckpointVersions.join('\0') !== childCheckpointVersions.join('\0')
-    ) {
-      throw new TypeError('A Local runner identity must declare one checkpoint-version set.');
-    }
-    const runner =
-      existingRunner ??
-      Object.freeze({
-        runnerId: registration.runnerId,
-        runnerVersion: registration.runnerVersion,
-        childCheckpointVersions,
-      });
-    this.#runners.set(runnerKey, runner);
-    this.#registrations.set(
-      key,
-      Object.freeze({
-        definition: Object.freeze({
-          name: registration.definition.name,
-          version: registration.definition.version,
-        }),
-        runnerId: registration.runnerId,
-        runnerVersion: registration.runnerVersion,
-        childCheckpointVersions,
-        create: registration.create,
-      }),
-    );
-    return this;
-  }
-
-  seal(): this {
-    this.#sealed = true;
-    return this;
-  }
-
-  get sealed(): boolean {
-    return this.#sealed;
-  }
-
-  has(definition: SubAgentDefinitionRef): boolean {
-    return this.#registrations.has(definitionKey(definition));
-  }
-
-  list(): readonly SubAgentDefinitionRef[] {
-    return Object.freeze(
-      [...this.#registrations.values()]
-        .map(({ definition }) =>
-          Object.freeze({ name: definition.name, version: definition.version }),
-        )
-        .sort((left, right) => definitionKey(left).localeCompare(definitionKey(right))),
-    );
-  }
-
-  runnerFor(definition: SubAgentDefinitionRef): Readonly<{
-    runnerId: string;
-    runnerVersion: string;
-    childCheckpointVersions: readonly string[];
-  }> {
-    const registration = this.#registrations.get(definitionKey(definition));
-    if (registration === undefined) {
-      throw new Error('No Local Subagent runner is registered for the exact definition version.');
-    }
-    return Object.freeze({
-      runnerId: registration.runnerId,
-      runnerVersion: registration.runnerVersion,
-      childCheckpointVersions: Object.freeze([...registration.childCheckpointVersions]),
-    });
-  }
-
-  listRunnerCompatibility(): readonly Readonly<{
-    runnerId: string;
-    runnerVersion: string;
-    childCheckpointVersions: readonly string[];
-  }>[] {
-    return Object.freeze(
-      [...this.#runners.values()].sort((left, right) =>
-        definitionKey({ name: left.runnerId, version: left.runnerVersion }).localeCompare(
-          definitionKey({ name: right.runnerId, version: right.runnerVersion }),
-        ),
-      ),
-    );
-  }
-
+  /**
+   * Legacy direct child-runner creation retained for Local consumers. MemorySubAgentExecutor does
+   * not use this shortcut; it always supplies the complete execution operation to
+   * `prepareExecution()`.
+   */
   async create(
     request: SubAgentChildRunRequest,
     executorName: string,
   ): Promise<SubAgentChildRunner> {
-    assertIdentifier('executorName', executorName);
-    const registration = this.#registrations.get(definitionKey(request.definition));
-    if (registration === undefined) {
-      throw new Error('No Local Subagent runner is registered for the exact definition version.');
+    if (request.checkpoint !== undefined) {
+      throw new SubAgentRuntimeError({
+        code: 'RECOVERY_UNSUPPORTED',
+        message:
+          'Direct Local runner creation cannot restore checkpoints; use a complete Executor resume request.',
+        retryable: false,
+      });
     }
-    const runner = await registration.create({ request, executorName });
-    if (typeof runner !== 'object' || runner === null || typeof runner.run !== 'function') {
-      throw new TypeError('A Local Subagent factory must return a SubAgentChildRunner.');
-    }
-    return runner;
+    this.seal();
+    const prepared = this.prepareExecution(toCreateExecutionRequest(request), executorName);
+    return prepared.create();
   }
 }
 
-function definitionKey(definition: SubAgentDefinitionRef): string {
-  return `${definition.name}\0${definition.version}`;
-}
-
-function assertDefinition(definition: SubAgentDefinitionRef): void {
-  if (
-    typeof definition !== 'object' ||
-    definition === null ||
-    typeof definition.name !== 'string' ||
-    definition.name.length === 0 ||
-    typeof definition.version !== 'string' ||
-    definition.version.length === 0
-  ) {
-    throw new TypeError('A Local Subagent registration requires an exact definition reference.');
-  }
-}
-
-function assertIdentifier(label: 'runnerId' | 'executorName', value: string): void {
-  if (
-    typeof value !== 'string' ||
-    value.length > 128 ||
-    value !== value.trim() ||
-    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value)
-  ) {
-    throw new TypeError(`A Local Subagent registration requires a valid ${label}.`);
-  }
-}
-
-function assertVersion(label: string, value: string): void {
-  if (
-    typeof value !== 'string' ||
-    value.length > 128 ||
-    value !== value.trim() ||
-    !/^[A-Za-z0-9][A-Za-z0-9._+-]*$/u.test(value)
-  ) {
-    throw new TypeError(`A Local Subagent registration requires a valid ${label}.`);
-  }
-}
-
-function validateVersions(value: readonly string[]): readonly string[] {
-  if (
-    !Array.isArray(value) ||
-    value.length === 0 ||
-    value.some(
-      (version) =>
-        typeof version !== 'string' ||
-        version.length > 128 ||
-        version !== version.trim() ||
-        !/^[A-Za-z0-9][A-Za-z0-9._+-]*$/u.test(version),
-    ) ||
-    new Set(value).size !== value.length
-  ) {
-    throw new TypeError('Local runner childCheckpointVersions must be unique valid versions.');
-  }
-  return Object.freeze([...value].sort());
+function toCreateExecutionRequest(request: SubAgentChildRunRequest): SubAgentExecutionRequest {
+  return {
+    operation: {
+      type: 'create',
+      operationId: `local-direct-create:${request.taskId}`,
+      idempotencyKey: request.taskId,
+    },
+    ownerSessionId: request.ownerSessionId,
+    runId: request.runId,
+    taskId: request.taskId,
+    ...(request.parentTaskId === undefined ? {} : { parentTaskId: request.parentTaskId }),
+    subagentSessionId: request.subagentSessionId,
+    path: request.path,
+    attempt: request.attempt,
+    executionEpoch: request.executionEpoch,
+    executionFencingToken: request.executionFencingToken,
+    definition: request.definition,
+    input: request.input,
+    projectedContext: request.projectedContext,
+    delegation: request.delegation,
+    limits: request.limits,
+    signal: request.signal,
+    deadlineAt: request.deadlineAt,
+  };
 }

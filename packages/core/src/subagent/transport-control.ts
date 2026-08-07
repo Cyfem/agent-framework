@@ -13,6 +13,7 @@ import {
   SubAgentRuntimeError,
   type SubAgentErrorDescriptor,
 } from './errors';
+import { assertCanonicalFencingToken } from './fencing-token';
 import type { SubAgentTaskSnapshot } from './identity';
 import {
   assertJsonValue,
@@ -40,6 +41,13 @@ import type {
   SubAgentTaskHandle,
 } from './runtime';
 import type { ExecutorEventInput, SubAgentTaskEvent } from './telemetry';
+import {
+  SubAgentTransportTaskHandleRegistry,
+  rememberSubAgentTaskHandle,
+  resolveSubAgentTaskHandle,
+  type SubAgentTransportTaskHandleResolver,
+  type SubAgentTransportTaskHandleScope,
+} from './transport-task-handle-registry';
 import { assertSubAgentExecutionRequestWire } from './transport-codec';
 import {
   DEFAULT_SUBAGENT_TRANSPORT_MAX_FRAME_BYTES,
@@ -159,12 +167,20 @@ export type SubAgentTransportControlRequestPayload = {
   [M in SubAgentTransportControlMethod]: Pick<
     SubAgentTransportControlRequest<M>,
     'method' | 'args'
-  >;
+  > & {
+    /** Exact child execution scope. The controller validates it before trusted dispatch. */
+    readonly executionAttempt: number;
+    readonly executionEpoch: string;
+    readonly executionFencingToken: string;
+  };
 }[SubAgentTransportControlMethod];
 
 export type SubAgentTransportControlReplyPayload = SubAgentTransportControlReply;
 
 export interface SubAgentTransportControlExchangeContext {
+  readonly executionAttempt: number;
+  readonly executionEpoch: string;
+  readonly executionFencingToken: string;
   readonly signal: AbortSignal;
   readonly deadlineAt: number;
 }
@@ -183,12 +199,19 @@ export interface CreateSubAgentTransportControlDispatcherOptions {
   readonly control: SubAgentExecutionControl;
   readonly taskId: string;
   readonly ownerSessionId: string;
+  /** Shared process/session registry; inject the same instance after channel replacement. */
+  readonly taskHandles?: SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>;
+  /** Optional authoritative lazy reconstruction used when no resident nested handle exists. */
+  readonly resolveTaskHandle?: SubAgentTransportTaskHandleResolver<SubAgentTaskHandle>;
   /** Frozen once when the dispatcher is created and reused for every request and reply. */
   readonly validation?: JsonValueBoundaryOptions;
 }
 
 export interface CreateRemoteSubAgentExecutionControlOptions {
   readonly taskId: string;
+  readonly executionAttempt: number;
+  readonly executionEpoch: string;
+  readonly executionFencingToken: string;
   readonly signal: AbortSignal;
   readonly deadlineAt: number;
   readonly delegationSnapshot: SubAgentDelegationSnapshot;
@@ -327,7 +350,11 @@ export function createSubAgentTransportControlDispatcher(
     throw new TypeError('Control dispatcher requires a trusted SubAgentExecutionControl.');
   }
   const validation = resolveControlValidationOptions(options.validation);
-  const handles = new Map<string, SubAgentTaskHandle>();
+  const handles =
+    options.taskHandles ?? new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+  if (options.resolveTaskHandle !== undefined && typeof options.resolveTaskHandle !== 'function') {
+    throw new TypeError('Control dispatcher task-handle resolver must be a function.');
+  }
 
   return Object.freeze({
     taskId: options.taskId,
@@ -340,7 +367,14 @@ export function createSubAgentTransportControlDispatcher(
         assertControlRequestScope(request, options.taskId, options.ownerSessionId);
         const result = projectControlResult(
           request.method,
-          await dispatchControlRequest(options.control, handles, request),
+          await dispatchControlRequest(
+            options.control,
+            handles,
+            options.ownerSessionId,
+            options.taskId,
+            options.resolveTaskHandle,
+            request,
+          ),
         );
         assertControlResultScope(
           request.method,
@@ -363,6 +397,14 @@ export function createRemoteSubAgentExecutionControl(
   options: CreateRemoteSubAgentExecutionControlOptions,
 ): SubAgentExecutionControl {
   assertIdentifier(options.taskId, 'Remote control taskId');
+  if (!Number.isSafeInteger(options.executionAttempt) || options.executionAttempt < 1) {
+    throw new TypeError('Remote control executionAttempt must be a positive safe integer.');
+  }
+  assertIdentifier(options.executionEpoch, 'Remote control executionEpoch');
+  assertCanonicalFencingToken(
+    options.executionFencingToken,
+    'Remote control executionFencingToken',
+  );
   if (!(options.signal instanceof AbortSignal)) {
     throw new TypeError('Remote control signal must be an AbortSignal.');
   }
@@ -387,6 +429,9 @@ export function createRemoteSubAgentExecutionControl(
     options.catalogEntries,
   );
   const exchangeContext: SubAgentTransportControlExchangeContext = Object.freeze({
+    executionAttempt: options.executionAttempt,
+    executionEpoch: options.executionEpoch,
+    executionFencingToken: options.executionFencingToken,
     signal: options.signal,
     deadlineAt: options.deadlineAt,
   });
@@ -565,7 +610,10 @@ export function createRemoteSubAgentExecutionControl(
 
 async function dispatchControlRequest(
   control: SubAgentExecutionControl,
-  handles: Map<string, SubAgentTaskHandle>,
+  handles: SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>,
+  ownerSessionId: string,
+  parentTaskId: string,
+  resolveTaskHandle: SubAgentTransportTaskHandleResolver<SubAgentTaskHandle> | undefined,
   request: SubAgentTransportControlRequest,
 ): Promise<unknown> {
   switch (request.method) {
@@ -602,20 +650,81 @@ async function dispatchControlRequest(
       return control.delegation.execute(request.args.request);
     case 'delegation.spawn': {
       const handle = await control.delegation.spawn(request.args.request);
-      handles.set(handle.taskId, handle);
+      rememberSubAgentTaskHandle(handles, {
+        ownerSessionId,
+        parentTaskId,
+        taskId: handle.taskId,
+        resolver: () => handle,
+      });
       return { taskId: handle.taskId };
     }
     case 'delegation.resumeTool': {
       const handle = await control.delegation.resumeTool(request.args.childTaskId);
-      handles.set(handle.taskId, handle);
+      rememberSubAgentTaskHandle(handles, {
+        ownerSessionId,
+        parentTaskId,
+        taskId: handle.taskId,
+        resolver: () => handle,
+      });
       return { taskId: handle.taskId };
     }
     case 'task.snapshot':
-      return requireHandle(handles, request.args.taskId).snapshot();
+      return invokeRegisteredTaskHandle(
+        handles,
+        { ownerSessionId, parentTaskId, taskId: request.args.taskId },
+        'snapshot',
+        resolveTaskHandle,
+      );
     case 'task.wait':
-      return requireHandle(handles, request.args.taskId).wait();
+      return invokeRegisteredTaskHandle(
+        handles,
+        { ownerSessionId, parentTaskId, taskId: request.args.taskId },
+        'wait',
+        resolveTaskHandle,
+      );
     case 'task.cancel':
-      return requireHandle(handles, request.args.taskId).cancel(request.args.reason);
+      return invokeRegisteredTaskHandle(
+        handles,
+        { ownerSessionId, parentTaskId, taskId: request.args.taskId },
+        'cancel',
+        resolveTaskHandle,
+        request.args.reason,
+      );
+  }
+}
+
+async function invokeRegisteredTaskHandle(
+  handles: SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>,
+  scope: SubAgentTransportTaskHandleScope,
+  operation: 'snapshot' | 'wait' | 'cancel',
+  resolver?: SubAgentTransportTaskHandleResolver<SubAgentTaskHandle>,
+  reason?: string,
+): Promise<unknown> {
+  if (!handles.has(scope) && resolver !== undefined) {
+    handles.remember({ ...scope, resolver });
+  }
+  const registered = handles.has(scope);
+  try {
+    const handle = resolveSubAgentTaskHandle(handles, scope);
+    switch (operation) {
+      case 'snapshot':
+        return await handle.snapshot();
+      case 'wait':
+        return await handle.wait();
+      case 'cancel':
+        return await handle.cancel(reason);
+    }
+  } catch (error) {
+    if (
+      registered &&
+      error instanceof SubAgentRuntimeError &&
+      error.code === 'RESOURCE_NOT_FOUND'
+    ) {
+      throw new TypeError('A registered task handle returned a mismatched task scope.', {
+        cause: error,
+      });
+    }
+    throw error;
   }
 }
 
@@ -798,18 +907,6 @@ function approvalRequestsEqual(
 
 function executionOutcomeTaskId(outcome: SubAgentExecutionOutcome): string {
   return outcome.type === 'paused' ? outcome.task.taskId : outcome.result.task.taskId;
-}
-
-function requireHandle(
-  handles: ReadonlyMap<string, SubAgentTaskHandle>,
-  taskId: string,
-): SubAgentTaskHandle {
-  return (
-    handles.get(taskId) ??
-    (() => {
-      throw new SubAgentRuntimeError(RESOURCE_NOT_FOUND_ERROR);
-    })()
-  );
 }
 
 function errorReply(
@@ -1017,19 +1114,24 @@ function assertMethod(value: unknown): SubAgentTransportControlMethod {
 }
 
 function assertBinding(value: unknown): void {
-  const binding = closedRecord(value, 'Executor binding', [
-    'version',
-    'executorName',
-    'ownerSessionId',
-    'taskId',
-    'subagentSessionId',
-    'definitionName',
-    'definitionVersion',
-    'runnerId',
-    'runnerVersion',
-    'adapterStateVersion',
-    'recoveryData',
-  ]);
+  const binding = closedRecord(
+    value,
+    'Executor binding',
+    [
+      'version',
+      'executorName',
+      'ownerSessionId',
+      'taskId',
+      'subagentSessionId',
+      'definitionName',
+      'definitionVersion',
+      'runnerId',
+      'runnerVersion',
+      'adapterStateVersion',
+      'recoveryData',
+    ],
+    ['modelBinding'],
+  );
   if (binding.version !== '1') fail('Executor binding version is invalid.');
   for (const key of [
     'executorName',
@@ -1044,6 +1146,16 @@ function assertBinding(value: unknown): void {
   ] as const)
     assertIdentifier(binding[key], `Executor binding ${key}`);
   assertJsonValue(binding.recoveryData);
+  if (binding.modelBinding !== undefined) {
+    const modelBinding = closedRecord(binding.modelBinding, 'Executor Model binding', [
+      'gatewayId',
+      'protocol',
+      'codecVersion',
+    ]);
+    assertIdentifier(modelBinding.gatewayId, 'Executor Model binding gatewayId');
+    assertIdentifier(modelBinding.protocol, 'Executor Model binding protocol');
+    assertIdentifier(modelBinding.codecVersion, 'Executor Model binding codecVersion');
+  }
   assertSyntheticExecutionOperation({ type: 'reconnect', operationId: 'validation', binding });
 }
 
@@ -1096,7 +1208,7 @@ function assertSyntheticExecutionOperation(operation: UnknownRecord): void {
     path: [taskId],
     attempt: 1,
     executionEpoch: 'epoch',
-    executionFencingToken: 'fencing',
+    executionFencingToken: '1',
     definition: { name: definitionName, version: definitionVersion },
     input: null,
     projectedContext: [],

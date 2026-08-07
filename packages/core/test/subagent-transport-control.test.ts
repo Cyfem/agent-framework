@@ -30,6 +30,7 @@ import type {
 } from '../src';
 import { createResourceNotFoundError, SubAgentRuntimeError } from '../src/subagent/errors';
 import { canonicalJsonSha256 } from '../src/subagent/json';
+import { SubAgentTransportTaskHandleRegistry } from '../src/subagent/transport-task-handle-registry';
 import {
   SUBAGENT_TRANSPORT_CONTROL_METHODS,
   assertSubAgentTransportControlReply,
@@ -48,6 +49,11 @@ import {
 
 const TASK_ID = 'task-parent';
 const CHILD_TASK_ID = 'task-child';
+const EXECUTION_SCOPE = Object.freeze({
+  executionAttempt: 1,
+  executionEpoch: 'epoch-1',
+  executionFencingToken: '1',
+});
 
 function createBinding(): SubAgentExecutorBinding {
   return {
@@ -872,6 +878,76 @@ describe('Subagent transport control dispatcher', () => {
     expect(trusted.calls.reportProgress).not.toHaveBeenCalled();
   });
 
+  acceptanceIt(
+    'C7-GATEWAY-20.l1.nested-handle-registry',
+    'parent-scoped-nested-handle-reconnect',
+    async () => {
+      const trusted = createTrustedControl();
+      const handles = new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+      const firstChannel = createSubAgentTransportControlDispatcher({
+        control: trusted.control,
+        taskId: TASK_ID,
+        ownerSessionId: 'owner-session-1',
+        taskHandles: handles,
+      });
+      await expect(
+        firstChannel.dispatch(
+          request('delegation.spawn', createMethodFixtures()['delegation.spawn'].args),
+        ),
+      ).resolves.toEqual(successfulReply('delegation.spawn', { taskId: CHILD_TASK_ID }));
+
+      const replacementChannel = createSubAgentTransportControlDispatcher({
+        control: createTrustedControl().control,
+        taskId: TASK_ID,
+        ownerSessionId: 'owner-session-1',
+        taskHandles: handles,
+      });
+      await expect(
+        replacementChannel.dispatch(request('task.snapshot', { taskId: CHILD_TASK_ID })),
+      ).resolves.toEqual(successfulReply('task.snapshot', createTaskSnapshot()));
+
+      const differentParent = createSubAgentTransportControlDispatcher({
+        control: createTrustedControl().control,
+        taskId: 'task-other-parent',
+        ownerSessionId: 'owner-session-1',
+        taskHandles: handles,
+      });
+      await expect(
+        differentParent.dispatch(
+          request('task.snapshot', { taskId: CHILD_TASK_ID }, { taskId: 'task-other-parent' }),
+        ),
+      ).resolves.toMatchObject({
+        method: 'task.snapshot',
+        ok: false,
+        error: { code: 'RESOURCE_NOT_FOUND' },
+      });
+      expect(trusted.childHandle.snapshot).toHaveBeenCalledTimes(1);
+
+      const lazyResolver = vi.fn(async () => trusted.childHandle);
+      const reconstructed = createSubAgentTransportControlDispatcher({
+        control: createTrustedControl().control,
+        taskId: 'task-reconstructed-parent',
+        ownerSessionId: 'owner-session-1',
+        taskHandles: new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>(),
+        resolveTaskHandle: lazyResolver,
+      });
+      await expect(
+        reconstructed.dispatch(
+          request(
+            'task.snapshot',
+            { taskId: CHILD_TASK_ID },
+            { taskId: 'task-reconstructed-parent' },
+          ),
+        ),
+      ).resolves.toEqual(successfulReply('task.snapshot', createTaskSnapshot()));
+      expect(lazyResolver).toHaveBeenCalledWith({
+        ownerSessionId: 'owner-session-1',
+        parentTaskId: 'task-reconstructed-parent',
+        taskId: CHILD_TASK_ID,
+      });
+    },
+  );
+
   it('maps trusted exceptions to closed safe replies without raw error details', async () => {
     const trusted = createTrustedControl();
     trusted.calls.reportProgress.mockRejectedValueOnce(
@@ -1234,6 +1310,7 @@ describe('Remote Subagent execution control proxy', () => {
     expect(() =>
       createRemoteSubAgentExecutionControl({
         taskId: TASK_ID,
+        ...EXECUTION_SCOPE,
         signal: new AbortController().signal,
         deadlineAt: -1,
         delegationSnapshot: catalog.delegation,
@@ -1263,6 +1340,7 @@ describe('Remote Subagent execution control proxy', () => {
     const catalog = createCatalogFixtures();
     const remote = createRemoteSubAgentExecutionControl({
       taskId: TASK_ID,
+      ...EXECUTION_SCOPE,
       signal: new AbortController().signal,
       deadlineAt: 120_000,
       delegationSnapshot: catalog.delegation,
@@ -1305,6 +1383,7 @@ describe('Remote Subagent execution control proxy', () => {
     );
     const remote = createRemoteSubAgentExecutionControl({
       taskId: TASK_ID,
+      ...EXECUTION_SCOPE,
       signal: new AbortController().signal,
       deadlineAt: 120_000,
       delegationSnapshot: catalog.delegation,
@@ -1375,6 +1454,7 @@ describe('Remote Subagent execution control proxy', () => {
     const signal = new AbortController().signal;
     const remote = createRemoteSubAgentExecutionControl({
       taskId: TASK_ID,
+      ...EXECUTION_SCOPE,
       signal,
       deadlineAt: 120_000,
       delegationSnapshot: catalog.delegation,
@@ -1457,6 +1537,7 @@ describe('Remote Subagent execution control proxy', () => {
     expect(new Set(contexts).size).toBe(1);
     for (const context of contexts) {
       expect(Object.isFrozen(context)).toBe(true);
+      expect(context).toMatchObject(EXECUTION_SCOPE);
       expect(context.signal).toBe(signal);
       expect(context.deadlineAt).toBe(120_000);
     }
@@ -1502,6 +1583,7 @@ describe('Remote Subagent execution control proxy', () => {
     );
     const remote = createRemoteSubAgentExecutionControl({
       taskId: TASK_ID,
+      ...EXECUTION_SCOPE,
       signal: controller.signal,
       deadlineAt: 120_000,
       delegationSnapshot: catalog.delegation,
@@ -1552,6 +1634,7 @@ describe('Remote Subagent execution control proxy', () => {
     });
     const remote = createRemoteSubAgentExecutionControl({
       taskId: TASK_ID,
+      ...EXECUTION_SCOPE,
       signal: new AbortController().signal,
       deadlineAt: 120_000,
       delegationSnapshot: catalog.delegation,
@@ -1633,6 +1716,7 @@ describe('Remote Subagent execution control proxy', () => {
       });
     const remote = createRemoteSubAgentExecutionControl({
       taskId: TASK_ID,
+      ...EXECUTION_SCOPE,
       signal: new AbortController().signal,
       deadlineAt: 120_000,
       delegationSnapshot: catalog.delegation,
@@ -1670,6 +1754,7 @@ describe('Remote Subagent execution control proxy', () => {
     );
     const remote = createRemoteSubAgentExecutionControl({
       taskId: TASK_ID,
+      ...EXECUTION_SCOPE,
       signal: new AbortController().signal,
       deadlineAt: 120_000,
       delegationSnapshot: catalog.delegation,
@@ -1707,6 +1792,7 @@ describe('Remote Subagent execution control proxy', () => {
     });
     const remote = createRemoteSubAgentExecutionControl({
       taskId: TASK_ID,
+      ...EXECUTION_SCOPE,
       signal: new AbortController().signal,
       deadlineAt: 120_000,
       delegationSnapshot: catalog.delegation,

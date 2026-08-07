@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  canonicalJsonSha256,
   SubAgentRuntimeError,
   type ExecutorAvailabilityProbe,
   type ExecutorTaskHandle,
@@ -16,6 +17,7 @@ import {
   type SubAgentExecutorDescriptor,
   type SubAgentTaskEvent,
   type SubAgentTaskState,
+  type PreparedSubAgentTargetRunner,
 } from '@ruixutong.manee/maneeagent-framework';
 
 import { LocalSubAgentRunnerRegistry } from './local-runner-registry';
@@ -26,7 +28,8 @@ interface MemoryBindingState {
 }
 
 interface MemoryExecution {
-  request: SubAgentExecutionRequest;
+  request: SubAgentChildRunRequest;
+  readonly createIdentity?: MemoryCreateIdentity;
   readonly binding: SubAgentExecutorBinding;
   readonly runner: SubAgentChildRunner;
   controller: AbortController;
@@ -34,6 +37,12 @@ interface MemoryExecution {
   outcome?: SubAgentExecutionOutcome;
   running: boolean;
   updatedAt: number;
+}
+
+interface MemoryCreateIdentity {
+  readonly operationId: string;
+  readonly idempotencyKey: string;
+  readonly requestHash: string;
 }
 
 export interface MemorySubAgentExecutorOptions {
@@ -57,6 +66,7 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
   });
   readonly #registry: LocalSubAgentRunnerRegistry;
   readonly #executions = new Map<string, MemoryExecution>();
+  readonly #pendingStarts = new Map<string, Promise<MemoryExecution>>();
 
   constructor(options: MemorySubAgentExecutorOptions) {
     this.#registry = options.registry.seal();
@@ -160,29 +170,70 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<MemoryExecution> {
+    const prepared = this.#registry.prepareExecution(request, this.descriptor.name);
     if (request.operation.type === 'reconnect') {
       throw runtimeError('RECOVERY_UNSUPPORTED', 'Local execution does not support reconnect.');
     }
+    const createIdentity =
+      request.operation.type === 'create'
+        ? createMemoryCreateIdentity(
+            request.operation.operationId,
+            request.operation.idempotencyKey,
+            request,
+            prepared.request,
+          )
+        : undefined;
 
+    const pending = this.#pendingStarts.get(request.taskId);
+    if (pending !== undefined) {
+      const execution = await pending;
+      if (request.operation.type === 'create') {
+        assertCreateReplay(execution, createIdentity as MemoryCreateIdentity);
+        return execution;
+      }
+      return this.#start(request, control);
+    }
+
+    const start = this.#startPrepared(request, control, prepared, createIdentity).finally(() => {
+      if (this.#pendingStarts.get(request.taskId) === start) {
+        this.#pendingStarts.delete(request.taskId);
+      }
+    });
+    this.#pendingStarts.set(request.taskId, start);
+    return start;
+  }
+
+  async #startPrepared(
+    request: SubAgentExecutionRequest,
+    control: SubAgentExecutionControl,
+    prepared: PreparedSubAgentTargetRunner,
+    createIdentity: MemoryCreateIdentity | undefined,
+  ): Promise<MemoryExecution> {
+    if (request.operation.type === 'reconnect') {
+      throw runtimeError('RECOVERY_UNSUPPORTED', 'Local execution does not support reconnect.');
+    }
     let execution = this.#executions.get(request.taskId);
     if (request.operation.type === 'create') {
       if (execution !== undefined) {
-        if (!sameExecutionIdentity(execution.request, request)) {
-          throw runtimeError('IDEMPOTENCY_CONFLICT', 'The local task identity is already in use.');
-        }
+        assertCreateReplay(execution, createIdentity as MemoryCreateIdentity);
         return execution;
       }
-      const childRequest = toChildRequest(request);
-      const runner = await this.#registry.create(childRequest, this.descriptor.name);
-      const runnerIdentity = this.#registry.runnerFor(request.definition);
+      const bindingOperationId = request.operation.operationId;
+      const runner = await prepared.create();
       const bindingState: MemoryBindingState = {
         kind: 'maneeagent-memory-local/v1',
         handleId: randomUUID(),
       };
-      const binding = createBinding(request, this.descriptor.name, runnerIdentity, bindingState);
+      const binding = createBinding(
+        prepared.request,
+        this.descriptor.name,
+        prepared.runner,
+        bindingState,
+      );
       const controller = new AbortController();
       execution = {
-        request,
+        request: prepared.request,
+        createIdentity: createIdentity as MemoryCreateIdentity,
         binding,
         runner,
         controller,
@@ -192,32 +243,24 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
       };
       this.#executions.set(request.taskId, execution);
       try {
-        await control.commitBinding(request.operation.operationId, binding);
+        await control.commitBinding(bindingOperationId, binding);
       } catch (error) {
         this.#executions.delete(request.taskId);
         throw error;
       }
     } else {
       const state = this.bindingCodec.decode(request.operation.binding.recoveryData);
-      const runnerIdentity = this.#registry.runnerFor(request.definition);
-      if (
-        !bindingMatchesRequest(
-          request.operation.binding,
-          request,
-          this.descriptor.name,
-          runnerIdentity,
-        ) ||
-        !checkpointMatchesRunner(request.operation.checkpoint, runnerIdentity)
-      ) {
+      if (request.operation.binding.adapterStateVersion !== this.bindingCodec.adapterStateVersion) {
         throw runtimeError(
-          'CHECKPOINT_VERSION_MISMATCH',
-          'The Local child checkpoint is incompatible with the persisted runner binding.',
+          'RECOVERY_TARGET_LOST',
+          'The persisted Local child binding uses an unsupported adapter state version.',
         );
       }
+      const binding = createBinding(prepared.request, this.descriptor.name, prepared.runner, state);
       if (execution !== undefined) {
         if (
           !sameExecutionIdentity(execution.request, request) ||
-          !sameBinding(execution.binding, request.operation.binding) ||
+          !sameBinding(execution.binding, binding) ||
           this.bindingCodec.decode(execution.binding.recoveryData).handleId !== state.handleId
         ) {
           throw runtimeError(
@@ -231,10 +274,14 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
       }
 
       if (execution === undefined || request.operation.reason === 'checkpoint') {
-        const runner = await this.#registry.create(toChildRequest(request), this.descriptor.name);
+        const originalCreateIdentity = execution?.createIdentity;
+        const runner = await prepared.create();
         execution = {
-          request,
-          binding: request.operation.binding,
+          request: prepared.request,
+          ...(originalCreateIdentity === undefined
+            ? {}
+            : { createIdentity: originalCreateIdentity }),
+          binding,
           runner,
           controller: new AbortController(),
           promise: Promise.resolve(invalidPendingOutcome()),
@@ -243,7 +290,7 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
         };
         this.#executions.set(request.taskId, execution);
       } else {
-        execution.request = request;
+        execution.request = prepared.request;
         execution.controller = new AbortController();
       }
     }
@@ -255,7 +302,7 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
     activeExecution.running = true;
     activeExecution.updatedAt = Date.now();
     const childSignal = AbortSignal.any([request.signal, activeExecution.controller.signal]);
-    const childRequest = toChildRequest(request, childSignal);
+    const childRequest = withSignal(activeExecution.request, childSignal);
     const childControl = Object.freeze({ ...control, signal: childSignal });
     const run = Promise.resolve().then(() =>
       activeExecution.runner.run(childRequest, childControl),
@@ -304,33 +351,18 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
   }
 }
 
-function toChildRequest(
-  request: SubAgentExecutionRequest,
-  signal = request.signal,
+function withSignal(
+  request: SubAgentChildRunRequest,
+  signal: AbortSignal,
 ): SubAgentChildRunRequest {
   return Object.freeze({
-    ownerSessionId: request.ownerSessionId,
-    runId: request.runId,
-    taskId: request.taskId,
-    ...(request.parentTaskId === undefined ? {} : { parentTaskId: request.parentTaskId }),
-    subagentSessionId: request.subagentSessionId,
-    path: request.path,
-    attempt: request.attempt,
-    executionEpoch: request.executionEpoch,
-    executionFencingToken: request.executionFencingToken,
-    definition: request.definition,
-    input: request.input,
-    projectedContext: request.projectedContext,
-    delegation: request.delegation,
-    limits: request.limits,
-    ...(request.operation.type === 'resume' ? { checkpoint: request.operation.checkpoint } : {}),
+    ...request,
     signal,
-    deadlineAt: request.deadlineAt,
   });
 }
 
 function createBinding(
-  request: SubAgentExecutionRequest,
+  request: SubAgentChildRunRequest,
   executorName: string,
   runner: { readonly runnerId: string; readonly runnerVersion: string },
   state: MemoryBindingState,
@@ -348,24 +380,6 @@ function createBinding(
     adapterStateVersion: '1',
     recoveryData: { ...state },
   });
-}
-
-function checkpointMatchesRunner(
-  checkpoint: Extract<
-    SubAgentExecutionRequest['operation'],
-    { readonly type: 'resume' }
-  >['checkpoint'],
-  runner: {
-    readonly runnerId: string;
-    readonly runnerVersion: string;
-    readonly childCheckpointVersions: readonly string[];
-  },
-): boolean {
-  return (
-    checkpoint.runnerId === runner.runnerId &&
-    checkpoint.runnerVersion === runner.runnerVersion &&
-    runner.childCheckpointVersions.includes(checkpoint.version)
-  );
 }
 
 function decodeBindingState(value: JsonValue): MemoryBindingState {
@@ -407,8 +421,42 @@ function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T
   });
 }
 
+function createMemoryCreateIdentity(
+  operationId: string,
+  idempotencyKey: string,
+  request: SubAgentExecutionRequest,
+  preparedRequest: SubAgentChildRunRequest,
+): MemoryCreateIdentity {
+  const stablePreparedRequest = Object.fromEntries(
+    Object.entries(preparedRequest).filter(([key]) => key !== 'signal'),
+  ) as Record<string, JsonValue>;
+  const stableRequest = {
+    operation: { type: 'create', operationId, idempotencyKey },
+    ...stablePreparedRequest,
+    ...(request.retryOf === undefined ? {} : { retryOf: request.retryOf }),
+  };
+  return Object.freeze({
+    operationId,
+    idempotencyKey,
+    requestHash: canonicalJsonSha256(stableRequest as unknown as JsonValue),
+  });
+}
+
+function assertCreateReplay(execution: MemoryExecution, requested: MemoryCreateIdentity): void {
+  if (
+    execution.createIdentity?.operationId !== requested.operationId ||
+    execution.createIdentity?.idempotencyKey !== requested.idempotencyKey ||
+    execution.createIdentity.requestHash !== requested.requestHash
+  ) {
+    throw runtimeError(
+      'IDEMPOTENCY_CONFLICT',
+      'The local task create identity is already bound to a different prepared request.',
+    );
+  }
+}
+
 function sameExecutionIdentity(
-  left: SubAgentExecutionRequest,
+  left: SubAgentChildRunRequest,
   right: SubAgentExecutionRequest,
 ): boolean {
   return (
@@ -418,26 +466,6 @@ function sameExecutionIdentity(
     left.subagentSessionId === right.subagentSessionId &&
     left.definition.name === right.definition.name &&
     left.definition.version === right.definition.version
-  );
-}
-
-function bindingMatchesRequest(
-  binding: SubAgentExecutorBinding,
-  request: SubAgentExecutionRequest,
-  executorName: string,
-  runner: { readonly runnerId: string; readonly runnerVersion: string },
-): boolean {
-  return (
-    binding.version === '1' &&
-    binding.executorName === executorName &&
-    binding.ownerSessionId === request.ownerSessionId &&
-    binding.taskId === request.taskId &&
-    binding.subagentSessionId === request.subagentSessionId &&
-    binding.definitionName === request.definition.name &&
-    binding.definitionVersion === request.definition.version &&
-    binding.runnerId === runner.runnerId &&
-    binding.runnerVersion === runner.runnerVersion &&
-    binding.adapterStateVersion === '1'
   );
 }
 

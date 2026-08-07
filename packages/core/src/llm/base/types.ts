@@ -8,6 +8,21 @@ export interface ModelRuntimeMetadata {
   readonly sessionId?: string;
   readonly runId?: string;
   readonly taskId?: string;
+  /** One-based child execution attempt. Root Agent requests omit this placement identity. */
+  readonly executionAttempt?: number;
+  /** Opaque child execution epoch fixed by the authoritative Runtime. */
+  readonly executionEpoch?: string;
+  /** Decimal fencing token fixed for the child execution epoch. */
+  readonly executionFencingToken?: string;
+  /**
+   * Host-only durable provider operation identity. Protocol adapters must never copy it into a
+   * provider request body, header, query parameter or provider-visible idempotency field.
+   */
+  readonly providerOperationId?: string;
+  /** Durable checkpoint control operation acknowledged immediately before provider dispatch. */
+  readonly checkpointOperationId?: string;
+  /** Lowercase SHA-256 of the exact acknowledged child checkpoint. */
+  readonly checkpointDigest?: string;
   /** Zero-based logical Agent loop iteration. */
   readonly iteration?: number;
   /** One-based request attempt within model error recovery. */
@@ -34,9 +49,18 @@ export interface ModelGenerateRequest<P extends AgentProtocol> {
 }
 
 /** Model 执行一轮模型调用后返回的协议消息与可选完整响应。 */
+/** Provider-reported token usage normalized without retaining raw billing or credential data. */
+export interface ModelGenerateUsage {
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly totalTokens?: number;
+}
+
 export interface ModelGenerateResult<P extends AgentProtocol> {
   /** 本轮模型生成的协议消息；Agent 会按顺序原样写入 context/history。 */
   messages: readonly ContextOf<P>[];
+  /** Normalized usage used by durable Subagent budget settlement. */
+  usage?: ModelGenerateUsage;
   /** SDK 或 provider 返回的完整原始响应，供调试和审计使用。 */
   raw?: P['rawResponse'];
 }

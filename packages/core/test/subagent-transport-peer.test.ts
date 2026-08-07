@@ -65,7 +65,7 @@ function createExecutionRequest(): SubAgentExecutionRequest<{ readonly query: st
     path: [TASK_ID],
     attempt: 1,
     executionEpoch: 'epoch-1',
-    executionFencingToken: 'fencing-1',
+    executionFencingToken: '1',
     definition: { name: 'researcher', version: '2' },
     input: { query: 'hello' },
     projectedContext: [{ kind: 'text', name: 'brief', text: 'Use primary sources.' }],
@@ -92,6 +92,56 @@ function eventsReply(): {
   return {
     kind: 'events.page',
     payload: { events: [], nextSequence: 0, done: true },
+  };
+}
+
+function modelRequest() {
+  return {
+    kind: 'model.request' as const,
+    taskId: TASK_ID,
+    operationId: 'provider-operation-1',
+    payload: {
+      providerOperationId: 'provider-operation-1',
+      gatewayId: 'controller-gateway-1',
+      protocol: 'openai-chat',
+      codecVersion: '1',
+      runId: 'run-1',
+      executionAttempt: 1,
+      executionEpoch: 'epoch-1',
+      executionFencingToken: '7',
+      checkpointOperationId: 'child-checkpoint-1',
+      checkpointDigest: 'c'.repeat(64),
+      purpose: 'agent' as const,
+      iteration: 0,
+      requestAttempt: 1,
+      requestHash: 'a'.repeat(64),
+      context: [{ role: 'user', content: 'hello' }],
+      tools: [],
+      remainingMs: 30_000,
+    },
+  };
+}
+
+function modelReply(overrides: Record<string, unknown> = {}) {
+  return {
+    kind: 'model.reply' as const,
+    payload: {
+      providerOperationId: 'provider-operation-1',
+      gatewayId: 'controller-gateway-1',
+      protocol: 'openai-chat',
+      codecVersion: '1',
+      runId: 'run-1',
+      executionAttempt: 1,
+      executionEpoch: 'epoch-1',
+      executionFencingToken: '7',
+      checkpointOperationId: 'child-checkpoint-1',
+      checkpointDigest: 'c'.repeat(64),
+      requestHash: 'a'.repeat(64),
+      ok: true as const,
+      resultHash: 'b'.repeat(64),
+      messages: [{ role: 'assistant', content: 'done' }],
+      ...overrides,
+    },
   };
 }
 
@@ -217,6 +267,49 @@ function expectPeerFailure(error: unknown, reason: SubAgentTransportPeerError['r
 }
 
 describe('Subagent transport peer exchange and admission', () => {
+  it('uses the same Peer sequence domain for Model gateway RPC and fail-closes semantic mismatch', async () => {
+    const peers: { client?: SubAgentTransportPeer } = {};
+    const server: SubAgentTransportPeer = new SubAgentTransportPeer({
+      channelId: 'channel-model-gateway',
+      writer: (packet) => createSubAgentTransportPeerWriterAdmission(peers.client!.receive(packet)),
+      handler: (request) => request.reply(modelReply()),
+      createMessageId: messageIds('server-model'),
+    });
+    const client = new SubAgentTransportPeer({
+      channelId: 'channel-model-gateway',
+      writer: (packet) => createSubAgentTransportPeerWriterAdmission(server.receive(packet)),
+      createMessageId: messageIds('client-model'),
+    });
+    peers.client = client;
+
+    const exchange = client.openRequest(modelRequest());
+    const reply = await exchange.next();
+    expect(reply.done).toBe(false);
+    expect(reply.value?.envelope.kind).toBe('model.reply');
+    expect(client.state).toBe('open');
+
+    const badPeers: { client?: SubAgentTransportPeer } = {};
+    const badServer: SubAgentTransportPeer = new SubAgentTransportPeer({
+      channelId: 'channel-model-mismatch',
+      writer: (packet) =>
+        createSubAgentTransportPeerWriterAdmission(badPeers.client!.receive(packet)),
+      handler: (request) =>
+        request.reply(modelReply({ gatewayId: 'different-controller-gateway' })),
+      createMessageId: messageIds('bad-server-model'),
+    });
+    const badClient = new SubAgentTransportPeer({
+      channelId: 'channel-model-mismatch',
+      writer: (packet) => createSubAgentTransportPeerWriterAdmission(badServer.receive(packet)),
+      createMessageId: messageIds('bad-client-model'),
+    });
+    badPeers.client = badClient;
+    const badExchange = badClient.openRequest(modelRequest());
+    const failure = await badExchange.next().catch((error: unknown) => error);
+    expectPeerFailure(failure, 'writer-failed');
+    expect(badClient.state).toBe('closed');
+    expect(badServer.state).toBe('closed');
+  });
+
   it('supports bidirectional sequence spaces and reverse control without holding dispatch admission', async () => {
     const calls: string[] = [];
     const leftHandler: SubAgentTransportPeerRequestHandler = async (request) => {
@@ -528,6 +621,9 @@ describe('Subagent transport peer exchange and admission', () => {
       taskId: TASK_ID,
       operationId: OPERATION_ID,
       payload: {
+        executionAttempt: 1,
+        executionEpoch: 'epoch-1',
+        executionFencingToken: '1',
         method: 'execution.reportProgress',
         args: { update: { message: 'halfway' } },
       },
@@ -1184,6 +1280,42 @@ describe('Subagent transport peer cancellation and limits', () => {
     await expect(peer.receive(late)).resolves.toBeUndefined();
     expect(peer.state).toBe('open');
     expect(JSON.stringify(aborted)).not.toContain('raw abort reason');
+  });
+
+  it('bounds admitted abort tombstones and fail-closes instead of retaining them indefinitely', async () => {
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    const peer = new SubAgentTransportPeer({
+      channelId: 'channel-tombstone-bound',
+      createMessageId: messageIds('bounded'),
+      writer: () => createSubAgentTransportPeerWriterAdmission(),
+      maxTombstones: 1,
+    });
+    const first = peer.openRequest({
+      kind: 'events.request',
+      taskId: TASK_ID,
+      operationId: 'bounded-operation-1',
+      payload: {},
+      signal: firstAbort.signal,
+    });
+    const second = peer.openRequest({
+      kind: 'events.request',
+      taskId: TASK_ID,
+      operationId: 'bounded-operation-2',
+      payload: {},
+      signal: secondAbort.signal,
+    });
+
+    firstAbort.abort();
+    expectPeerFailure(await first.next().catch((error: unknown) => error), 'aborted');
+    expect(peer.state).toBe('draining');
+    expect(peer.tombstoneCount).toBe(1);
+
+    secondAbort.abort();
+    expectPeerFailure(await second.next().catch((error: unknown) => error), 'aborted');
+    expect(peer.state).toBe('closed');
+    expect(peer.pendingCount).toBe(0);
+    expect(peer.tombstoneCount).toBe(0);
   });
 
   it('close clears timeout/signal resources and rejects pending next calls', async () => {

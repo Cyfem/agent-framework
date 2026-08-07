@@ -3,7 +3,7 @@
 ## 1. 文档状态
 
 - 设计状态：验收方案，随 [PLAN.md](./PLAN.md) 与 [TECHNICAL_CHANGES.md](./TECHNICAL_CHANGES.md) 一起作为 Subagent v2 实施基线。
-- 当前实现状态：当前 checkout 已完成 C0～C6 的 Core v2、官方 Local、公开 Agent durable loop、Phase 1 离线/进程恢复证据，以及 C7 Core transport/RPC/control/Peer/artifact-sidecar；Worker/Process/HTTP placement 尚未交付，Phase 2 未通过，C8/C9 与 Docker/真实方舟最终证据仍是待交付要求。
+- 当前实现状态：当前 checkout 已完成 C0～C6 的 Core v2、官方 Local、公开 Agent durable loop、Phase 1 离线/进程恢复证据，以及 C7a/C7b/C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway；Worker/Process/HTTP placement 尚未交付，Phase 2 未通过，C8/C9 与 Docker/真实方舟最终证据仍是待交付要求。
 - 目标范围：Phase 1 Core/Local、Phase 2 Worker/Process/HTTP Remote、Phase 3 PostgreSQL/BullMQ/Docker/S3/OTel、Compose，以及完整离线与真实方舟验收。
 - 目标版本：所有公开包统一 `2.0.0`；不为 v1 legacy Subagent 提供兼容验收。
 - 明确排除：conversation handoff、active-agent 所有权转移、Windows/Electron 桌面交互、任意云厂商 transport 的产品化实现。
@@ -731,14 +731,14 @@ Phase 1 的 external reconnect 由 fake external Executor 证明 Core 契约；�
 
 适配器门禁：
 
-| Executor            | 必须能力与专项用例                                                                                                                    |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Local + Memory      | execute/spawn/cancel/events/approval/usage；仅 same-process approval resume；丢失原 handle 后 target lost。                           |
-| Local + Atomic File | Memory 全部能力；checkpoint resume、WAL、lease/fencing、双进程争抢、重启恢复；reconnect=`none`。                                      |
-| Worker package      | `maneeagent-executor-worker`：IPC schema 重验、signal/cancel、worker crash、checkpoint/result/event sequence 恢复，reconnect=`none`。 |
-| Process package     | `maneeagent-executor-process`：Worker 契约 + kill/exit 分类、stdio/IPC 脱敏、孤儿进程清理，reconnect=`none`。                         |
-| HTTP package        | `maneeagent-executor-http`：TLS + HMAC-SHA256 v1、幂等 create、heartbeat、event cursor、approval/resume/external reconnect。          |
-| Phase 3 packages    | PostgreSQL 权威状态/outbox、BullMQ 投递/DLQ、Docker 隔离、S3 artifact 加密与 OTel bridge 分别通过 adapter/L6 门禁。                   |
+| Executor            | 必须能力与专项用例                                                                                                                              |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Local + Memory      | execute/spawn/cancel/events/approval/usage；官方 descriptor 为 checkpoint；Memory Store 仅能在原进程提供该 checkpoint，进程退出后 target lost。 |
+| Local + Atomic File | Memory 全部能力；checkpoint resume、WAL、lease/fencing、双进程争抢、重启恢复；reconnect=`none`。                                                |
+| Worker package      | `maneeagent-executor-worker`：IPC schema 重验、signal/cancel、worker crash、checkpoint/result/event sequence 恢复，reconnect=`none`。           |
+| Process package     | `maneeagent-executor-process`：Worker 契约 + kill/exit 分类、stdio/IPC 脱敏、孤儿进程清理，reconnect=`none`。                                   |
+| HTTP package        | `maneeagent-executor-http`：TLS + HMAC-SHA256 v1、幂等 create、heartbeat、event cursor、approval/resume/external reconnect。                    |
+| Phase 3 packages    | PostgreSQL 权威状态/outbox、BullMQ 投递/DLQ、Docker 隔离、S3 artifact 加密与 OTel bridge 分别通过 adapter/L6 门禁。                             |
 
 新 Executor 不能仅通过一条真实方舟 happy path 声称兼容；必须先通过 conformance，再运行对应 placement 的真实方舟 smoke。
 
@@ -772,7 +772,7 @@ L6-01/02 使用本地 transport test double 即可验证模板 hook，不要求 
 
 Phase 2 manifest 分为 `C7-TRANSPORT`、`C7-WORKER`、`C7-PROCESS`、`C7-HTTP`、`C7-AUTH` 与 `C7-PACK`，并显式映射 CONF-01～08、L6-01～05 和 F02/F08/F09/F12～F15。默认 `pnpm test` 只加入三个 adapter 的无外网 unit/conformance；真实 OS crash 与 HTTP loopback 归入独立 `acceptance:subagent:v2:phase2:offline`，真实方舟仍需显式凭证和调用确认。
 
-当前 closed envelope、sequence/replay、execution wire 与 recoverable settle 四项 L1 证据单列为 `C7-TRANSPORT-FOUNDATION`；12-kind strict RPC、16-method control dispatcher/proxy、32 MiB artifact sidecar 与双向 Peer 已分别映射 `rpc-outcome`、`rpc-control`、`artifact-sidecar`、`rpc-peer`，因此 `C7-TRANSPORT` requirement 已改为 `implemented`。`rpc-peer` 显式覆盖 canonical replay、sidecar 重排、同步 writer admission、准入前 abort、accepted-or-direct-unbound spawn、reply 语义关联、长 timeout 分段、abort tombstone、settlement headroom 与 active-task continuation。该状态只代表 Core transport requirement，不能替代 `C7-WORKER`、`C7-PROCESS`、`C7-HTTP`、Phase 2 离线门禁或真实 placement profile。
+当前 closed envelope、sequence/replay、execution wire 与 recoverable settle 四项 L1 证据单列为 `C7-TRANSPORT-FOUNDATION`；14-kind strict RPC、16-method control dispatcher/proxy、32 MiB artifact sidecar 与双向 Peer 已分别映射 `rpc-outcome`、`rpc-control`、`artifact-sidecar`、`rpc-peer`，因此 `C7-TRANSPORT` requirement 已改为 `implemented`。C7c-1 的 target registry、controller/target bridge 和 Model gateway 分别登记在 `C7-TARGET-REGISTRY`、`C7-BRIDGE` 与 `C7-MODEL-GATEWAY`；覆盖 owner/session scope、handle/receipt 生命周期、canonical decimal fencing、execution-scoped control/Model、跨 Handler single-flight、Chat/Responses reply-loss replay、显式 in-flight recovery oracle 与官方 credential-free protocol surface。manifest 按 C7c-1～C7c-6 的稳定批次增量登记：当前 case 只证明已经实现的 C7c-1 子集，其余 C7c matrix ID 仍是待交付 Oracle；到 C7c-6 退出门禁时，上表每个 ID 都必须映射到 literal `acceptanceIt`、真实进程 reporter 或 Ark scenario，不能用本段说明替代证据。该状态只代表 Core transport/bridge/gateway requirement，不能替代 `C7-WORKER`、`C7-PROCESS`、`C7-HTTP`、Phase 2 离线门禁或真实 placement profile。
 
 Ark placement 调用公式固定为：Worker/Process 各为两条跨协议 5-call flow，加 provider in-flight 2、result receipt 3、terminal CAS 4，共 19 次（hard limit 21）；HTTP 为两条 5-call 跨协议 flow 加 1-call lost-target，共 11 次（hard limit 13）。ARK key 只在 controller 内存，child 通过受控 Model gateway 请求，不进入 Worker、Process、HTTP remote 的 env、argv、binding、job store、日志或 evidence。
 
@@ -802,8 +802,8 @@ task-handle registry 必须是 lazy、session-bound 且可回收的，不能把�
 
 | ID         | 场景                                                                                                                     | Oracle                                                                                                                                                                                                  | 层级  |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
-| C7C-HDL-01 | accepted binding 后首次 `snapshot/wait/events/cancel` 才按 `ownerSessionId + taskId` 解析 lazy handle。                  | 仅 create/terminal 但未调用 handle API 时不注册 listener/timer；checkpoint、binding、event 与 artifact 不序列化 raw handle、PID、threadId、socket、URL 或 closure。                                     | L1/L2 |
-| C7C-HDL-02 | 同 session 对同 task 重复解析复用同一受控 operation state；并发首次解析通过 single-flight。                              | unknown 与跨 session 都返回相同 `RESOURCE_NOT_FOUND` 投影；错误 owner、task、binding、executor 或 target identity 在接触 adapter 前失败，不泄漏资源是否存在。                                           | L1/L2 |
+| C7C-HDL-01 | accepted binding 后首次 `snapshot/wait/events/cancel` 才按 `ownerSessionId + parentTaskId + taskId` 解析 lazy handle。   | 仅 create/terminal 但未调用 handle API 时不注册 listener/timer；checkpoint、binding、event 与 artifact 不序列化 raw handle、PID、threadId、socket、URL 或 closure。                                     | L1/L2 |
+| C7C-HDL-02 | 同 owner/parent scope 对同 task 重复解析复用同一受控 operation state；并发首次解析通过 single-flight。                   | unknown 与跨 session/parent 都返回相同 `RESOURCE_NOT_FOUND` 投影；错误 owner、parent、task、binding、executor 或 target identity 在接触 adapter 前失败，不泄漏资源是否存在。                            | L1/L2 |
 | C7C-HDL-03 | `events(afterSequence)` 按需建立一个 cursor subscription，重复/断线重连只回放 `sequence > afterSequence` 的权威事件。    | iterator `return()`、AbortSignal、HTTP disconnect、terminal、Peer close 和异常路径都移除 listener；同 cursor 重连不重复事件、不跳 sequence、不保持旧 response writer。                                  | L2/L3 |
 | C7C-HDL-04 | terminal 且没有 pending operation/subscriber 后驱逐 lazy entry；后续只读查询从 StateStore/remote terminal receipt 重建。 | 10,000 次 create/resolve/cancel/terminal 与反复 events connect/disconnect 后，registry entry、listener、timer、MessagePort、child process、socket 和 pending promise 回到基线，不得随 task 数单调增长。 | L2/L6 |
 
@@ -995,8 +995,10 @@ dry-run JSON 用于检查文件清单；真实 pack 生成 tarball。脚本随�
 - Core 包不依赖 concrete Local Executor。
 - Local Executor 的 Core dependency/peer range 与目标 2.0 版本一致。
 - tarball 不含 test、fixture、`.env`、checkpoint、artifact、WAL 或验收临时文件。
+- 解包后的全部允许文件都执行内容级 secret scan；`.map` 的 `sourcesContent` 同样纳入扫描，但 `ARK_API_KEY` 等环境变量名本身不是凭证命中。
+- Core 根导出不暴露 ledger failpoint、protocol-surface audit marker 或内部 fencing helper。
 
-pack validator 先运行敏感 dist 产物、TypeScript 源码、缺 source map、child 超时和输出超限负例，再锁定包名、`engines.node`、仅根 exports、无 `bin`、peer range 及发布文件正向白名单。Local consumer 必须使用同轮生成且 semver 兼容的 Core tarball；tar/tsc/runtime child 使用不含 provider key 的最小环境白名单，所有 npm/tar/tsc/runtime child 都有 wall-clock watchdog，并在超限后等待进程关闭再进入 `finally` 清理。validator 输出两个 tarball digest、package version 和 consumer caseId；这些字段进入本次 evidence shard，不能靠人工阅读 `npm pack` 输出完成门禁。
+pack validator 先运行敏感 dist 产物、TypeScript 源码、普通文件 secret marker、source map `sourcesContent` secret marker、缺 source map、child 超时和输出超限负例，再锁定包名、`engines.node`、仅根 exports、无 `bin`、peer range、内部 helper 不可见性及发布文件正向白名单。内容扫描只匹配私钥头和具有足够结构/长度的常见 token，不把环境变量名称或普通 API 标识误判为 credential。Local consumer 必须使用同轮生成且 semver 兼容的 Core tarball；tar/tsc/runtime child 使用不含 provider key 的最小环境白名单，所有 npm/tar/tsc/runtime child 都有 wall-clock watchdog，并在超限后等待进程关闭再进入 `finally` 清理。validator 输出两个 tarball digest、package version 和 consumer caseId；这些字段进入本次 evidence shard，不能靠人工阅读 `npm pack` 输出完成门禁。
 
 默认 `pnpm test` 必须完全无网络。前置 `pnpm install --frozen-lockfile` 可以在验收计时外预热 store；offline orchestrator 中的 tarball consumer 强制使用 pnpm/npm cache 的 offline 模式，缺依赖时失败且不能回退访问 registry。若要单独诊断 packaging network，应使用另一个不产生 platform passed 的显式命令。两种路径都禁止访问方舟或其他模型 provider。
 

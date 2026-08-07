@@ -4,6 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { assertArtifactReference } from './artifact';
 import type { SubAgentContextItem } from './definition';
+import { assertCanonicalFencingToken } from './fencing-token';
 import {
   createResourceNotFoundError,
   SubAgentRuntimeError,
@@ -306,6 +307,16 @@ export async function acquireRenewingRuntimeLease(
     scheduleExpiryBarrier();
     try {
       const renewed = await current.renew(ttlMs);
+      try {
+        assertCanonicalFencingToken(renewed.fencingToken, 'renewed execution lease fencingToken');
+      } catch (error) {
+        try {
+          await renewed.release();
+        } catch {
+          // The adapter already violated the renewal contract; cleanup remains best-effort.
+        }
+        throw error;
+      }
       if (renewed.key !== key || renewed.fencingToken !== fixedFencingToken) {
         try {
           await renewed.release();
@@ -390,7 +401,9 @@ async function acquireLeaseWithinOperation(
 ): Promise<StateLease> {
   const pending = Promise.resolve().then(() => store.acquireLease(key, ttlMs));
   try {
-    return await raceWithOperationSignal(pending, signal, deadlineAt);
+    const lease = await raceWithOperationSignal(pending, signal, deadlineAt);
+    assertCanonicalFencingToken(lease.fencingToken, 'StateStore lease fencingToken');
+    return lease;
   } catch (error) {
     // A StateStore may not support cancelling an in-flight acquire. If it grants the lease after
     // the caller has already stopped waiting, release that late success so it cannot strand the

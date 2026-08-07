@@ -28,6 +28,13 @@ export const SUBAGENT_RUNTIME_PROTOCOL_VERSION = '1' as const;
 export const DEFAULT_EXECUTOR_MAX_BINDING_BYTES = 64 * 1024;
 export const DEFAULT_EXECUTOR_MAX_EVENT_PAGE_SIZE = 256;
 
+/** Credential-free protocol/gateway identity fixed for one transported child execution. */
+export interface SubAgentExecutorModelBinding {
+  readonly gatewayId: string;
+  readonly protocol: string;
+  readonly codecVersion: string;
+}
+
 /** Persisted opaque adapter state. It is never model-visible. */
 export interface SubAgentExecutorBinding {
   readonly version: '1';
@@ -40,6 +47,8 @@ export interface SubAgentExecutorBinding {
   readonly runnerId: string;
   readonly runnerVersion: string;
   readonly adapterStateVersion: string;
+  /** Required by transported Executors and omitted by in-process Local bindings. */
+  readonly modelBinding?: SubAgentExecutorModelBinding;
   readonly recoveryData: JsonValue;
 }
 
@@ -106,6 +115,7 @@ export interface SubAgentExecutionRequest<I extends JsonValue = JsonValue> {
   readonly path: readonly string[];
   readonly attempt: number;
   readonly executionEpoch: string;
+  /** Canonical unsigned base-10 fencing token issued by the authoritative StateStore lease. */
   readonly executionFencingToken: string;
   readonly retryOf?: string;
   /** Only the ref crosses this boundary; registries resolve schemas and factories. */

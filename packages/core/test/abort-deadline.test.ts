@@ -30,13 +30,21 @@ describe('Model request cancellation metadata', () => {
       tools: [],
       signal: controller.signal,
       deadlineAt,
-      runtime: { sessionId: 'session-1', runId: 'run-1', taskId: 'task-1' },
+      runtime: {
+        sessionId: 'session-1',
+        runId: 'run-1',
+        taskId: 'task-1',
+        providerOperationId: 'provider-operation-secret-marker',
+      },
     });
 
-    expect(create.mock.calls[0]?.[1]).toEqual({ signal: controller.signal });
+    expect(create.mock.calls[0]?.[1]).toEqual({ maxRetries: 0, signal: controller.signal });
     expect(create.mock.calls[0]?.[0]).not.toHaveProperty('signal');
     expect(create.mock.calls[0]?.[0]).not.toHaveProperty('deadlineAt');
     expect(create.mock.calls[0]?.[0]).not.toHaveProperty('runtime');
+    expect(JSON.stringify(create.mock.calls[0]?.[0])).not.toContain(
+      'provider-operation-secret-marker',
+    );
   });
 
   it('passes the exact signal as Responses SDK request options without leaking runtime fields', async () => {
@@ -52,13 +60,21 @@ describe('Model request cancellation metadata', () => {
       tools: [],
       signal: controller.signal,
       deadlineAt: Date.now() + 10_000,
-      runtime: { sessionId: 'session-1', runId: 'run-1', taskId: 'task-1' },
+      runtime: {
+        sessionId: 'session-1',
+        runId: 'run-1',
+        taskId: 'task-1',
+        providerOperationId: 'provider-operation-secret-marker',
+      },
     });
 
-    expect(create.mock.calls[0]?.[1]).toEqual({ signal: controller.signal });
+    expect(create.mock.calls[0]?.[1]).toEqual({ maxRetries: 0, signal: controller.signal });
     expect(create.mock.calls[0]?.[0]).not.toHaveProperty('signal');
     expect(create.mock.calls[0]?.[0]).not.toHaveProperty('deadlineAt');
     expect(create.mock.calls[0]?.[0]).not.toHaveProperty('runtime');
+    expect(JSON.stringify(create.mock.calls[0]?.[0])).not.toContain(
+      'provider-operation-secret-marker',
+    );
   });
 });
 

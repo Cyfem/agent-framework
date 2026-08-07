@@ -9,7 +9,13 @@ export {
   Tool,
   detectSkillScriptExecutors,
 } from './agent';
-export { Model, OpenAIChatModel, OpenAIResponsesModel } from './llm';
+export {
+  Model,
+  OpenAIChatModel,
+  OpenAIResponsesModel,
+  createOpenAIChatProtocolSurface,
+  createOpenAIResponsesProtocolSurface,
+} from './llm';
 export * from './subagent';
 export type * from './agent';
 export type * from './llm';

@@ -159,6 +159,40 @@ describe('model error recovery limits', () => {
     ).rejects.toBe(providerError);
     expect(model.generate).toHaveBeenCalledTimes(1);
   });
+
+  it('continues the durable request-attempt identity and recovery telemetry', async () => {
+    const attempts: number[] = [];
+    const recoveryAttempts: number[] = [];
+    const model = createModel(async (request) => {
+      attempts.push(request.runtime?.requestAttempt ?? -1);
+      if (attempts.length === 1) throw new Error('cached attempt two rejection');
+      return successfulResult;
+    });
+
+    await expect(
+      runRecovery(model, {
+        initialRequestAttempts: 1,
+        limits: resolveModelErrorRecoveryLimits({ unhandledRetryLimit: 1 }),
+        beforeListeners: [
+          (event) => {
+            recoveryAttempts.push(event.requestAttempt);
+          },
+        ],
+      }),
+    ).resolves.toEqual(successfulResult);
+
+    expect(attempts).toEqual([2, 3]);
+    expect(recoveryAttempts).toEqual([2]);
+  });
+
+  it('rejects an invalid durable request-attempt offset before dispatch', async () => {
+    const model = createModel(async () => successfulResult);
+
+    for (const initialRequestAttempts of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      await expect(runRecovery(model, { initialRequestAttempts })).rejects.toThrow(TypeError);
+    }
+    expect(model.generate).not.toHaveBeenCalled();
+  });
 });
 
 describe('before and after decisions', () => {

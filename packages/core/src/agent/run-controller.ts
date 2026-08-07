@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
+import type { ModelGenerateUsage } from '../llm/base';
 import type { AgentCheckpointMigrator, AgentProtocolCheckpointCodec } from '../subagent/checkpoint';
 import { createResourceNotFoundError, SubAgentRuntimeError } from '../subagent/errors';
+import { assertCanonicalFencingToken } from '../subagent/fencing-token';
 import {
   assertJsonValue,
   canonicalJsonSha256,
@@ -41,6 +43,7 @@ import {
   getCompactTransactionRecoveryAction,
 } from './context-compact';
 import { ContextStore } from './context-store';
+import { normalizeModelGenerateUsage } from './model-usage';
 import type { AgentProtocol, ContextOf } from './types';
 
 export const AGENT_RUN_CHECKPOINT_VERSION = '1';
@@ -159,6 +162,7 @@ export interface CommitAgentModelOperationResultInput<P extends AgentProtocol> {
   readonly runId: string;
   readonly operationId: string;
   readonly messages: readonly ContextOf<P>[];
+  readonly usage?: ModelGenerateUsage;
 }
 
 export interface ApplyAgentModelOperationInput<
@@ -235,6 +239,7 @@ export class AgentRunLease {
     readonly lease: StateLease;
     readonly ttlMs: number;
   }) {
+    assertCanonicalFencingToken(input.lease.fencingToken, 'Agent run lease fencingToken');
     this.#controllerIdentity = input.controllerIdentity;
     this.ownerSessionId = input.ownerSessionId;
     this.runId = input.runId;
@@ -294,7 +299,14 @@ export class AgentRunLease {
         // work error was unrelated, while any failure/identity drift proves this owner is stale.
         try {
           const renewed = await this.#current.renew(this.#ttlMs);
+          try {
+            assertCanonicalFencingToken(renewed.fencingToken, 'renewed Agent run fencingToken');
+          } catch (error) {
+            await renewed.release().catch(() => undefined);
+            throw error;
+          }
           if (renewed.key !== this.key || renewed.fencingToken !== this.fencingToken) {
+            await renewed.release().catch(() => undefined);
             throw rootLeaseLostError();
           }
           this.#current = renewed;
@@ -350,7 +362,14 @@ export class AgentRunLease {
       await this.#exclusive(async () => {
         if (this.#releaseRequested || this.signal.aborted) return;
         const renewed = await this.#current.renew(this.#ttlMs);
+        try {
+          assertCanonicalFencingToken(renewed.fencingToken, 'renewed Agent run fencingToken');
+        } catch (error) {
+          await renewed.release().catch(() => undefined);
+          throw error;
+        }
         if (renewed.key !== this.key || renewed.fencingToken !== this.fencingToken) {
+          await renewed.release().catch(() => undefined);
           throw rootLeaseLostError();
         }
         this.#current = renewed;
@@ -443,6 +462,16 @@ export class AgentRunCheckpointController<P extends AgentProtocol> {
     if (parentSignal.aborted) throwAbortReason(parentSignal);
     const key = createRunLeaseKey(this.ownerSessionId, runId);
     const stateLease = await this.#stateStore.acquireLease(key, ttlMs);
+    try {
+      assertCanonicalFencingToken(stateLease.fencingToken, 'Agent run lease fencingToken');
+    } catch (error) {
+      try {
+        await stateLease.release();
+      } catch {
+        // Invalid adapter output is the primary failure; cleanup remains best effort.
+      }
+      throw error;
+    }
     if (parentSignal.aborted) {
       await stateLease.release();
       throwAbortReason(parentSignal);
@@ -715,16 +744,28 @@ export class AgentRunCheckpointController<P extends AgentProtocol> {
   ): Promise<RestoredAgentRunCheckpoint<P>> {
     assertNonEmpty(input.runId, 'runId');
     assertNonEmpty(input.operationId, 'model operationId');
+    const usage = normalizeModelGenerateUsage(input.usage);
     const result = encodeProtocolContext(this.#codec, input.messages);
-    return this.#commitModelOperationTransition(input.runId, lease, (current, now) => {
-      const operation = assertOpenModelOperation(current, input.operationId, 'in_flight');
-      return Object.freeze({
-        ...operation,
-        phase: 'result_ready' as const,
-        result,
-        updatedAt: now,
-      });
-    });
+    return this.#commitModelOperationTransition(
+      input.runId,
+      lease,
+      (current, now) => {
+        const operation = assertOpenModelOperation(current, input.operationId, 'in_flight');
+        return Object.freeze({
+          ...operation,
+          phase: 'result_ready' as const,
+          result,
+          updatedAt: now,
+        });
+      },
+      usage === undefined
+        ? undefined
+        : Object.freeze({
+            providerCalls: 0,
+            inputTokens: usage.inputTokens ?? 0,
+            outputTokens: usage.outputTokens ?? 0,
+          }),
+    );
   }
 
   /**
@@ -1092,6 +1133,11 @@ export class AgentRunCheckpointController<P extends AgentProtocol> {
     runId: string,
     lease: AgentRunLease,
     transition: (current: DurableStoredAgentRun, now: number) => StoredModelOperationV1,
+    budgetDelta?: Readonly<{
+      readonly providerCalls: number;
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+    }>,
   ): Promise<RestoredAgentRunCheckpoint<P>> {
     assertNonEmpty(runId, 'runId');
     let next!: DurableStoredAgentRun;
@@ -1105,11 +1151,16 @@ export class AgentRunCheckpointController<P extends AgentProtocol> {
       const observedNow = this.#now();
       assertTimestamp(observedNow, 'now');
       const now = Math.max(observedNow, current.updatedAt);
+      const budget =
+        budgetDelta === undefined
+          ? current.budget
+          : reserveTreeBudget(current.budget, budgetDelta, current.limits);
       next = Object.freeze({
         ...current,
         revision: current.revision + 1,
         fencingToken: stateLease.fencingToken,
         modelOperation: transition(current, now),
+        budget,
         updatedAt: now,
       });
       this.#validateRecord(next);

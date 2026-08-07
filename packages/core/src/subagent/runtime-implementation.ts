@@ -39,6 +39,7 @@ import type {
   SubAgentExecutorOperation,
 } from './executor';
 import { SubAgentExecutorRegistry, type SubAgentExecutionTarget } from './executor-registry';
+import { isCanonicalFencingToken } from './fencing-token';
 import {
   assertJsonValue,
   canonicalJsonSha256,
@@ -2115,6 +2116,9 @@ class DefaultSubAgentRuntime implements SubAgentRuntime {
           ...task,
           binding: Object.freeze({
             ...binding,
+            ...(binding.modelBinding === undefined
+              ? {}
+              : { modelBinding: Object.freeze({ ...binding.modelBinding }) }),
             recoveryData: cloneJsonValue(binding.recoveryData),
           }),
           revision: task.revision + 1,
@@ -5591,6 +5595,7 @@ function validateBinding(
   assertNonEmpty(binding.subagentSessionId, 'binding subagentSessionId');
   assertNonEmpty(binding.runnerId, 'binding runnerId');
   assertNonEmpty(binding.runnerVersion, 'binding runnerVersion');
+  validateExecutorModelBinding(binding.modelBinding);
   if (
     !target.descriptor.runnerCompatibility.some(
       (runner) =>
@@ -5622,13 +5627,28 @@ function assertBindingMigrationIdentity(
     migrated.definitionName === original.definitionName &&
     migrated.definitionVersion === original.definitionVersion &&
     migrated.runnerId === original.runnerId &&
-    migrated.runnerVersion === original.runnerVersion;
+    migrated.runnerVersion === original.runnerVersion &&
+    isDeepStrictEqual(migrated.modelBinding, original.modelBinding);
   if (!identityPreserved) {
     throw createSubAgentError(
       'CHECKPOINT_MIGRATION_FAILED',
       'An Executor binding migrator changed immutable binding identity.',
     );
   }
+}
+
+function validateExecutorModelBinding(modelBinding: SubAgentExecutorBinding['modelBinding']): void {
+  if (modelBinding === undefined) return;
+  if (
+    typeof modelBinding !== 'object' ||
+    modelBinding === null ||
+    Object.keys(modelBinding).sort().join('\0') !== 'codecVersion\0gatewayId\0protocol'
+  ) {
+    throw createSubAgentError('BINDING_INVALID', 'The Executor Model binding is invalid.');
+  }
+  assertNonEmpty(modelBinding.gatewayId, 'binding Model gatewayId');
+  assertNonEmpty(modelBinding.protocol, 'binding Model protocol');
+  assertNonEmpty(modelBinding.codecVersion, 'binding Model codecVersion');
 }
 
 function validateApprovalRequestInput(input: ApprovalRequestInput): void {
@@ -5671,6 +5691,7 @@ function assertChildCheckpointTransition(
       before.operationId !== after.operationId ||
       before.iteration !== after.iteration ||
       before.purpose !== after.purpose ||
+      before.requestAttempt !== after.requestAttempt ||
       before.requestHash !== after.requestHash ||
       before.preparedAt !== after.preparedAt ||
       after.updatedAt < before.updatedAt)
@@ -6041,8 +6062,7 @@ function executionOwnership(task: StoredTask): ExecutionOwnership {
   if (
     typeof task.executionEpoch !== 'string' ||
     task.executionEpoch.length === 0 ||
-    typeof task.executionFencingToken !== 'string' ||
-    task.executionFencingToken.length === 0 ||
+    !isCanonicalFencingToken(task.executionFencingToken) ||
     task.executorOperation?.executionEpoch !== task.executionEpoch ||
     task.executorOperation.attempt !== task.attempt
   ) {
@@ -6232,6 +6252,8 @@ function validateChildCheckpointV1(
       modelOperation.operationId.length > 0 &&
       modelOperation.iteration === checkpoint.modelIteration &&
       (modelOperation.purpose === 'agent' || modelOperation.purpose === 'context-summary') &&
+      Number.isSafeInteger(modelOperation.requestAttempt) &&
+      modelOperation.requestAttempt >= 1 &&
       /^[0-9a-f]{64}$/u.test(modelOperation.requestHash) &&
       (modelOperation.phase === 'prepared' ||
         modelOperation.phase === 'in_flight' ||

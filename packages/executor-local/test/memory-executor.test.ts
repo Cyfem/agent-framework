@@ -3,7 +3,9 @@ import { z } from 'zod';
 
 import {
   acceptanceIt,
+  createExecutorConformanceControl,
   createExecutorConformanceChildCheckpoint,
+  createExecutorConformanceRequest,
   runSubAgentExecutorConformance,
   type ExecutorConformanceScenario,
   type SubAgentExecutorConformanceSubject,
@@ -12,11 +14,13 @@ import {
 import {
   createSubAgentRuntime,
   canonicalJsonSha256,
+  DEFAULT_SUBAGENT_LIMITS,
   defineSubAgent,
   type JsonValue,
   type SubAgentChildRunner,
   type SubAgentExecutionOutcome,
   type SubAgentDefinitionRegistration,
+  type SubAgentExecutionRequest,
 } from '@ruixutong.manee/maneeagent-framework';
 
 import {
@@ -34,12 +38,24 @@ const definition = defineSubAgent({
   outputSchema: z.object({ answer: z.string() }),
 });
 
-function candidate(taskId: string, output: JsonValue): SubAgentExecutionOutcome {
+const conformanceDefinition = defineSubAgent({
+  name: 'executor-conformance-researcher',
+  version: '2',
+  description: 'Accept the shared Executor conformance scenario input.',
+  inputSchema: z.object({ scenario: z.string() }),
+  outputSchema: z.object({ answer: z.string() }),
+});
+
+function candidate(
+  taskId: string,
+  output: JsonValue,
+  subAgent = { name: definition.name, version: definition.version },
+): SubAgentExecutionOutcome {
   return {
     type: 'terminal',
     result: {
       status: 'succeeded',
-      task: { taskId, subAgent: { name: definition.name, version: definition.version } },
+      task: { taskId, subAgent },
       executor: 'local',
       output,
     },
@@ -141,7 +157,7 @@ function createConformanceSubject(
   });
   const registry = new LocalSubAgentRunnerRegistry([
     {
-      definition,
+      definition: conformanceDefinition,
       runnerId: 'researcher-runner',
       runnerVersion: '1',
       childCheckpointVersions: ['1'],
@@ -198,18 +214,129 @@ function createConformanceSubject(
           await control.completion.complete(`conformance-end:${scenario}`, {
             isStandalone: true,
           });
-          return candidate(child.taskId, output);
+          return candidate(child.taskId, output, child.definition);
         },
       }),
     },
   ]);
   return {
     executor: new MemorySubAgentExecutor({ registry }),
-    definition: { name: definition.name, version: definition.version },
+    definition: { name: conformanceDefinition.name, version: conformanceDefinition.version },
     unsupportedDefinition: { name: 'unsupported', version: '1' },
     ...(scenario === 'cancel' ? { waitUntilStarted: () => started } : {}),
   };
 }
+
+function createDirectCreateHarness(blockFactory = false) {
+  let factories = 0;
+  let runs = 0;
+  let releaseFactory = (): void => undefined;
+  const factoryGate = blockFactory
+    ? new Promise<void>((resolve) => {
+        releaseFactory = resolve;
+      })
+    : undefined;
+  const registry = new LocalSubAgentRunnerRegistry([
+    {
+      definition,
+      runnerId: 'researcher-runner',
+      runnerVersion: '1',
+      childCheckpointVersions: ['1'],
+      create: async () => {
+        factories += 1;
+        if (factoryGate !== undefined) await factoryGate;
+        return {
+          async run(child) {
+            runs += 1;
+            return candidate(child.taskId, { answer: 'direct-idempotency-proof' });
+          },
+        };
+      },
+    },
+  ]);
+  const prepare = vi.spyOn(registry, 'prepareExecution');
+  const executor = new MemorySubAgentExecutor({ registry });
+  const baseRequest = createExecutorConformanceRequest({
+    executorName: 'local',
+    taskId: 'local-create-idempotency-task',
+    definition: { name: definition.name, version: definition.version },
+    input: { value: 'alpha' },
+  });
+  const control = createExecutorConformanceControl({
+    ownerSessionId: baseRequest.ownerSessionId,
+    taskId: baseRequest.taskId,
+    signal: baseRequest.signal,
+    deadlineAt: baseRequest.deadlineAt,
+    approval: 'suspend',
+  }).control;
+  return {
+    registry,
+    executor,
+    baseRequest,
+    control,
+    prepare,
+    releaseFactory,
+    factories: () => factories,
+    runs: () => runs,
+  };
+}
+
+type CreateMutation = (request: SubAgentExecutionRequest) => SubAgentExecutionRequest;
+
+const conflictingCreateMutations: readonly [string, CreateMutation][] = [
+  [
+    'operation ID',
+    (request) => {
+      if (request.operation.type !== 'create') throw new Error('expected create request');
+      return {
+        ...request,
+        operation: {
+          type: 'create',
+          operationId: 'different-create-operation',
+          idempotencyKey: request.operation.idempotencyKey,
+        },
+      };
+    },
+  ],
+  ['input', (request) => ({ ...request, input: { value: 'beta' } })],
+  ['path', (request) => ({ ...request, path: ['different-parent', request.taskId] })],
+  [
+    'projected context',
+    (request) => ({
+      ...request,
+      projectedContext: [{ kind: 'text', name: 'brief', text: 'Different context.' }],
+    }),
+  ],
+  [
+    'delegation snapshot',
+    (request) => ({
+      ...request,
+      delegation: {
+        ...request.delegation,
+        catalogRevision: request.delegation.catalogRevision + 1,
+      },
+    }),
+  ],
+  [
+    'limits',
+    (request) => ({
+      ...request,
+      limits: { ...DEFAULT_SUBAGENT_LIMITS, maxTurns: DEFAULT_SUBAGENT_LIMITS.maxTurns + 1 },
+    }),
+  ],
+  [
+    'idempotency key',
+    (request) => ({
+      ...request,
+      operation: {
+        type: 'create',
+        operationId: request.operation.operationId,
+        idempotencyKey: 'different-idempotency-key',
+      },
+    }),
+  ],
+  ['retry lineage', (request) => ({ ...request, retryOf: 'different-terminal-task' })],
+];
 
 describe('MemorySubAgentExecutor', () => {
   acceptanceIt('EXE-LOCAL-01.l2.conformance', 'memory-local', async () => {
@@ -249,6 +376,84 @@ describe('MemorySubAgentExecutor', () => {
     });
     expect(executor.disposeTask(outcome.result.task.taskId)).toBe(true);
     expect(executor.disposeTask(outcome.result.task.taskId)).toBe(false);
+  });
+
+  it('prepares every identical sequential create but starts one runner and execution', async () => {
+    const harness = createDirectCreateHarness();
+
+    const first = await harness.executor.spawn(harness.baseRequest, harness.control);
+    const second = await harness.executor.spawn(
+      { ...harness.baseRequest, signal: new AbortController().signal },
+      harness.control,
+    );
+    await first.wait();
+
+    expect(second.binding).toEqual(first.binding);
+    expect(harness.prepare).toHaveBeenCalledTimes(2);
+    expect(harness.factories()).toBe(1);
+    expect(harness.runs()).toBe(1);
+  });
+
+  it('prepares concurrent identical creates before single-flight reuse and runs once', async () => {
+    const harness = createDirectCreateHarness(true);
+
+    const first = harness.executor.spawn(harness.baseRequest, harness.control);
+    await vi.waitFor(() => expect(harness.factories()).toBe(1));
+    const second = harness.executor.spawn(
+      { ...harness.baseRequest, signal: new AbortController().signal },
+      harness.control,
+    );
+    await vi.waitFor(() => expect(harness.prepare).toHaveBeenCalledTimes(2));
+    harness.releaseFactory();
+    const [firstHandle, secondHandle] = await Promise.all([first, second]);
+    await firstHandle.wait();
+
+    expect(secondHandle.binding).toEqual(firstHandle.binding);
+    expect(harness.factories()).toBe(1);
+    expect(harness.runs()).toBe(1);
+  });
+
+  it.each(conflictingCreateMutations)(
+    'rejects a sequential duplicate create with different %s after target preparation',
+    async (_label, mutate) => {
+      const harness = createDirectCreateHarness();
+      await harness.executor.spawn(harness.baseRequest, harness.control);
+
+      await expect(
+        harness.executor.spawn(mutate(harness.baseRequest), harness.control),
+      ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+      expect(harness.prepare).toHaveBeenCalledTimes(2);
+      expect(harness.factories()).toBe(1);
+      expect(harness.runs()).toBe(1);
+    },
+  );
+
+  it.each(conflictingCreateMutations)(
+    'rejects a concurrent duplicate create with different %s after target preparation',
+    async (_label, mutate) => {
+      const harness = createDirectCreateHarness(true);
+      const first = harness.executor.spawn(harness.baseRequest, harness.control);
+      await vi.waitFor(() => expect(harness.factories()).toBe(1));
+      const conflicting = harness.executor.spawn(mutate(harness.baseRequest), harness.control);
+      await vi.waitFor(() => expect(harness.prepare).toHaveBeenCalledTimes(2));
+      harness.releaseFactory();
+      await first;
+
+      await expect(conflicting).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+      expect(harness.factories()).toBe(1);
+      expect(harness.runs()).toBe(1);
+    },
+  );
+
+  it('fails closed when the direct Local registry shortcut receives a checkpoint', async () => {
+    const harness = createDirectCreateHarness();
+    const prepared = harness.registry.prepareExecution(harness.baseRequest, 'local');
+
+    await expect(
+      harness.registry.create({ ...prepared.request, checkpoint: childCheckpoint() }, 'local'),
+    ).rejects.toMatchObject({ code: 'RECOVERY_UNSUPPORTED', retryable: false });
+    expect(harness.factories()).toBe(0);
+    expect(harness.runs()).toBe(0);
   });
 
   it('reuses the exact in-memory runner for approval resume', async () => {

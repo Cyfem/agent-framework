@@ -33,6 +33,11 @@ export interface DurableAgentModelOperationV1 {
   readonly updatedAt: number;
 }
 
+/** Child provider operation with the exact recovery-attempt identity sent to its gateway. */
+export interface SubAgentChildModelOperationV1 extends DurableAgentModelOperationV1 {
+  readonly requestAttempt: number;
+}
+
 /** Strict versioned codec required for durable or cross-process restoration. */
 export interface AgentProtocolCheckpointCodec<P extends AgentProtocol = AgentProtocol> {
   readonly protocol: string;
@@ -128,7 +133,7 @@ export interface SubAgentChildCheckpointV1 {
   readonly contextStore: ContextStoreCheckpointV1;
   readonly modelIteration: number;
   readonly maxIterations: number | null;
-  readonly modelOperation?: DurableAgentModelOperationV1;
+  readonly modelOperation?: SubAgentChildModelOperationV1;
   readonly pendingBatch?: SubAgentChildPendingBatchV1;
   readonly compactTransaction?: SubAgentChildCompactTransactionV1;
   /** Minimal authoritative result projection required to resume the result-closed child phase. */

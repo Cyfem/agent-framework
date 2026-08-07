@@ -10,7 +10,7 @@
   - 官方本地 Executor、Memory/Atomic File Store 与文件系统边界：[packages/executor-local/README.md](./packages/executor-local/README.md)
   - 可运行示例、真实模型配置和费用边界：[demo/README.md](./demo/README.md)
   - 分批实施中的 Subagent v2 生产运行时设计与验收：[PLAN.md](./plans/subagent-v2-production-runtime/PLAN.md)、[TECHNICAL_CHANGES.md](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md) 与 [TEST_ACCEPTANCE_PLAN.md](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)
-  - 当前 checkout 已完成 C6，并交付 C7 的 Core transport/RPC/control/Peer/artifact-sidecar 与 recoverable Executor settle 地基；Worker/Process/HTTP placement 尚未交付、Phase 2 未通过，C8–C9 分布式能力仍以源码、测试和 README 状态为准。
+  - 当前 checkout 已完成 C6，并交付 C7a/C7b/C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、recoverable Executor settle、target registry、controller/target bridge 与 controller-owned Model gateway 地基；Worker/Process/HTTP placement 尚未交付、Phase 2 未通过，C8–C9 分布式能力仍以源码、测试和 README 状态为准。
   - Core/Local package manifest 已固定为待发布 `2.0.0`，但 npm Core `latest` 仍是 `1.0.0`、Local 尚未发布；不得把 manifest、pack 成功或计划状态写成 npm 已发布。
 
 ## Working Rules

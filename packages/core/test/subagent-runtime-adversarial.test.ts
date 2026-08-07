@@ -245,6 +245,7 @@ function childModelCheckpoint(phase: 'prepared' | 'in_flight' | 'result_ready') 
       operationId: 'adversarial-provider-operation',
       iteration: 1,
       purpose: 'agent' as const,
+      requestAttempt: 1,
       requestHash: 'a'.repeat(64),
       phase,
       ...(phase === 'result_ready'

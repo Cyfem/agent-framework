@@ -35,17 +35,20 @@ const REQUEST_KINDS = new Set<SubAgentTransportRpcRequestKind>([
   'cancel.request',
   'snapshot.request',
   'events.request',
+  'model.request',
 ]);
 const ACTIVE_TASK_CONTINUATION_KINDS = new Set<SubAgentTransportRpcRequestKind>([
   'control.request',
   'cancel.request',
   'snapshot.request',
   'events.request',
+  'model.request',
 ]);
 const SAFE_ERROR_CODES = new Set<string>(SUBAGENT_ERROR_CODES);
 const SAFE_ERROR_KEYS = new Set(['code', 'message', 'retryable', 'causeCode', 'outcomeUnknown']);
 
 export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_PENDING = 256;
+export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_TOMBSTONES = 256;
 export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_CACHED_REQUESTS = 1_024;
 export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_CACHED_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECARS = DEFAULT_ARTIFACT_LIMITS.maxItemsPerTask;
@@ -235,6 +238,8 @@ export interface SubAgentTransportPeerOptions {
   readonly now?: () => number;
   readonly timers?: SubAgentTransportPeerTimerApi;
   readonly maxPending?: number;
+  /** Maximum admitted aborted/timed-out exchanges retained for safe late-reply correlation. */
+  readonly maxTombstones?: number;
   readonly maxCachedRequests?: number;
   /** Includes exact inbound replay packets and cached outbound handler replies. */
   readonly maxCachedBytes?: number;
@@ -268,6 +273,7 @@ interface ExchangeProtocolState {
   readonly controlMethod?: SubAgentTransportRpcPayloadMap['control.request']['method'];
   readonly executor?: ExecutorExchangeCorrelation;
   readonly events?: EventsExchangeCorrelation;
+  readonly model?: ModelExchangeCorrelation;
   stage: ExchangeStage;
 }
 
@@ -296,6 +302,20 @@ interface ExecutorExchangeCorrelation {
 interface EventsExchangeCorrelation {
   readonly afterSequence: number;
   readonly limit: number;
+}
+
+interface ModelExchangeCorrelation {
+  readonly providerOperationId: string;
+  readonly gatewayId: string;
+  readonly protocol: string;
+  readonly codecVersion: string;
+  readonly runId: string;
+  readonly executionAttempt: number;
+  readonly executionEpoch: string;
+  readonly executionFencingToken: string;
+  readonly checkpointOperationId: string;
+  readonly checkpointDigest: string;
+  readonly requestHash: string;
 }
 
 interface ExchangeWaiter {
@@ -380,6 +400,7 @@ export class SubAgentTransportPeer {
   readonly #now: () => number;
   readonly #timers: SubAgentTransportPeerTimerApi;
   readonly #maxPending: number;
+  readonly #maxTombstones: number;
   readonly #maxCachedRequests: number;
   readonly #maxCachedBytes: number;
   readonly #maxSidecarBytes: number;
@@ -433,6 +454,11 @@ export class SubAgentTransportPeer {
       DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_PENDING,
       'maxPending',
     );
+    this.#maxTombstones = positiveLimit(
+      options.maxTombstones,
+      DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_TOMBSTONES,
+      'maxTombstones',
+    );
     this.#maxCachedRequests = positiveLimit(
       options.maxCachedRequests,
       DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_CACHED_REQUESTS,
@@ -467,6 +493,10 @@ export class SubAgentTransportPeer {
 
   get pendingCount(): number {
     return this.#pending.size;
+  }
+
+  get tombstoneCount(): number {
+    return this.#tombstones.size;
   }
 
   get cachedRequestCount(): number {
@@ -705,6 +735,13 @@ export class SubAgentTransportPeer {
     record.queue.length = 0;
     this.#pending.delete(record.messageId);
     if (record.admitted) {
+      if (this.#tombstones.size >= this.#maxTombstones) {
+        this.#failClose('rollover-required', ROLLOVER_ERROR);
+        record.executorTaskActive = false;
+        this.#releaseExchange(record);
+        for (const waiter of record.waiters.splice(0)) waiter.reject(error);
+        return;
+      }
       this.#tombstones.set(record.messageId, {
         taskId: record.taskId,
         operationId: record.operationId,
@@ -712,6 +749,7 @@ export class SubAgentTransportPeer {
         executorTaskActive: record.executorTaskActive,
       });
       record.executorTaskActive = false;
+      if (this.#tombstones.size >= this.#maxTombstones) this.beginDrain();
     } else if (record.executorTaskActive) {
       record.executorTaskActive = false;
       this.#deactivateExecutorTask(record.taskId);
@@ -887,7 +925,7 @@ export class SubAgentTransportPeer {
           );
           return Promise.reject(failure);
         }
-        const failure = peerError('protocol-violation', PROTOCOL_ERROR);
+        const failure = this.#failClose('protocol-violation', PROTOCOL_ERROR);
         const rejected = Promise.reject(failure);
         void rejected.catch(() => undefined);
         return rejected;
@@ -908,8 +946,9 @@ export class SubAgentTransportPeer {
         }),
       );
       await Promise.all(request.writes);
-    } catch {
+    } catch (error) {
       await Promise.allSettled(request.writes);
+      if (this.#state === 'closed') throw error;
     }
 
     if (this.#state !== 'closed' && request.protocol.stage !== 'terminal') {
@@ -1257,6 +1296,25 @@ function createExchangeProtocol(envelope: RpcRequestEnvelope): ExchangeProtocolS
       stage: 'initial',
     };
   }
+  if (envelope.kind === 'model.request') {
+    return {
+      requestKind: envelope.kind,
+      model: {
+        providerOperationId: envelope.payload.providerOperationId,
+        gatewayId: envelope.payload.gatewayId,
+        protocol: envelope.payload.protocol,
+        codecVersion: envelope.payload.codecVersion,
+        runId: envelope.payload.runId,
+        executionAttempt: envelope.payload.executionAttempt,
+        executionEpoch: envelope.payload.executionEpoch,
+        executionFencingToken: envelope.payload.executionFencingToken,
+        checkpointOperationId: envelope.payload.checkpointOperationId,
+        checkpointDigest: envelope.payload.checkpointDigest,
+        requestHash: envelope.payload.requestHash,
+      },
+      stage: 'initial',
+    };
+  }
   return { requestKind: envelope.kind, stage: 'initial' };
 }
 
@@ -1283,6 +1341,7 @@ function cloneProtocolState(state: ExchangeProtocolState): ExchangeProtocolState
           },
         }),
     ...(state.events === undefined ? {} : { events: { ...state.events } }),
+    ...(state.model === undefined ? {} : { model: { ...state.model } }),
     stage: state.stage,
   };
 }
@@ -1362,6 +1421,10 @@ function advanceExchange(
     case 'events.request':
       assertSingleReply(replyKind, 'events.page');
       assertEventsPageCorrelation(state.events, payload);
+      break;
+    case 'model.request':
+      assertSingleReply(replyKind, 'model.reply');
+      assertModelReplyCorrelation(state.model, payload);
       break;
   }
   state.stage = 'terminal';
@@ -1494,6 +1557,30 @@ function assertEventsPageCorrelation(
     nextSequence !== expectedNextSequence
   ) {
     throw new TypeError('Events page does not satisfy the requested cursor and limit.');
+  }
+}
+
+function assertModelReplyCorrelation(
+  expected: ModelExchangeCorrelation | undefined,
+  value: unknown,
+): void {
+  if (expected === undefined || typeof value !== 'object' || value === null) {
+    throw new TypeError('Model reply correlation state is missing.');
+  }
+  if (
+    Reflect.get(value, 'providerOperationId') !== expected.providerOperationId ||
+    Reflect.get(value, 'gatewayId') !== expected.gatewayId ||
+    Reflect.get(value, 'protocol') !== expected.protocol ||
+    Reflect.get(value, 'codecVersion') !== expected.codecVersion ||
+    Reflect.get(value, 'runId') !== expected.runId ||
+    Reflect.get(value, 'executionAttempt') !== expected.executionAttempt ||
+    Reflect.get(value, 'executionEpoch') !== expected.executionEpoch ||
+    Reflect.get(value, 'executionFencingToken') !== expected.executionFencingToken ||
+    Reflect.get(value, 'checkpointOperationId') !== expected.checkpointOperationId ||
+    Reflect.get(value, 'checkpointDigest') !== expected.checkpointDigest ||
+    Reflect.get(value, 'requestHash') !== expected.requestHash
+  ) {
+    throw new TypeError('Model reply does not match its request identity.');
   }
 }
 
