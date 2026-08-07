@@ -747,6 +747,12 @@ export interface SubAgentTransportTargetBindingContext {
   readonly modelBinding: SubAgentTargetModelBinding;
 }
 
+/** Trusted placement-local binding check run before any target runner factory is invoked. */
+export interface SubAgentTransportTargetBindingValidationContext {
+  readonly request: SubAgentExecutionRequest;
+  readonly binding: SubAgentExecutorBinding;
+}
+
 export interface SubAgentTransportTargetCatalog {
   readonly catalog: ExecutorCatalogSnapshot;
   readonly catalogEntries: readonly SubAgentCatalogEntry[];
@@ -770,6 +776,13 @@ export interface CreateSubAgentTransportTargetBridgeOptions {
   readonly createBinding: (
     context: SubAgentTransportTargetBindingContext,
   ) => SubAgentExecutorBinding | Promise<SubAgentExecutorBinding>;
+  /**
+   * Optional adapter-specific check for opaque recovery data such as a Worker logical job ID.
+   * It runs for create, resume and reconnect before a runner factory or resident runner is used.
+   */
+  readonly validateBinding?: (
+    context: SubAgentTransportTargetBindingValidationContext,
+  ) => void | Promise<void>;
   readonly resolveCatalog?: (request: SubAgentExecutionRequest) => SubAgentTransportTargetCatalog;
   readonly events?: (
     context: SubAgentTransportTargetEventsContext,
@@ -819,6 +832,9 @@ export class SubAgentTransportTargetBridge {
   readonly #bindingCodec: SubAgentExecutorBindingCodec;
   readonly #peer: PeerProvider;
   readonly #createBinding: CreateSubAgentTransportTargetBridgeOptions['createBinding'];
+  readonly #validateBinding: NonNullable<
+    CreateSubAgentTransportTargetBridgeOptions['validateBinding']
+  >;
   readonly #resolveCatalog: NonNullable<
     CreateSubAgentTransportTargetBridgeOptions['resolveCatalog']
   >;
@@ -847,12 +863,16 @@ export class SubAgentTransportTargetBridge {
     if (typeof options.createBinding !== 'function') {
       throw new TypeError('A target transport bridge requires a binding factory.');
     }
+    if (options.validateBinding !== undefined && typeof options.validateBinding !== 'function') {
+      throw new TypeError('A target transport binding validator must be a function.');
+    }
     this.#ownerSessionId = options.ownerSessionId;
     this.#executorName = options.executorName;
     this.#registry = options.registry;
     this.#bindingCodec = options.bindingCodec;
     this.#peer = options.peer;
     this.#createBinding = options.createBinding;
+    this.#validateBinding = options.validateBinding ?? (() => undefined);
     this.#resolveCatalog = options.resolveCatalog ?? emptyTargetCatalog;
     this.#events = options.events;
     this.#now = options.now ?? Date.now;
@@ -1059,6 +1079,8 @@ export class SubAgentTransportTargetBridge {
         throw createResourceNotFoundError();
       }
       if (request.operation.type === 'reconnect') {
+        await this.#validateBinding(Object.freeze({ request, binding: request.operation.binding }));
+        if (this.#disposed) throw createResourceNotFoundError();
         const resident = this.#requireTask(request.taskId);
         this.#assertTaskBinding(resident, request.operation.binding);
         assertForwardResume(resident.request, request);
@@ -1119,13 +1141,6 @@ export class SubAgentTransportTargetBridge {
           retryable: false,
         });
       }
-      const runner =
-        request.operation.type === 'resume' &&
-        request.operation.reason === 'approval' &&
-        resident !== undefined
-          ? resident.runner
-          : await prepared.create();
-      if (this.#disposed) throw createResourceNotFoundError();
       const bindingCandidate =
         request.operation.type === 'create'
           ? await this.#createBinding({ request, runner: prepared.runner, modelBinding })
@@ -1133,6 +1148,15 @@ export class SubAgentTransportTargetBridge {
       if (this.#disposed) throw createResourceNotFoundError();
       const binding = ownedBinding(bindingCandidate);
       this.#assertCreatedBinding(binding, request, prepared.runner, modelBinding);
+      await this.#validateBinding(Object.freeze({ request, binding }));
+      if (this.#disposed) throw createResourceNotFoundError();
+      const runner =
+        request.operation.type === 'resume' &&
+        request.operation.reason === 'approval' &&
+        resident !== undefined
+          ? resident.runner
+          : await prepared.create();
+      if (this.#disposed) throw createResourceNotFoundError();
 
       const catalog = this.#resolveCatalog(request);
       const control = createRemoteSubAgentExecutionControl({

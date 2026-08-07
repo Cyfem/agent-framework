@@ -6,6 +6,10 @@ import { acceptanceIt } from '../../../testkit';
 import type { SubAgentExecutionRequest, SubAgentExecutorBinding } from '../src/subagent/executor';
 import { DEFAULT_SUBAGENT_LIMITS } from '../src/subagent/limits';
 import {
+  DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_CACHED_BYTES,
+  DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_BYTES,
+  DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_ITEM_BYTES,
+  DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECARS,
   SubAgentTransportPeer,
   SubAgentTransportPeerError,
   createSubAgentTransportPeerWriterAdmission,
@@ -1554,6 +1558,7 @@ describe('Subagent transport peer cancellation and limits', () => {
       readonly sidecars: SubAgentTransportPeerPacket['sidecars'];
       readonly expected: readonly string[];
       readonly maxSidecarBytes?: number;
+      readonly maxSidecarItemBytes?: number;
       readonly maxSidecars?: number;
       readonly reason: SubAgentTransportPeerError['reason'];
     }[] = [
@@ -1572,10 +1577,19 @@ describe('Subagent transport peer cancellation and limits', () => {
         reason: 'protocol-violation',
       },
       {
-        name: 'oversized',
+        name: 'item-oversized',
         sidecars: [sidecar],
         expected: ['sidecar-1'],
-        maxSidecarBytes: 1,
+        maxSidecarItemBytes: 1,
+        maxSidecarBytes: 2,
+        reason: 'sidecar-limit-exceeded',
+      },
+      {
+        name: 'total-oversized',
+        sidecars: [sidecar, secondSidecar],
+        expected: ['sidecar-1', 'sidecar-2'],
+        maxSidecarItemBytes: 2,
+        maxSidecarBytes: 3,
         reason: 'sidecar-limit-exceeded',
       },
       {
@@ -1605,6 +1619,9 @@ describe('Subagent transport peer cancellation and limits', () => {
         ...(testCase.maxSidecarBytes === undefined
           ? {}
           : { maxSidecarBytes: testCase.maxSidecarBytes }),
+        ...(testCase.maxSidecarItemBytes === undefined
+          ? {}
+          : { maxSidecarItemBytes: testCase.maxSidecarItemBytes }),
         ...(testCase.maxSidecars === undefined ? {} : { maxSidecars: testCase.maxSidecars }),
       });
       const packet = requestPacket(channelId);
@@ -1651,5 +1668,96 @@ describe('Subagent transport peer cancellation and limits', () => {
     expect(replayHandler).toHaveBeenCalledTimes(1);
     expect(replayReplies).toHaveLength(2);
     expect(replayReplies[1]?.frame).toBe(replayReplies[0]?.frame);
+  });
+
+  it('keeps the default item, packet, count and replay-cache limits mutually reachable', () => {
+    expect(DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_ITEM_BYTES).toBe(32 * 1024 * 1024);
+    expect(DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_BYTES).toBe(128 * 1024 * 1024);
+    expect(DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECARS).toBe(8);
+    expect(DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_CACHED_BYTES).toBe(160 * 1024 * 1024);
+    expect(DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_CACHED_BYTES).toBeGreaterThan(
+      DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_BYTES,
+    );
+  });
+
+  it('accepts exact item, packet and eight-item boundaries and rejects one byte or item beyond', async () => {
+    const makeSidecar = (index: number, byteLength: number) => {
+      const bytes = new Uint8Array(byteLength).fill(index + 1);
+      const sha256 = createHash('sha256').update(bytes).digest('hex');
+      return createSubAgentTransportArtifactSidecar({
+        sidecarId: `boundary-${index}`,
+        artifact: {
+          version: '1',
+          id: `boundary-artifact-${index}`,
+          mediaType: 'application/octet-stream',
+          size: byteLength,
+          sha256,
+        },
+        data: bytes,
+      });
+    };
+    const exact = Array.from({ length: 8 }, (_, index) => makeSidecar(index, 1));
+    const exactIds = exact.map(({ descriptor }) => descriptor.sidecarId);
+    const exactHandler = vi.fn(async (request: SubAgentTransportPeerHandlerRequest) =>
+      request.reply(eventsReply()),
+    );
+    const exactPeer = new SubAgentTransportPeer({
+      channelId: 'channel-sidecar-exact-boundaries',
+      writer: () => createSubAgentTransportPeerWriterAdmission(),
+      handler: exactHandler,
+      validateSidecars: (envelope) => (envelope.kind === 'events.request' ? exactIds : []),
+      maxSidecarItemBytes: 1,
+      maxSidecarBytes: 8,
+      maxSidecars: 8,
+    });
+    const exactPacket = requestPacket('channel-sidecar-exact-boundaries');
+    await expect(
+      exactPeer.receive({ frame: exactPacket.frame, sidecars: exact }),
+    ).resolves.toBeUndefined();
+    expect(exactHandler).toHaveBeenCalledTimes(1);
+
+    const overItem = makeSidecar(20, 2);
+    const itemPeer = new SubAgentTransportPeer({
+      channelId: 'channel-sidecar-over-item-boundary',
+      writer: () => createSubAgentTransportPeerWriterAdmission(),
+      validateSidecars: () => [overItem.descriptor.sidecarId],
+      maxSidecarItemBytes: 1,
+      maxSidecarBytes: 8,
+      maxSidecars: 8,
+    });
+    const itemPacket = requestPacket('channel-sidecar-over-item-boundary');
+    const itemError = await itemPeer
+      .receive({ frame: itemPacket.frame, sidecars: [overItem] })
+      .catch((caught: unknown) => caught);
+    expectPeerFailure(itemError, 'sidecar-limit-exceeded');
+
+    const totalPeer = new SubAgentTransportPeer({
+      channelId: 'channel-sidecar-over-total-boundary',
+      writer: () => createSubAgentTransportPeerWriterAdmission(),
+      validateSidecars: () => exactIds,
+      maxSidecarItemBytes: 1,
+      maxSidecarBytes: 7,
+      maxSidecars: 8,
+    });
+    const totalPacket = requestPacket('channel-sidecar-over-total-boundary');
+    const totalError = await totalPeer
+      .receive({ frame: totalPacket.frame, sidecars: exact })
+      .catch((caught: unknown) => caught);
+    expectPeerFailure(totalError, 'sidecar-limit-exceeded');
+
+    const ninth = makeSidecar(8, 1);
+    const countPeer = new SubAgentTransportPeer({
+      channelId: 'channel-sidecar-over-count-boundary',
+      writer: () => createSubAgentTransportPeerWriterAdmission(),
+      validateSidecars: () => [...exactIds, ninth.descriptor.sidecarId],
+      maxSidecarItemBytes: 1,
+      maxSidecarBytes: 9,
+      maxSidecars: 8,
+    });
+    const countPacket = requestPacket('channel-sidecar-over-count-boundary');
+    const countError = await countPeer
+      .receive({ frame: countPacket.frame, sidecars: [...exact, ninth] })
+      .catch((caught: unknown) => caught);
+    expectPeerFailure(countError, 'sidecar-limit-exceeded');
   });
 });

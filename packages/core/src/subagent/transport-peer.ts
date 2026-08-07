@@ -18,7 +18,6 @@ import {
   type SubAgentTransportSafeError,
 } from './transport-rpc';
 import {
-  DEFAULT_SUBAGENT_TRANSPORT_ARTIFACT_SIDECAR_BYTES,
   decodeSubAgentTransportArtifactSidecar,
   type SubAgentTransportArtifactSidecar,
 } from './transport-sidecar';
@@ -50,7 +49,14 @@ const SAFE_ERROR_KEYS = new Set(['code', 'message', 'retryable', 'causeCode', 'o
 export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_PENDING = 256;
 export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_TOMBSTONES = 256;
 export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_CACHED_REQUESTS = 1_024;
-export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_CACHED_BYTES = 64 * 1024 * 1024;
+/** Accommodates one maximum default frame plus one maximum default sidecar packet and receipts. */
+export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_CACHED_BYTES = 160 * 1024 * 1024;
+/** Maximum aggregate sidecar bytes in one packet. */
+export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_BYTES =
+  DEFAULT_ARTIFACT_LIMITS.maxTotalBytesPerTask;
+/** Maximum bytes in one sidecar item. */
+export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_ITEM_BYTES =
+  DEFAULT_ARTIFACT_LIMITS.maxItemBytes;
 export const DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECARS = DEFAULT_ARTIFACT_LIMITS.maxItemsPerTask;
 export const DEFAULT_SUBAGENT_TRANSPORT_PEER_SETTLEMENT_SEQUENCE_HEADROOM = 256;
 const MAX_NODE_TIMER_DELAY_MS = 2_147_483_647;
@@ -243,8 +249,10 @@ export interface SubAgentTransportPeerOptions {
   readonly maxCachedRequests?: number;
   /** Includes exact inbound replay packets and cached outbound handler replies. */
   readonly maxCachedBytes?: number;
-  /** Maximum sum of artifact bytes in one packet. */
+  /** Maximum sum of artifact bytes in one packet. Defaults to 128 MiB. */
   readonly maxSidecarBytes?: number;
+  /** Maximum bytes in one artifact sidecar. Defaults to 32 MiB. */
+  readonly maxSidecarItemBytes?: number;
   /** Maximum sidecar count in one packet. Defaults to the per-task artifact limit (8). */
   readonly maxSidecars?: number;
   readonly maxTrackedSequences?: number;
@@ -404,6 +412,7 @@ export class SubAgentTransportPeer {
   readonly #maxCachedRequests: number;
   readonly #maxCachedBytes: number;
   readonly #maxSidecarBytes: number;
+  readonly #maxSidecarItemBytes: number;
   readonly #maxSidecars: number;
   readonly #maxTrackedSequences: number;
   readonly #settlementSequenceHeadroom: number;
@@ -471,8 +480,13 @@ export class SubAgentTransportPeer {
     );
     this.#maxSidecarBytes = positiveLimit(
       options.maxSidecarBytes,
-      DEFAULT_SUBAGENT_TRANSPORT_ARTIFACT_SIDECAR_BYTES,
+      DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_BYTES,
       'maxSidecarBytes',
+    );
+    this.#maxSidecarItemBytes = positiveLimit(
+      options.maxSidecarItemBytes,
+      DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_ITEM_BYTES,
+      'maxSidecarItemBytes',
     );
     this.#maxSidecars = positiveLimit(
       options.maxSidecars,
@@ -875,10 +889,14 @@ export class SubAgentTransportPeer {
       const sidecar = itemDescriptor.value;
       assertSidecarShape(sidecar);
       const rawBytes = sidecarByteLength(sidecar.data);
+      if (rawBytes > this.#maxSidecarItemBytes) throw new CapacityError('sidecar');
       if (rawBytes > this.#maxSidecarBytes - totalBytes) throw new CapacityError('sidecar');
       const decoded = decodeSubAgentTransportArtifactSidecar(sidecar.descriptor, sidecar.data, {
-        maxBytes: this.#maxSidecarBytes,
+        maxBytes: this.#maxSidecarItemBytes,
       });
+      if (decoded.data.byteLength > this.#maxSidecarItemBytes) {
+        throw new CapacityError('sidecar');
+      }
       if (decoded.data.byteLength > this.#maxSidecarBytes - totalBytes) {
         throw new CapacityError('sidecar');
       }

@@ -358,6 +358,10 @@ interface LoopbackOptions {
     afterSequence: number,
   ) => AsyncIterable<SubAgentTaskEvent>;
   readonly model?: SubAgentTransportModelRequestHandler;
+  readonly createBinding?: (request: SubAgentExecutionRequest) => SubAgentExecutorBinding;
+  readonly validateBinding?: Parameters<
+    typeof createSubAgentTransportTargetBridge
+  >[0]['validateBinding'];
   readonly maxRetainedTasks?: number;
   readonly maxRetainedOperations?: number;
 }
@@ -383,6 +387,7 @@ function createLoopback(options: LoopbackOptions) {
       create: factory,
     })
     .seal();
+  const targetCreateBinding = vi.fn(options.createBinding ?? createBinding);
 
   const peers: {
     controller?: SubAgentTransportPeer;
@@ -412,7 +417,8 @@ function createLoopback(options: LoopbackOptions) {
     registry,
     bindingCodec,
     peer: () => requirePeer('target'),
-    createBinding: ({ request }) => createBinding(request),
+    createBinding: ({ request }) => targetCreateBinding(request),
+    ...(options.validateBinding === undefined ? {} : { validateBinding: options.validateBinding }),
     now: options.now ?? (() => NOW),
     createOperationId: ({ kind, sequence }) => `target-${kind}-${sequence}`,
     maxEventPageSize: descriptor.maxEventPageSize,
@@ -450,7 +456,7 @@ function createLoopback(options: LoopbackOptions) {
   });
   peers.controller = controllerPeer;
   peers.target = targetPeer;
-  return { controller, target, factory, controllerPeer, targetPeer };
+  return { controller, target, factory, targetCreateBinding, controllerPeer, targetPeer };
 }
 
 function messageIds(prefix: string): () => string {
@@ -513,6 +519,120 @@ describe('Subagent transport controller/target bridge', () => {
       taskCapacity: 10_000,
       operationCapacity: 10_000,
     });
+  });
+
+  it('runs a placement binding validator after createBinding but before runner or control effects', async () => {
+    const run = vi.fn(async (request: SubAgentChildRunRequest) => terminalOutcome(request));
+    const model = vi.fn<SubAgentTransportModelRequestHandler>();
+    const validateBinding = vi.fn(
+      async ({ binding }: { readonly binding: SubAgentExecutorBinding }) => {
+        const state = bindingCodec.decode(binding.recoveryData);
+        if (state.jobId !== 'trusted-worker-job') {
+          throw new SubAgentRuntimeError({
+            code: 'BINDING_INVALID',
+            message: 'The Worker binding does not belong to this bootstrap job.',
+            retryable: false,
+          });
+        }
+      },
+    );
+    const loopback = createLoopback({ run, model, validateBinding });
+    const fixtures = createControl();
+
+    await expect(
+      loopback.controller.execute(createRequest(), fixtures.control),
+    ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+    expect(loopback.targetCreateBinding).toHaveBeenCalledTimes(1);
+    expect(validateBinding).toHaveBeenCalledTimes(1);
+    expect(loopback.factory).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(fixtures.commitBinding).not.toHaveBeenCalled();
+    expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+    expect(fixtures.reportProgress).not.toHaveBeenCalled();
+    expect(fixtures.consumeBudget).not.toHaveBeenCalled();
+    expect(fixtures.submitResult).not.toHaveBeenCalled();
+    expect(fixtures.complete).not.toHaveBeenCalled();
+    expect(model).not.toHaveBeenCalled();
+  });
+
+  it('validates a resumed placement binding before creating a replacement runner', async () => {
+    const initial = createRequest();
+    const run = vi.fn(async (request: SubAgentChildRunRequest) => terminalOutcome(request));
+    const model = vi.fn<SubAgentTransportModelRequestHandler>();
+    const validateBinding = vi.fn(
+      async ({ binding }: { readonly binding: SubAgentExecutorBinding }) => {
+        const state = bindingCodec.decode(binding.recoveryData);
+        if (state.jobId !== 'trusted-worker-job') {
+          throw new SubAgentRuntimeError({
+            code: 'BINDING_INVALID',
+            message: 'The Worker binding does not belong to this bootstrap job.',
+            retryable: false,
+          });
+        }
+      },
+    );
+    const loopback = createLoopback({ run, model, validateBinding });
+    const fixtures = createControl();
+    const resume = createRequest({
+      operation: {
+        type: 'resume',
+        operationId: 'resume-worker-checkpoint-1',
+        reason: 'checkpoint',
+        binding: createBinding(initial),
+        checkpoint: childCheckpoint(),
+      },
+      attempt: 2,
+      executionEpoch: 'epoch-2',
+      executionFencingToken: '2',
+    });
+
+    await expect(loopback.controller.execute(resume, fixtures.control)).rejects.toMatchObject({
+      code: 'BINDING_INVALID',
+    });
+    expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
+    expect(validateBinding).toHaveBeenCalledTimes(1);
+    expect(loopback.factory).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(fixtures.commitBinding).not.toHaveBeenCalled();
+    expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+    expect(fixtures.reportProgress).not.toHaveBeenCalled();
+    expect(fixtures.consumeBudget).not.toHaveBeenCalled();
+    expect(fixtures.submitResult).not.toHaveBeenCalled();
+    expect(fixtures.complete).not.toHaveBeenCalled();
+    expect(model).not.toHaveBeenCalled();
+  });
+
+  it('validates a reconnect binding before looking up a resident target task', async () => {
+    const initial = createRequest();
+    const validateBinding = vi.fn(async () => {
+      throw new SubAgentRuntimeError({
+        code: 'BINDING_INVALID',
+        message: 'The Worker bootstrap job does not match the reconnect binding.',
+        retryable: false,
+      });
+    });
+    const run = vi.fn(async (request: SubAgentChildRunRequest) => terminalOutcome(request));
+    const loopback = createLoopback({ run, validateBinding });
+    const fixtures = createControl();
+    const reconnect = createRequest({
+      operation: {
+        type: 'reconnect',
+        operationId: 'reconnect-worker-1',
+        binding: createBinding(initial),
+      },
+      attempt: 2,
+      executionEpoch: 'epoch-2',
+      executionFencingToken: '2',
+    });
+
+    await expect(loopback.controller.execute(reconnect, fixtures.control)).rejects.toMatchObject({
+      code: 'BINDING_INVALID',
+    });
+    expect(validateBinding).toHaveBeenCalledTimes(1);
+    expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
+    expect(loopback.factory).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(fixtures.commitBinding).not.toHaveBeenCalled();
   });
 
   acceptanceIt(
