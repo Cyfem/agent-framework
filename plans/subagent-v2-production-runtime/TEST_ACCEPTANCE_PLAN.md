@@ -3,7 +3,7 @@
 ## 1. 文档状态
 
 - 设计状态：验收方案，随 [PLAN.md](./PLAN.md) 与 [TECHNICAL_CHANGES.md](./TECHNICAL_CHANGES.md) 一起作为 Subagent v2 实施基线。
-- 当前实现状态：当前 checkout 已完成 C0～C6 的 Core v2、官方 Local、公开 Agent durable loop、Phase 1 离线/进程恢复证据，以及 C7a/C7b/C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway；Worker/Process/HTTP placement 尚未交付，Phase 2 未通过，C8/C9 与 Docker/真实方舟最终证据仍是待交付要求。
+- 当前实现状态：当前 checkout 已完成 C0～C6 的 Core v2、官方 Local、公开 Agent durable loop、Phase 1 离线/进程恢复证据，以及 C7a/C7b/C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge、controller-owned Model gateway 和 C7c-2 离线 Worker placement。`C7-WORKER` requirement 因缺少 L5/L6/Ark 仍为 `planned`；Process/HTTP placement 尚未交付，Phase 2 未通过，C8/C9 与 Docker/Linux/真实方舟最终证据仍是待交付要求。
 - 目标范围：Phase 1 Core/Local、Phase 2 Worker/Process/HTTP Remote、Phase 3 PostgreSQL/BullMQ/Docker/S3/OTel、Compose，以及完整离线与真实方舟验收。
 - 目标版本：所有公开包统一 `2.0.0`；不为 v1 legacy Subagent 提供兼容验收。
 - 明确排除：conversation handoff、active-agent 所有权转移、Windows/Electron 桌面交互、任意云厂商 transport 的产品化实现。
@@ -29,11 +29,11 @@ Subagent v2 只有同时满足以下三类证据才可发布：
 当前 checkout 有以下可复用事实：
 
 - Core 与 Local 待发布包统一为 `2.0.0`；v1 `subAgents`、`AgentConstructor`、动态 `RuntimeSubAgent` 与旧模型 wire 已由 legacy 门禁禁止。
-- 根 `pnpm test` 显式组合 Core、Local 和 5 个 Windows 进程恢复用例，默认无 API key、网络访问或真实费用；Vitest 统一使用 Node 环境、network deny setup 与 2023-11 decorators transform。
+- 根 `pnpm test` 显式组合 Core、Local、Worker 默认 unit/conformance 和 5 个 Windows 进程恢复用例，默认无 API key、网络访问或真实费用；Vitest 统一使用 Node 环境、network deny setup 与 2023-11 decorators transform。真实 `worker_threads` crash/lifecycle 用例仍由独立 `pnpm acceptance:subagent:v2:worker:offline` shard 执行，不混入默认测试。
 - Phase 1 manifest 当前覆盖 Core/Local、跨协议、审批、上下文压缩、provider intent、tree budget、lease/fencing、Atomic File WAL 和 process-crash recovery；具体 case 数与 digest 以每次 `pnpm validate:subagent:v2:manifest` 输出为准。
 - `pnpm demo:features:ark` 已迁移到 v2 Local Runtime，继续复用配置加载、Observed Model、严格序列、marker、Skills fixture、压缩断言和白名单日志；它不会进入默认 `pnpm test`。
 - `pnpm demo:ark:subagent` 继续作为独立真实模型 smoke，但不替代完整 v2 manifest、placement profile 或离线竞态证据。
-- C7 Core 已有 closed transport、strict RPC/control、双向 Peer、replay/rollover 与 artifact sidecar 的 L1 测试和 manifest 映射；Worker、Process、HTTP 包及对应真实 placement profile 尚未完成。C8/C9 的 PostgreSQL、BullMQ、Docker、S3、OTel、Compose 与 release report 同样不能由这些 Core 证据代替。
+- C7 Core 已有 closed transport、strict RPC/control、双向 Peer、replay/rollover 与 artifact sidecar 的 L1 测试和 manifest 映射；Worker 包及其 `C7-WORKER-01`～`C7-WORKER-29` 离线 acceptance 已交付。它仍缺 L5 真实方舟 placement 与 L6/Docker/Linux live gate，不能把 manifest 的 `C7-WORKER` requirement 改为 implemented；Process、HTTP 包及对应真实 placement profile 尚未完成。C8/C9 的 PostgreSQL、BullMQ、Docker、S3、OTel、Compose 与 release report 同样不能由这些 Core/Worker 离线证据代替。
 - 当前环境未具备 Docker live gate；没有显式方舟凭证和调用确认时也不运行真实 provider 验收。
 
 ## 4. 验收原则
@@ -200,17 +200,19 @@ L3 文件统一命名 `*.process.test.ts`：普通 Local Vitest config 显式 ex
 
 ## 7. 未来命令设计
 
-以下命令是 v2 实施后应新增或调整的目标，不是当前可运行命令：
+以下是 v2 的完整目标命令集。当前 checkout 已实现其中的 Core/Local/Worker 默认测试、Worker 离线 shard、manifest/legacy/pack 校验和既有 demo；尚无对应 script 的命令仍是后续目标，是否可运行以根 `package.json` 为准：
 
 ```bash
 pnpm test
 pnpm test:subagent:v2
 pnpm test:subagent:v2:process
+pnpm acceptance:subagent:v2:worker:offline
 pnpm acceptance:subagent:v2:offline
 pnpm validate:subagent:v2:manifest
 pnpm validate:subagent:v2:evidence
 pnpm validate:subagent:v2:legacy
 pnpm validate:subagent:v2:pack
+pnpm validate:subagent:v2:pack:worker
 pnpm validate:subagent:v2:release-report
 pnpm demo:subagent:v2:ark:smoke
 pnpm demo:subagent:v2:ark:full
@@ -218,19 +220,21 @@ pnpm demo:subagent:v2:ark:full
 
 命令语义：
 
-| 命令                                       | 语义                                                                                                                                                                                   |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pnpm test`                                | 显式组合现有 Core 全量回归、Local Executor 全量测试和 L1-L4；不能继续只过滤 Core，也不能盲目递归执行未来可能联网的 workspace test。                                                    |
-| `pnpm test:subagent:v2`                    | 聚焦 L1、L2、L4，便于开发者快速定位 v2 合约失败；L0 由独立静态/pack 门禁完成。                                                                                                         |
-| `pnpm test:subagent:v2:process`            | 聚焦 L3，启动真实 child process 验证 File Store、WAL 和 fencing。                                                                                                                      |
-| `pnpm acceptance:subagent:v2:offline`      | 创建唯一 evidenceRunId，按发布顺序编排静态、测试、process、pack、回归 demo 与 evidence 校验，输出当前平台 shard。                                                                      |
-| `pnpm validate:subagent:v2:manifest`       | 纯静态校验 manifest schema、全局唯一 caseId、requirement/layer/variant 完整性，并将所有测试源码中的 literal `acceptanceIt` 与 file/caseId/variant 精确双向核对；动态或未登记注册失败。 |
-| `pnpm validate:subagent:v2:evidence`       | 在测试完成后把本次 Vitest/process/pack/平台 reporter 产物与 manifest、git SHA 和构建版本对照，拒绝陈旧证据。                                                                           |
-| `pnpm validate:subagent:v2:legacy`         | 只扫描可执行源码并拒绝未 allowlist 的 v1 Subagent symbol/wire。                                                                                                                        |
-| `pnpm validate:subagent:v2:pack`           | 在唯一临时 consumer 中构建并验证 Core/Local 的 dry-run、真实 tarball、ESM/CJS/NodeNext 和负向文件清单。                                                                                |
-| `pnpm validate:subagent:v2:release-report` | 显式接收 Windows、Linux 与 Ark evidence 路径，校验同一 commit/manifest/package/lock 后合并 release report。                                                                            |
-| `pnpm demo:subagent:v2:ark:smoke`          | 复用当前综合 feature suite，运行两个跨协议、Skills/context compact 集成场景，硬上限 24 次 provider generate。                                                                          |
-| `pnpm demo:subagent:v2:ark:full`           | 包含 smoke 和全部模型可见/控制终态 v2 场景；要求 `--ack-provider-calls=112`，精确 110 次 SDK attempt，reservation 硬上限 112。                                                         |
+| 命令                                         | 语义                                                                                                                                                                                   |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm test`                                  | 显式组合 Core、Local、Worker 默认 unit/conformance、L1-L4 和既有 Local 进程恢复；真实 Worker crash/lifecycle 保持在独立 offline shard。不能盲目递归执行未来可能联网的 workspace test。 |
+| `pnpm test:subagent:v2`                      | 聚焦 L1、L2、L4，便于开发者快速定位 v2 合约失败；L0 由独立静态/pack 门禁完成。                                                                                                         |
+| `pnpm test:subagent:v2:process`              | 聚焦 L3，启动真实 child process 验证 File Store、WAL 和 fencing。                                                                                                                      |
+| `pnpm acceptance:subagent:v2:worker:offline` | 使用真实 `worker_threads` 运行 C7c-2 的独立离线 shard；不读取 API key、不访问真实模型。                                                                                                |
+| `pnpm acceptance:subagent:v2:offline`        | 创建唯一 evidenceRunId，按发布顺序编排静态、测试、process、pack、回归 demo 与 evidence 校验，输出当前平台 shard。                                                                      |
+| `pnpm validate:subagent:v2:manifest`         | 纯静态校验 manifest schema、全局唯一 caseId、requirement/layer/variant 完整性，并将所有测试源码中的 literal `acceptanceIt` 与 file/caseId/variant 精确双向核对；动态或未登记注册失败。 |
+| `pnpm validate:subagent:v2:evidence`         | 在测试完成后把本次 Vitest/process/pack/平台 reporter 产物与 manifest、git SHA 和构建版本对照，拒绝陈旧证据。                                                                           |
+| `pnpm validate:subagent:v2:legacy`           | 只扫描可执行源码并拒绝未 allowlist 的 v1 Subagent symbol/wire。                                                                                                                        |
+| `pnpm validate:subagent:v2:pack`             | 在唯一临时 consumer 中构建并验证 Core/Local/Worker 的 dry-run、真实 tarball、ESM/CJS/NodeNext 和负向文件清单。                                                                         |
+| `pnpm validate:subagent:v2:pack:worker`      | 只运行 Worker 的发布包、Core peer、公开类型和敏感内容边界校验，便于 C7c-2 聚焦诊断。                                                                                                   |
+| `pnpm validate:subagent:v2:release-report`   | 显式接收 Windows、Linux 与 Ark evidence 路径，校验同一 commit/manifest/package/lock 后合并 release report。                                                                            |
+| `pnpm demo:subagent:v2:ark:smoke`            | 复用当前综合 feature suite，运行两个跨协议、Skills/context compact 集成场景，硬上限 24 次 provider generate。                                                                          |
+| `pnpm demo:subagent:v2:ark:full`             | 包含 smoke 和全部模型可见/控制终态 v2 场景；要求 `--ack-provider-calls=112`，精确 110 次 SDK attempt，reservation 硬上限 112。                                                         |
 
 现有 `pnpm demo:features:ark` 应迁移到 v2 wire 并作为 smoke 的实现基线或兼容别名；复用其配置加载、Skill fixture、marker、Observed Model 思路和安全日志，不复用当前“每轮恰好一个 Tool call”的 sequence validator、按协议保存的进程级 evidence 或单 Model 实例调用计数。不能保留旧 `agentName/input/outputDescription` 的可执行路径。`pnpm demo:ark:subagent` 保留独立 smoke 的命令定位，但实现同样必须迁移到 v2 wire，且不计入 v2 full 通过证据。
 
@@ -763,6 +767,7 @@ L6-01/02 使用本地 transport test double 即可验证模板 hook，不要求 
 
 - Transport：closed envelope、错版本/额外字段、16 MiB 边界、JCS digest、双向连续 sequence、same-ID/canonical-envelope replay、same-ID/different-semantics conflict、sidecar 无序重放、sequence gap，以及 execution `remainingMs` 本地重建 deadline；`2^31` 与 `2^32 ms` 长 timeout 必须保持原时长并可取消，不能触发 Node timer overflow 或 1 ms 退化。
 - 生命周期：`reconstructSubAgentExecutionRequest()` 必须返回 `{ request, dispose }`；正常 settle、失败、取消和长 timeout 都要证明 listener/timer 被幂等释放。Peer writer 必须同步返回 admission receipt；throw/void/Promise/非法 receipt 在调用返回前失败，可选 I/O `settled` 不得串行阻塞反向 control。准入前 abort 不发送、不提交 sequence、不留 tombstone；准入后 abort/timeout 才保留 tombstone 校验并吞掉迟到 reply。Peer 与 execution reconstruction 的超长 timeout 都必须分段调度。Peer 的 spawn 只允许 `accepted → settled(mode: 'spawn')`，或绑定提交前 direct `unbound_create` recovery settlement；soft drain 预留 settlement headroom 并允许 active-task continuation，hard sequence bound 才 fail-close。
+- Worker retention：终态释放 Worker/Peer/Port/timer 等重资源，但 create/cancel 的 compact terminal receipt/tombstone 必须保留以支持幂等重放；`maxRetainedTasks` 不得 LRU 删除这些证据。容量耗尽时新 task fail closed，直到 Executor `dispose()`；当前没有公开的逐 task retention 删除 API。
 - 入站重验：definition/runner/checkpoint/adapter identity、Zod input、JSON-safe、projection/artifact limits 和 binding/outcome/control payload；任何失败发生在 child runner/Core mutation 前。
 - 恢复窗口：unbound create 只重放原 operation；完整 checkpoint crash 使用原 task/binding，attempt、epoch、fencing 按恢复规则推进且 reconnect count 为 0；provider `in_flight` 为 `failed + outcomeUnknown`；result receipt 窗口为 `failed + partial`；terminal CAS 后重放只读原 terminal。每次 live dispatch 最多自动恢复一次。
 - Worker/Process：严格环境白名单、secret 不进 env/argv/stdout/stderr/binding；protocol cancel、5 秒 kill fallback、exit/close 分类和无孤儿资源；两者 `reconnect=none`。
@@ -770,9 +775,9 @@ L6-01/02 使用本地 transport test double 即可验证模板 hook，不要求 
 - Reply 关联：accepted binding、terminal/paused task identity、已知 executor 必须与原 execution request 一致；events page 不得超过请求 limit，所有 sequence 必须大于 cursor，`nextSequence` 必须等于末项或空页原 cursor，不能跳读。
 - Artifact sidecar：三种 transport 都验证 byte length 与 SHA-256；拒绝 Proxy、shadowed typed-array 属性、ArrayBuffer `slice`/`Symbol.species` 绕过与源 mutation，确保 handler 只收到普通 owned copy。JSON envelope 不允许携带大块 base64 数据，binding/job/event/error 不含路径、URL、cursor 或 credential。
 
-Phase 2 manifest 分为 `C7-TRANSPORT`、`C7-WORKER`、`C7-PROCESS`、`C7-HTTP`、`C7-AUTH` 与 `C7-PACK`，并显式映射 CONF-01～08、L6-01～05 和 F02/F08/F09/F12～F15。默认 `pnpm test` 只加入三个 adapter 的无外网 unit/conformance；真实 OS crash 与 HTTP loopback 归入独立 `acceptance:subagent:v2:phase2:offline`，真实方舟仍需显式凭证和调用确认。
+Phase 2 manifest 分为 `C7-TRANSPORT`、`C7-WORKER`、`C7-PROCESS`、`C7-HTTP`、`C7-AUTH` 与 `C7-PACK`，并显式映射 CONF-01～08、L6-01～05 和 F02/F08/F09/F12～F19。默认 `pnpm test` 只加入已经实现 adapter 的无外网 unit/conformance；真实 Worker shard 当前由 `pnpm acceptance:subagent:v2:worker:offline` 独立运行，后续真实 Process crash 与 HTTP loopback 再归入完整 `acceptance:subagent:v2:phase2:offline`。真实方舟始终需要显式凭证和调用确认。
 
-当前 closed envelope、sequence/replay、execution wire 与 recoverable settle 四项 L1 证据单列为 `C7-TRANSPORT-FOUNDATION`；14-kind strict RPC、16-method control dispatcher/proxy、32 MiB artifact sidecar 与双向 Peer 已分别映射 `rpc-outcome`、`rpc-control`、`artifact-sidecar`、`rpc-peer`，因此 `C7-TRANSPORT` requirement 已改为 `implemented`。C7c-1 的 target registry、controller/target bridge 和 Model gateway 分别登记在 `C7-TARGET-REGISTRY`、`C7-BRIDGE` 与 `C7-MODEL-GATEWAY`；覆盖 owner/session scope、handle/receipt 生命周期、canonical decimal fencing、execution-scoped control/Model、跨 Handler single-flight、Chat/Responses reply-loss replay、显式 in-flight recovery oracle 与官方 credential-free protocol surface。manifest 按 C7c-1～C7c-6 的稳定批次增量登记：当前 case 只证明已经实现的 C7c-1 子集，其余 C7c matrix ID 仍是待交付 Oracle；到 C7c-6 退出门禁时，上表每个 ID 都必须映射到 literal `acceptanceIt`、真实进程 reporter 或 Ark scenario，不能用本段说明替代证据。该状态只代表 Core transport/bridge/gateway requirement，不能替代 `C7-WORKER`、`C7-PROCESS`、`C7-HTTP`、Phase 2 离线门禁或真实 placement profile。
+当前 closed envelope、sequence/replay、execution wire 与 recoverable settle 四项 L1 证据单列为 `C7-TRANSPORT-FOUNDATION`；14-kind strict RPC、16-method control dispatcher/proxy、32 MiB artifact sidecar 与双向 Peer 已分别映射 `rpc-outcome`、`rpc-control`、`artifact-sidecar`、`rpc-peer`，因此 `C7-TRANSPORT` requirement 已改为 `implemented`。C7c-1 的 target registry、controller/target bridge 和 Model gateway 分别登记在 `C7-TARGET-REGISTRY`、`C7-BRIDGE` 与 `C7-MODEL-GATEWAY`；覆盖 owner/session scope、handle/receipt 生命周期、canonical decimal fencing、execution-scoped control/Model、跨 Handler single-flight、Chat/Responses reply-loss replay、显式 in-flight recovery oracle 与官方 credential-free protocol surface。C7c-2 又登记了 `C7-WORKER-01`～`C7-WORKER-29`：01～11 覆盖 L1/L2/L4 conformance、静态 target、环境/secret、binding、Chat/Responses proxy 与 transferable sidecar，12～29 通过真实 `worker_threads` 覆盖 handshake、cancel/terminate、crash/checkpoint、scope/capacity/cleanup 和恢复故障窗。其中 20/21/25 固定 F19 的 result-ready replay、provider in-flight no-resend 与单 execution-scope 恢复配额；28 固定 F08 的 result receipt CAS/回复丢失后 `failed + partialOutput`、receipt 只读重放且无 replacement job；29 固定 F09 的 terminal CAS/完成回复丢失后 `succeeded` 保留、completion 只读重放且无 replacement job。上述只证明 Worker 离线子集；因为 L5/L6/Ark 尚未完成，manifest 中 `C7-WORKER` requirement 继续保持 `planned`。`C7-PROCESS`、`C7-HTTP`、完整 Phase 2 离线门禁和真实 placement profile 也仍待交付。
 
 Ark placement 调用公式固定为：Worker/Process 各为两条跨协议 5-call flow，加 provider in-flight 2、result receipt 3、terminal CAS 4，共 19 次（hard limit 21）；HTTP 为两条 5-call 跨协议 flow 加 1-call lost-target，共 11 次（hard limit 13）。ARK key 只在 controller 内存，child 通过受控 Model gateway 请求，不进入 Worker、Process、HTTP remote 的 env、argv、binding、job store、日志或 evidence。
 
@@ -780,7 +785,7 @@ Phase 3 Docker Compose 必须同时启动 PostgreSQL、Redis、MinIO、HTTP work
 
 ### 12.2 C7c Placement bridge、Model gateway 与 HTTP 安全验收矩阵
 
-本节冻结 C7c 的目标验收 Oracle；在对应实现、manifest case、Worker/Process 真实进程 shard、HTTP loopback shard 和 Ark placement profile 实际产出证据前，所有条目均为 `pending_external_evidence` 或未满足 requirement，不能据此宣称 Phase 2 passed。C7c 仍只改变 child execution placement，父 Agent、root run、owner session 和审批控制权都留在 controller，不实现 handoff。
+本节冻结 C7c 的目标验收 Oracle。C7c-1 与 `C7-WORKER-01`～`C7-WORKER-29` 已有对应离线实现和 manifest case；矩阵中尚未由这些 case 覆盖的 Worker L5/L6/Ark、Process、HTTP loopback/安全和 Ark placement 条目仍是 `pending_external_evidence` 或未满足 requirement，不能据此宣称 `C7-WORKER` 或 Phase 2 passed。C7c 仍只改变 child execution placement，父 Agent、root run、owner session 和审批控制权都留在 controller，不实现 handoff。
 
 #### 12.2.1 Target registry 与 controller/target bridge
 
@@ -974,7 +979,7 @@ pnpm validate:subagent:v2:evidence
 
 `validate:subagent:v2:legacy` 使用 Node 校验脚本，扫描整个 `packages` 与 `demo` 树中的可执行源码（包括各包测试），忽略 README、plans、声明文件和构建产物。C6 的 `--forbid-all` 门禁不保留例外；任一 `subAgents`、`AgentConstructor`、`AgentInstance`、`RuntimeSubAgent`、`agentName` 或 `outputDescription` 命中都退出 1，不能用原始 `rg` 的命中退出码充当门禁。
 
-`pnpm validate:subagent:v2:pack` 在唯一 OS 临时目录中为每个发布包分别执行 pack dry-run，并验证真实打包消费。其内部等价步骤为：
+`pnpm validate:subagent:v2:pack` 在唯一 OS 临时目录中为 Core、Local 和 Worker 三个发布包分别执行 pack dry-run，并验证真实打包消费。其内部等价步骤为：
 
 ```bash
 cd packages/core
@@ -984,21 +989,25 @@ npm pack --json --pack-destination <temp-package-dir>
 cd ../executor-local
 npm pack --dry-run --json
 npm pack --json --pack-destination <temp-package-dir>
+
+cd ../executor-worker
+npm pack --dry-run --json
+npm pack --json --pack-destination <temp-package-dir>
 ```
 
-dry-run JSON 用于检查文件清单；真实 pack 生成 tarball。脚本随后在唯一临时 consumer 中同时安装 Core 与 Local Executor tarball，并验证：
+dry-run JSON 用于检查文件清单；真实 pack 生成 tarball。脚本随后在唯一临时 consumer 中同时安装 Core、Local 与 Worker Executor tarball，并验证：
 
 - Node 22 `.mjs` consumer 的 ESM `import`。
 - Node 22 `.cjs` consumer 的 CommonJS `require`。
 - `module/moduleResolution: NodeNext` TypeScript consumer 的声明编译与 public types。
 - source map 和 README 随包发布。
-- Core 包不依赖 concrete Local Executor。
-- Local Executor 的 Core dependency/peer range 与目标 2.0 版本一致。
+- Core 包不依赖 concrete Local/Worker Executor。
+- Local/Worker Executor 的 Core dependency/peer range 与目标 2.0 版本一致。
 - tarball 不含 test、fixture、`.env`、checkpoint、artifact、WAL 或验收临时文件。
 - 解包后的全部允许文件都执行内容级 secret scan；`.map` 的 `sourcesContent` 同样纳入扫描，但 `ARK_API_KEY` 等环境变量名本身不是凭证命中。
 - Core 根导出不暴露 ledger failpoint、protocol-surface audit marker 或内部 fencing helper。
 
-pack validator 先运行敏感 dist 产物、TypeScript 源码、普通文件 secret marker、source map `sourcesContent` secret marker、缺 source map、child 超时和输出超限负例，再锁定包名、`engines.node`、仅根 exports、无 `bin`、peer range、内部 helper 不可见性及发布文件正向白名单。内容扫描只匹配私钥头和具有足够结构/长度的常见 token，不把环境变量名称或普通 API 标识误判为 credential。Local consumer 必须使用同轮生成且 semver 兼容的 Core tarball；tar/tsc/runtime child 使用不含 provider key 的最小环境白名单，所有 npm/tar/tsc/runtime child 都有 wall-clock watchdog，并在超限后等待进程关闭再进入 `finally` 清理。validator 输出两个 tarball digest、package version 和 consumer caseId；这些字段进入本次 evidence shard，不能靠人工阅读 `npm pack` 输出完成门禁。
+pack validator 先运行敏感 dist 产物、TypeScript 源码、普通文件 secret marker、source map `sourcesContent` secret marker、缺 source map、child 超时和输出超限负例，再锁定包名、`engines.node`、仅根 exports、无 `bin`、peer range、内部 helper 不可见性及发布文件正向白名单。内容扫描只匹配私钥头和具有足够结构/长度的常见 token，不把环境变量名称或普通 API 标识误判为 credential。Local/Worker consumer 必须使用同轮生成且 semver 兼容的 Core tarball；tar/tsc/runtime child 使用不含 provider key 的最小环境白名单，所有 npm/tar/tsc/runtime child 都有 wall-clock watchdog，并在超限后等待进程关闭再进入 `finally` 清理。validator 输出三个 tarball digest、package version 和 consumer caseId；这些字段进入本次 evidence shard，不能靠人工阅读 `npm pack` 输出完成门禁。
 
 默认 `pnpm test` 必须完全无网络。前置 `pnpm install --frozen-lockfile` 可以在验收计时外预热 store；offline orchestrator 中的 tarball consumer 强制使用 pnpm/npm cache 的 offline 模式，缺依赖时失败且不能回退访问 registry。若要单独诊断 packaging network，应使用另一个不产生 platform passed 的显式命令。两种路径都禁止访问方舟或其他模型 provider。
 
@@ -1119,7 +1128,7 @@ Windows 与 Linux 都必须运行 Atomic File/进程恢复离线门禁，因为 
   "manifestDigest": "sha256:<digest>",
   "buildDigest": "sha256:<public-dist-digest>",
   "status": "passed",
-  "tarballDigests": ["sha256:<core>", "sha256:<executor-local>"]
+  "tarballDigests": ["sha256:<core>", "sha256:<executor-local>", "sha256:<executor-worker>"]
 }
 ```
 

@@ -262,7 +262,8 @@ export function createExecutorConformanceRequest(
     runId: RUN_ID,
     taskId: options.taskId,
     subagentSessionId: `session:${options.taskId}`,
-    path: Object.freeze([options.taskId]),
+    parentTaskId: 'executor-conformance-parent',
+    path: Object.freeze(['executor-conformance-parent', options.taskId]),
     attempt: operation.type === 'create' ? 1 : 2,
     executionEpoch: `epoch:${options.taskId}:${operation.type}`,
     executionFencingToken: operation.type === 'create' ? '1' : '2',
@@ -273,9 +274,9 @@ export function createExecutorConformanceRequest(
       version: '1',
       ownerSessionId: OWNER_SESSION_ID,
       runId: RUN_ID,
-      parentTaskId: 'executor-conformance-parent',
-      path: Object.freeze(['executor-conformance-parent']),
-      depth: 1,
+      parentTaskId: options.taskId,
+      path: Object.freeze(['executor-conformance-parent', options.taskId]),
+      depth: 2,
       catalogRevision: 1,
       definitions: Object.freeze([
         Object.freeze({
@@ -455,9 +456,17 @@ export function createExecutorConformanceChildCheckpoint(options: {
       codecVersion,
       revision: 0,
       rawHistory: [],
-      activeSpans: [],
+      activeSpans: [
+        {
+          spanId: 'context-span-1',
+          kind: 'seed' as const,
+          closed: true,
+          originalContext: [],
+          entries: [],
+        },
+      ],
       nextRawItemId: 1,
-      nextSpanId: 1,
+      nextSpanId: 2,
       nextEntryId: 1,
     },
     modelIteration: 1,
@@ -566,10 +575,10 @@ function assertSuccessfulOutcome(
   assert.notEqual(
     outcome.type,
     'recovery_required',
-    'the conformance settle scenario must not require recovery',
+    `the conformance task ${request.taskId} must not require recovery`,
   );
   if (outcome.type === 'recovery_required') {
-    throw new Error('The conformance settle scenario unexpectedly required recovery.');
+    throw new Error(`The conformance task ${request.taskId} unexpectedly required recovery.`);
   }
   assert.equal(outcome.type, 'terminal');
   if (outcome.type !== 'terminal') throw new Error('Expected a terminal outcome.');

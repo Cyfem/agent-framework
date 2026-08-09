@@ -783,6 +783,10 @@ describe('SubAgentRuntime execution contract', () => {
     'REC-02.l1.checkpoint-orphan-adoption',
     'expired-execution-lease-fenced-checkpoint-adoption',
     async () => {
+      // The store expiry is driven deterministically by ManualClock. Keep the host-monotonic
+      // execution proof comfortably above a saturated Vitest turn so this test exercises orphan
+      // adoption instead of the independent renewal-loss boundary covered by adversarial tests.
+      const executionLeaseTtlMs = 900;
       const clock = new ManualClock(Date.now());
       const store = new RecordingRuntimeStateStore({ now: clock.now });
       const firstEntered = new Deferred<void>();
@@ -801,7 +805,7 @@ describe('SubAgentRuntime execution contract', () => {
       const first = await createFixture({
         store,
         executors: [firstExecutor],
-        executionLeaseTtlMs: 30,
+        executionLeaseTtlMs,
       });
       const original = first.runtime.execute(
         executeRequest({ requestId: 'running-orphan-adoption' }),
@@ -827,10 +831,10 @@ describe('SubAgentRuntime execution contract', () => {
       const replacement = await createFixture({
         store,
         executors: [recoveredExecutor],
-        executionLeaseTtlMs: 30,
+        executionLeaseTtlMs,
         initializeRun: false,
       });
-      clock.advanceBy(31);
+      clock.advanceBy(executionLeaseTtlMs + 1);
       const recoveredHandle = await replacement.runtime.recover(SESSION_ID, before.taskId);
       await expect(recoveredHandle.wait()).resolves.toMatchObject({
         type: 'terminal',

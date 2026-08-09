@@ -8,10 +8,11 @@
 - 根据改动范围继续阅读相关项目文档：
   - 核心库、公共 API、Skills 和上下文压缩：[packages/core/README.md](./packages/core/README.md)
   - 官方本地 Executor、Memory/Atomic File Store 与文件系统边界：[packages/executor-local/README.md](./packages/executor-local/README.md)
+  - 官方 Worker Executor、静态 target、线程生命周期与安全边界：[packages/executor-worker/README.md](./packages/executor-worker/README.md)
   - 可运行示例、真实模型配置和费用边界：[demo/README.md](./demo/README.md)
   - 分批实施中的 Subagent v2 生产运行时设计与验收：[PLAN.md](./plans/subagent-v2-production-runtime/PLAN.md)、[TECHNICAL_CHANGES.md](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md) 与 [TEST_ACCEPTANCE_PLAN.md](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)
-  - 当前 checkout 已完成 C6，并交付 C7a/C7b/C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、recoverable Executor settle、target registry、controller/target bridge 与 controller-owned Model gateway 地基；Worker/Process/HTTP placement 尚未交付、Phase 2 未通过，C8–C9 分布式能力仍以源码、测试和 README 状态为准。
-  - Core/Local package manifest 已固定为待发布 `2.0.0`，但 npm Core `latest` 仍是 `1.0.0`、Local 尚未发布；不得把 manifest、pack 成功或计划状态写成 npm 已发布。
+  - 当前 checkout 已完成 C6，并交付 C7a/C7b/C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、recoverable Executor settle、target registry、controller/target bridge 与 controller-owned Model gateway，以及 C7c-2 的离线 Worker placement；Process/HTTP placement 尚未交付、Phase 2 未通过，C8–C9 分布式能力仍以源码、测试和 README 状态为准。
+  - Core/Local/Worker package manifest 已固定为待发布 `2.0.0`，但 npm Core `latest` 仍是 `1.0.0`、Local/Worker 尚未发布；不得把 manifest、pack 成功或计划状态写成 npm 已发布。
 
 ## Working Rules
 

@@ -36,6 +36,8 @@ const SESSION_ID = 'runtime-adversarial-session';
 const RUN_ID = 'runtime-adversarial-run';
 const TASK_ID = 'runtime-adversarial-task';
 const SUBAGENT_SESSION_ID = 'runtime-adversarial-child-session';
+// The renewal must be observed before the proof expires even when Vitest saturates the event loop.
+const RENEWAL_LOSS_TEST_LEASE_TTL_MS = 900;
 
 type ExecuteHandler = (
   request: SubAgentExecutionRequest,
@@ -1064,7 +1066,7 @@ describe('SubAgentRuntime adversarial Oracles', () => {
     });
     const first = await createFixture(executor, {
       store,
-      executionLeaseTtlMs: 30,
+      executionLeaseTtlMs: RENEWAL_LOSS_TEST_LEASE_TTL_MS,
     });
     const stalePromise = first.runtime.execute(request());
     stalePromise.catch(() => undefined);
@@ -1092,7 +1094,7 @@ describe('SubAgentRuntime adversarial Oracles', () => {
     const replacement = await createFixture(executor, {
       store,
       createRun: false,
-      executionLeaseTtlMs: 30,
+      executionLeaseTtlMs: RENEWAL_LOSS_TEST_LEASE_TTL_MS,
     });
     await expect(replacement.runtime.execute(request())).resolves.toMatchObject({
       type: 'terminal',
@@ -1124,7 +1126,7 @@ describe('SubAgentRuntime adversarial Oracles', () => {
     const executor = new AdversarialExecutor();
     const first = await createFixture(executor, {
       store,
-      executionLeaseTtlMs: 30,
+      executionLeaseTtlMs: RENEWAL_LOSS_TEST_LEASE_TTL_MS,
     });
     const stalePromise = first.runtime.execute(request());
     stalePromise.catch(() => undefined);
@@ -1158,7 +1160,7 @@ describe('SubAgentRuntime adversarial Oracles', () => {
     const replacement = await createFixture(executor, {
       store,
       createRun: false,
-      executionLeaseTtlMs: 30,
+      executionLeaseTtlMs: RENEWAL_LOSS_TEST_LEASE_TTL_MS,
     });
     await expect(replacement.runtime.execute(request())).resolves.toMatchObject({
       type: 'terminal',
@@ -1217,7 +1219,7 @@ describe('SubAgentRuntime adversarial Oracles', () => {
     const replacement = await createFixture(executor, {
       store,
       createRun: false,
-      executionLeaseTtlMs: 30,
+      executionLeaseTtlMs: RENEWAL_LOSS_TEST_LEASE_TTL_MS,
     });
     const handlePromise = replacement.runtime.recover(SESSION_ID, waiting.taskId);
     await store.adoptionCommitEntered.promise;
@@ -1283,7 +1285,7 @@ describe('SubAgentRuntime adversarial Oracles', () => {
       });
       const first = await createFixture(executor, {
         store,
-        executionLeaseTtlMs: 30,
+        executionLeaseTtlMs: RENEWAL_LOSS_TEST_LEASE_TTL_MS,
       });
       const stalePromise = first.runtime.execute(request());
       stalePromise.catch(() => undefined);
@@ -1318,7 +1320,7 @@ describe('SubAgentRuntime adversarial Oracles', () => {
       const replacement = await createFixture(executor, {
         store,
         createRun: false,
-        executionLeaseTtlMs: 30,
+        executionLeaseTtlMs: RENEWAL_LOSS_TEST_LEASE_TTL_MS,
       });
       await expect(replacement.runtime.execute(request())).resolves.toMatchObject({
         type: 'terminal',

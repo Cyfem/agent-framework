@@ -5,9 +5,9 @@
 
 `@ruixutong.manee/maneeagent-framework` 是一个运行在 Node.js 端、以 TypeScript 为主要开发体验的 AI Agent 编排框架。它把 Agent 的任务循环、上下文、工具、事件和子代理，与具体模型 API 的消息格式和请求方式解耦，使同一套 Agent 逻辑可以接入不同协议。
 
-本仓库是框架源码和示例所在的 pnpm workspace。可发布的核心包位于 [`packages/core`](./packages/core)，完整 API 文档见 [`packages/core/README.md`](./packages/core/README.md)。
+本仓库是框架源码和示例所在的 pnpm workspace。可发布的核心包位于 [`packages/core`](./packages/core)，完整 API 文档见 [`packages/core/README.md`](./packages/core/README.md)；官方 Local 与 Worker Executor 分别见 [`packages/executor-local`](./packages/executor-local) 和 [`packages/executor-worker`](./packages/executor-worker)。
 
-> **发布状态**：当前 checkout 中 Core 与 Local Executor 的 package manifest 都是待发布的 `2.0.0`，但 npm registry 上 Core 的 `latest` 仍是 `1.0.0`，Local Executor 尚未发布。本文的 v2 API 与 npm 安装示例面向 `2.0.0` 发布物；在正式发布前，请在本仓库通过 workspace 命令构建和验收，不能用 manifest 版本推断 npm 已发布。
+> **发布状态**：当前 checkout 中 Core、Local Executor 与 Worker Executor 的 package manifest 都是待发布的 `2.0.0`，但 npm registry 上 Core 的 `latest` 仍是 `1.0.0`，Local/Worker Executor 尚未发布。本文的 v2 API 与 npm 安装示例面向 `2.0.0` 发布物；在正式发布前，请在本仓库通过 workspace 命令构建和验收，不能用 manifest 版本推断 npm 已发布。
 
 ## 核心能力
 
@@ -17,7 +17,7 @@
 - **上下文与历史**：分别维护模型使用的 active context 和完整 raw history，并保留 provider 原始字段。
 - **事件系统**：可观察模型响应、工具调用前后、工具异常、Agent 状态和 Agent 错误。
 - **渐进式 Skills**：首轮只暴露 `name + description`，模型通过内置 `skill` 工具按需加载 instructions、读取文本资源或运行显式启用的脚本。
-- **Subagent v2**：通过 typed `SubAgentDefinition`、模型可见 `{ subAgent, executor, input }` wire 和独立 Executor 调度隔离 child Agent；支持跨协议 placement、审批暂停/恢复、嵌套委派、持久 checkpoint、取消与 typed result，并提供 C7 transport v1、14-kind strict RPC、controller/target bridge、controller-owned Model gateway、双向 Peer、artifact sidecar 与可恢复 Executor settle contract。
+- **Subagent v2**：通过 typed `SubAgentDefinition`、模型可见 `{ subAgent, executor, input }` wire 和独立 Executor 调度隔离 child Agent；支持跨协议 placement、审批暂停/恢复、嵌套委派、持久 checkpoint、取消与 typed result，并提供 Local 与真实 `worker_threads` placement、C7 transport v1、14-kind strict RPC、controller/target bridge、controller-owned Model gateway、双向 Peer、artifact sidecar 与可恢复 Executor settle contract。
 - **上下文压缩与恢复**：支持 active-only 工具 payload 裁剪、外部摘要事务和 context-length 错误恢复；raw history 始终保留原文。
 - **多模态上下文**：Responses 支持文件上传和图片、文件、视频、音频内容块；Chat 支持图片、音频和文件内容块。
 - **扩展 Model**：可继承 `Model<P>` 接入其他消息协议或 OpenAI-compatible 服务。
@@ -91,15 +91,16 @@ if (outcome.status === 'succeeded') {
 
 ## 仓库结构
 
-| 路径                      | 说明                                                                   |
-| ------------------------- | ---------------------------------------------------------------------- |
-| `packages/core`           | Core `2.0.0` 待发布源码，输出 ESM、CJS 和 TypeScript 声明。            |
-| `packages/executor-local` | Local Executor 与 Memory/Atomic File StateStore 的 `2.0.0` 待发布包。  |
-| `demo/src`                | CLI 示例、离线回归、真实方舟调用、金融新闻和 Windows 工具。            |
-| `demo/electron-weixin`    | Windows Electron 微信消息示例。                                        |
-| `plans`                   | Subagent v2 的目标架构与验收方案；已实现范围以源码和各包 README 为准。 |
+| 路径                       | 说明                                                                     |
+| -------------------------- | ------------------------------------------------------------------------ |
+| `packages/core`            | Core `2.0.0` 待发布源码，输出 ESM、CJS 和 TypeScript 声明。              |
+| `packages/executor-local`  | Local Executor 与 Memory/Atomic File StateStore 的 `2.0.0` 待发布包。    |
+| `packages/executor-worker` | 每 task 一个受信 `worker_threads.Worker` 的 `2.0.0` 待发布 Executor 包。 |
+| `demo/src`                 | CLI 示例、离线回归、真实方舟调用、金融新闻和 Windows 工具。              |
+| `demo/electron-weixin`     | Windows Electron 微信消息示例。                                          |
+| `plans`                    | Subagent v2 的目标架构与验收方案；已实现范围以源码和各包 README 为准。   |
 
-两个包都没有 `bin` CLI；下文命令都是本仓库的 pnpm workspace scripts。demo 源码中的 `@manee/agent-framework` 与 `@manee/agent-executor-local` 是 workspace alias，分别指向待发布包 `@ruixutong.manee/maneeagent-framework` 与 `@ruixutong.manee/maneeagent-executor-local`；它们只是仓库内 import 名，不是另外两个 npm 包。
+三个待发布包都没有 `bin` CLI；下文命令都是本仓库的 pnpm workspace scripts。demo 源码中的 `@manee/agent-framework` 与 `@manee/agent-executor-local` 是 workspace alias，分别指向待发布包 `@ruixutong.manee/maneeagent-framework` 与 `@ruixutong.manee/maneeagent-executor-local`；它们只是仓库内 import 名，不是另外两个 npm 包。
 
 ## 本地开发
 
@@ -117,7 +118,7 @@ pnpm demo
 
 正式验收证据使用固定的 Node.js 22 和 `pnpm@11.1.3`。Windows 上可运行 `pnpm toolchain:node22`，脚本会把便携工具链安装到被忽略的 `.tools/` 目录，并在解压前核对 Node.js 官方 SHA-256；日常开发可继续使用满足版本要求的本机工具链。
 
-Subagent v2 实施期间可运行 `pnpm validate:subagent:v2:manifest`、`pnpm validate:subagent:v2:legacy` 和 `pnpm validate:subagent:v2:pack` 校验需求追踪、旧 API/wire 零残留与 Core/Local 两个待发布包的内容。manifest 门禁会静态核对所有测试源码中的 literal `acceptanceIt(caseId, variant, fn)` 与清单记录，拒绝动态、重复、错文件或未登记 case；legacy 门禁以 `--forbid-all` 扫描整个 `packages` 与 `demo` 可执行源码树；pack 门禁会先运行敏感产物、源码泄漏、缺 source map、超时和输出超限负例，再重新构建两包并比对 dry-run 与真实临时 tarball。发布文件只允许根 `package.json`、README/license，以及 `dist` 中的 ESM/CJS、声明和 source map，并叠加 secret-sensitive 文件拒绝。真实 tarball 解包后会以正式包名执行 ESM `import()` 与 CommonJS `require()` smoke，并同时编译 `type: module` ESM 与 `.cts` CommonJS 消费者；两者都使用 `module/moduleResolution: NodeNext`、`strict: true`、`skipLibCheck: false`、关键 contract/字段非 `any` 断言和 missing-export 负检。门禁还锁定包名、Node.js 要求、根 exports、无 `bin` 与 peer range；Local 使用同一轮生成、解包且 semver 兼容的 Core tarball，不借用 workspace Core。除本地 `npm pack` 外的 tar/tsc/runtime child 只收到最小环境白名单，所有 child 都有 wall-clock watchdog，因而不会把 `ARK_API_KEY` 等凭证带入消费 smoke。`validate:subagent:v2:evidence` 还需通过 `--evidence=<repo-relative.json>` 显式指定本次证据 shard。这些是仓库验收命令，不是 npm 包 CLI；临时生成 tarball 也不代表执行了 `npm publish`。
+Subagent v2 实施期间可运行 `pnpm validate:subagent:v2:manifest`、`pnpm validate:subagent:v2:legacy` 和 `pnpm validate:subagent:v2:pack` 校验需求追踪、旧 API/wire 零残留与 Core/Local/Worker 三个待发布包的内容。manifest 门禁会静态核对所有测试源码中的 literal `acceptanceIt(caseId, variant, fn)` 与清单记录，拒绝动态、重复、错文件或未登记 case；legacy 门禁以 `--forbid-all` 扫描整个 `packages` 与 `demo` 可执行源码树；pack 门禁会先运行敏感产物、源码泄漏、缺 source map、超时和输出超限负例，再重新构建三包并比对 dry-run 与真实临时 tarball。发布文件只允许根 `package.json`、README/license，以及 `dist` 中的 ESM/CJS、声明和 source map，并叠加 secret-sensitive 文件拒绝。真实 tarball 解包后会以正式包名执行 ESM `import()` 与 CommonJS `require()` smoke，并同时编译 `type: module` ESM 与 `.cts` CommonJS 消费者；两者都使用 `module/moduleResolution: NodeNext`、`strict: true`、`skipLibCheck: false`、关键 contract/字段非 `any` 断言和 missing-export 负检。门禁还锁定包名、Node.js 要求、根 exports、无 `bin` 与 peer range；Local/Worker 使用同一轮生成、解包且 semver 兼容的 Core tarball，不借用 workspace Core。除本地 `npm pack` 外的 tar/tsc/runtime child 只收到最小环境白名单，所有 child 都有 wall-clock watchdog，因而不会把 `ARK_API_KEY` 等凭证带入消费 smoke。`validate:subagent:v2:evidence` 还需通过 `--evidence=<repo-relative.json>` 显式指定本次证据 shard。这些是仓库验收命令，不是 npm 包 CLI；临时生成 tarball 也不代表执行了 `npm publish`。
 
 ## Skills
 
@@ -192,9 +193,10 @@ pnpm test
 pnpm typecheck
 pnpm lint
 pnpm format:check
+pnpm acceptance:subagent:v2:worker:offline
 ```
 
-`pnpm test` 显式组合 Core、Local Executor 和专用跨进程恢复测试，不需要模型凭据或网络访问，也不会递归触发真实模型命令；`pnpm demo`、`pnpm demo:chat` 和 `pnpm demo:finance-news:smoke` 是额外的离线回归入口。
+`pnpm test` 显式组合 Core、Local Executor、Worker Executor 和专用跨进程恢复测试，不需要模型凭据或网络访问，也不会递归触发真实模型命令。`acceptance:subagent:v2:worker:offline` 额外运行真实 `worker_threads` 的崩溃、terminate、checkpoint 和资源回收 shard；它仍使用 fake SDK，不读取 API key。`pnpm demo`、`pnpm demo:chat` 和 `pnpm demo:finance-news:smoke` 是额外的离线回归入口。
 
 ## 当前限制
 
@@ -204,7 +206,7 @@ pnpm format:check
 - 同一个 Agent 实例不能并发执行多个 `agent()` 调用。
 - 父 Agent 与 child Agent 可以使用不同协议；child 的 Model、Tools、Skills、system prompts、compact 与错误恢复配置由受信任 Executor factory 独立提供，不从父 Agent 隐式继承。
 - durable root resume 和跨进程 child resume 需要 ready `SubAgentRuntime`、持久 StateStore 以及兼容的版本化 checkpoint codec。无 codec 自定义协议仅限宿主提供、Catalog 明确声明 `same_process` 的 placement：同一 Agent 实例可以保留进程内 checkpoint 并恢复根审批；替换实例、跨进程恢复和无 codec child 自身产生的 durable 审批仍会被拒绝。官方 Local Executor 声明的是 `checkpoint`，不是 `same_process`。
-- 当前 checkout 已实现宿主进程内 Local Executor、单机 Memory/Atomic File StateStore，以及 C7 Core 共用的 closed JSON transport v1、14-kind strict RPC、16-method control dispatcher/proxy、controller/target bridge、controller-owned Model gateway、双向 Peer、32 MiB artifact sidecar 和 `recovery_required` settle contract。Target bridge 绑定经认证的单一 owner session，并把 Model gateway/protocol/codec 身份固定到持久 binding；Model gateway 支持幂等 budget、显式 crash takeover、attempt-aware reply-loss replay、token usage 结算与有界内存 receipt，内置 OpenAI adapter 每次 SDK dispatch 强制 `maxRetries: 0`。Core 通用 bridge 的 live external reconnect 会 fail closed；Remote control proxy 暂不提供 artifact `put`。Worker、Process、HTTP 具体 placement 与分布式生产适配器仍属于后续 C7–C9，Phase 2 尚未通过，且当前 Local 包尚未发布到 npm。
+- 当前 checkout 已实现宿主进程内 Local Executor、真实 `worker_threads` Worker Executor、单机 Memory/Atomic File StateStore，以及 C7 Core 共用的 closed JSON transport v1、14-kind strict RPC、16-method control dispatcher/proxy、controller/target bridge、controller-owned Model gateway、双向 Peer、32 MiB 单件/128 MiB 单 packet artifact sidecar 和 `recovery_required` settle contract。Target bridge 绑定经认证的单一 owner session，并把 Model gateway/protocol/codec 身份固定到持久 binding；Model gateway 支持幂等 budget、显式 crash takeover、attempt-aware reply-loss replay、token usage 结算与有界内存 receipt，内置 OpenAI adapter 每次 SDK dispatch 强制 `maxRetries: 0`。Worker 每个 live task 使用一个静态受信 target、最小环境和独立 MessageChannel，支持 checkpoint resume 但不支持 reconnect；`worker_threads` 不是文件系统或网络沙箱。Core 通用 bridge 的 live external reconnect 会 fail closed；Remote control proxy 暂不提供 artifact `put`。Process、HTTP placement 与分布式生产适配器仍属于后续 C7–C9，Phase 2 尚未通过，且当前 Local/Worker 包尚未发布到 npm。
 - `@Tool` 需要应用构建链支持 2023-11 decorators。
 
 `agent()` 和独立 `toolCall()` 支持传入 `AbortSignal` 与绝对 `deadlineAt`。取消信号会贯穿 Model、Tool、摘要、payload compactor 和模型错误恢复；Chat/Responses 适配器只把 `signal` 作为 SDK request option 传递，不会把截止时间或运行时身份写入 provider body。取消是协作式的，第三方 Model、Tool 或 callback 仍需主动遵守收到的 signal。对 durable provider operation，SDK dispatch 前收到取消会得到 `cancelled`；请求 intent 已持久化为 `in_flight` 后再发生 abort、超时或连接结果不确定，则 run/task 固定为 `failed + outcomeUnknown`，不会自动重发可能已经执行的请求。
@@ -245,4 +247,4 @@ const agent = new Agent({
 
 核心 API、事件、上下文、Skills、子代理、Responses/Chat 适配和自定义 Model 的完整说明见 [`packages/core/README.md`](./packages/core/README.md)。
 
-Subagent v2 正按三阶段计划分批实施。当前 checkout 的 Core/Local manifest 为 `2.0.0`，C2–C6 源码已完成 Core contracts、持久状态域、Catalog/Router、公开 `Agent` durable loop、v1 原子删除、跨协议 Local placement、审批/嵌套审批恢复、context compact 崩溃窗口恢复，以及 Memory/Atomic File StateStore；C7 Core 层已进一步交付 transport v1、14-kind strict RPC/control、双向 Peer、artifact sidecar、recoverable Executor settle、target registry、controller/target bridge 与 controller-owned Model gateway。C7 的 Worker/Process/HTTP placement 以及 C8–C9 的分布式适配器、Compose、完整 evidence/release report 尚未交付，Phase 2 尚未通过；Docker live gate 与真实方舟验收也未执行。npm 发布状态独立于这些 manifest。实际 API 与本地存储边界见 [`packages/core/README.md`](./packages/core/README.md) 与 [`packages/executor-local/README.md`](./packages/executor-local/README.md)。
+Subagent v2 正按三阶段计划分批实施。当前 checkout 的 Core/Local/Worker manifest 为 `2.0.0`，C2–C6 源码已完成 Core contracts、持久状态域、Catalog/Router、公开 `Agent` durable loop、v1 原子删除、跨协议 Local placement、审批/嵌套审批恢复、context compact 崩溃窗口恢复，以及 Memory/Atomic File StateStore；C7 Core 层已进一步交付 transport v1、14-kind strict RPC/control、双向 Peer、artifact sidecar、recoverable Executor settle、target registry、controller/target bridge 与 controller-owned Model gateway，C7c-2 已交付离线 Worker placement。C7 的 Process/HTTP placement 以及 C8–C9 的分布式适配器、Compose、完整 evidence/release report 尚未交付，Phase 2 尚未通过；Worker 方舟 L5、Docker/Linux live gate 与完整真实方舟验收也未执行。npm 发布状态独立于这些 manifest。实际 API 与运行边界见 [`packages/core/README.md`](./packages/core/README.md)、[`packages/executor-local/README.md`](./packages/executor-local/README.md) 与 [`packages/executor-worker/README.md`](./packages/executor-worker/README.md)。

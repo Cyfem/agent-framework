@@ -700,10 +700,15 @@ async function invokeRegisteredTaskHandle(
   resolver?: SubAgentTransportTaskHandleResolver<SubAgentTaskHandle>,
   reason?: string,
 ): Promise<unknown> {
-  if (!handles.has(scope) && resolver !== undefined) {
-    handles.remember({ ...scope, resolver });
+  const previouslyRegistered = handles.has(scope);
+  let createdForLookup = false;
+  if (!previouslyRegistered && resolver !== undefined) {
+    rememberSubAgentTaskHandle(handles, {
+      ...scope,
+      resolver: scopedAuthoritativeTaskHandleResolver(resolver),
+    });
+    createdForLookup = true;
   }
-  const registered = handles.has(scope);
   try {
     const handle = resolveSubAgentTaskHandle(handles, scope);
     switch (operation) {
@@ -715,17 +720,41 @@ async function invokeRegisteredTaskHandle(
         return await handle.cancel(reason);
     }
   } catch (error) {
-    if (
-      registered &&
-      error instanceof SubAgentRuntimeError &&
-      error.code === 'RESOURCE_NOT_FOUND'
-    ) {
-      throw new TypeError('A registered task handle returned a mismatched task scope.', {
-        cause: error,
-      });
+    if (error instanceof SubAgentRuntimeError && error.code === 'RESOURCE_NOT_FOUND') {
+      handles.forget(scope);
+      if (previouslyRegistered && !createdForLookup) {
+        throw new TypeError('A registered task handle returned a mismatched task scope.', {
+          cause: error,
+        });
+      }
     }
     throw error;
   }
+}
+
+function scopedAuthoritativeTaskHandleResolver(
+  resolver: SubAgentTransportTaskHandleResolver<SubAgentTaskHandle>,
+): SubAgentTransportTaskHandleResolver<SubAgentTaskHandle> {
+  return async (scope) => {
+    const handle = await resolver(scope);
+    if (
+      handle === null ||
+      typeof handle !== 'object' ||
+      handle.taskId !== scope.taskId ||
+      typeof handle.snapshot !== 'function'
+    ) {
+      throw new SubAgentRuntimeError(RESOURCE_NOT_FOUND_ERROR);
+    }
+    const snapshot = await handle.snapshot();
+    if (
+      snapshot.taskId !== scope.taskId ||
+      snapshot.ownerSessionId !== scope.ownerSessionId ||
+      snapshot.parentTaskId !== scope.parentTaskId
+    ) {
+      throw new SubAgentRuntimeError(RESOURCE_NOT_FOUND_ERROR);
+    }
+    return handle;
+  };
 }
 
 /** Project Core-owned values into the strictly smaller transport-safe result surface. */

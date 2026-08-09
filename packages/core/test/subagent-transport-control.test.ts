@@ -747,10 +747,12 @@ describe('Subagent strict transport control schema', () => {
 describe('Subagent transport control dispatcher', () => {
   it('injects the outer operationId and delegates every method to trusted controls', async () => {
     const trusted = createTrustedControl();
+    const resolveTaskHandle = vi.fn(async () => trusted.childHandle);
     const dispatcher = createSubAgentTransportControlDispatcher({
       control: trusted.control,
       taskId: TASK_ID,
       ownerSessionId: 'owner-session-1',
+      resolveTaskHandle,
     });
     const fixtures = createMethodFixtures();
     const replies = new Map<SubAgentTransportControlMethod, SubAgentTransportControlReply>();
@@ -823,9 +825,10 @@ describe('Subagent transport control dispatcher', () => {
       createMethodFixtures()['delegation.spawn'].args.request,
     );
     expect(trusted.calls.resumeTool).toHaveBeenCalledWith(CHILD_TASK_ID);
-    expect(trusted.childHandle.snapshot).toHaveBeenCalledTimes(1);
+    expect(trusted.childHandle.snapshot).toHaveBeenCalledTimes(2);
     expect(trusted.childHandle.wait).toHaveBeenCalledTimes(1);
     expect(trusted.childHandle.cancel).toHaveBeenCalledWith('host-cancelled');
+    expect(resolveTaskHandle).toHaveBeenCalledOnce();
 
     expect(replies.get('delegation.spawn')).toEqual(
       successfulReply('delegation.spawn', { taskId: CHILD_TASK_ID }),
@@ -923,7 +926,16 @@ describe('Subagent transport control dispatcher', () => {
       });
       expect(trusted.childHandle.snapshot).toHaveBeenCalledTimes(1);
 
-      const lazyResolver = vi.fn(async () => trusted.childHandle);
+      const reconstructedSnapshot = {
+        ...createTaskSnapshot(),
+        parentTaskId: 'task-reconstructed-parent',
+        path: ['task-reconstructed-parent', CHILD_TASK_ID],
+      };
+      const reconstructedHandle = createHandle();
+      (reconstructedHandle.snapshot as ReturnType<typeof vi.fn>).mockResolvedValue(
+        reconstructedSnapshot,
+      );
+      const lazyResolver = vi.fn(async () => reconstructedHandle);
       const reconstructed = createSubAgentTransportControlDispatcher({
         control: createTrustedControl().control,
         taskId: 'task-reconstructed-parent',
@@ -939,7 +951,7 @@ describe('Subagent transport control dispatcher', () => {
             { taskId: 'task-reconstructed-parent' },
           ),
         ),
-      ).resolves.toEqual(successfulReply('task.snapshot', createTaskSnapshot()));
+      ).resolves.toEqual(successfulReply('task.snapshot', reconstructedSnapshot));
       expect(lazyResolver).toHaveBeenCalledWith({
         ownerSessionId: 'owner-session-1',
         parentTaskId: 'task-reconstructed-parent',
@@ -947,6 +959,155 @@ describe('Subagent transport control dispatcher', () => {
       });
     },
   );
+
+  it('evicts terminal nested handles and reconstructs them on a replacement channel', async () => {
+    const trusted = createTrustedControl();
+    const handles = new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+    const firstChannel = createSubAgentTransportControlDispatcher({
+      control: trusted.control,
+      taskId: TASK_ID,
+      ownerSessionId: 'owner-session-1',
+      taskHandles: handles,
+    });
+
+    await expect(
+      firstChannel.dispatch(
+        request('delegation.spawn', createMethodFixtures()['delegation.spawn'].args),
+      ),
+    ).resolves.toEqual(successfulReply('delegation.spawn', { taskId: CHILD_TASK_ID }));
+    expect(handles.diagnostics()).toMatchObject({ entries: 1, resolvedHandles: 0 });
+    await expect(
+      firstChannel.dispatch(request('task.wait', { taskId: CHILD_TASK_ID })),
+    ).resolves.toEqual(successfulReply('task.wait', createOutcome()));
+    expect(handles.diagnostics()).toEqual({
+      entries: 0,
+      resolvedHandles: 0,
+      pendingResolutions: 0,
+      activeOperations: 0,
+      activeSubscribers: 0,
+    });
+
+    const reconstructed = createHandle();
+    (reconstructed.snapshot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...createTaskSnapshot(),
+      state: 'succeeded',
+      completedAt: 2_500,
+    });
+    const authoritativeResolver = vi.fn(async () => reconstructed);
+    const replacementChannel = createSubAgentTransportControlDispatcher({
+      control: createTrustedControl().control,
+      taskId: TASK_ID,
+      ownerSessionId: 'owner-session-1',
+      taskHandles: handles,
+      resolveTaskHandle: authoritativeResolver,
+    });
+    await expect(
+      replacementChannel.dispatch(request('task.snapshot', { taskId: CHILD_TASK_ID })),
+    ).resolves.toMatchObject({
+      method: 'task.snapshot',
+      ok: true,
+      result: { taskId: CHILD_TASK_ID, state: 'succeeded' },
+    });
+    expect(authoritativeResolver).toHaveBeenCalledWith({
+      ownerSessionId: 'owner-session-1',
+      parentTaskId: TASK_ID,
+      taskId: CHILD_TASK_ID,
+    });
+    expect(handles.diagnostics()).toEqual({
+      entries: 0,
+      resolvedHandles: 0,
+      pendingResolutions: 0,
+      activeOperations: 0,
+      activeSubscribers: 0,
+    });
+  });
+
+  it('rejects a sibling-parent handle from the authoritative resolver before using it', async () => {
+    const fixtures = createMethodFixtures();
+    const operations = [
+      { method: 'task.snapshot' as const, args: fixtures['task.snapshot'].args },
+      { method: 'task.wait' as const, args: fixtures['task.wait'].args },
+      { method: 'task.cancel' as const, args: fixtures['task.cancel'].args },
+    ];
+
+    for (const { method, args } of operations) {
+      const sibling = createHandle();
+      (sibling.snapshot as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...createTaskSnapshot(),
+        parentTaskId: 'task-sibling-parent',
+        path: ['task-sibling-parent', CHILD_TASK_ID],
+      });
+      const resolver = vi.fn(async () => sibling);
+      const handles = new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+      const dispatcher = createSubAgentTransportControlDispatcher({
+        control: createTrustedControl().control,
+        taskId: TASK_ID,
+        ownerSessionId: 'owner-session-1',
+        taskHandles: handles,
+        resolveTaskHandle: resolver,
+      });
+
+      await expect(dispatcher.dispatch(request(method, args))).resolves.toEqual({
+        method,
+        ok: false,
+        error: {
+          code: 'RESOURCE_NOT_FOUND',
+          message: 'The requested resource was not found.',
+          retryable: false,
+        },
+      });
+      expect(resolver).toHaveBeenCalledWith({
+        ownerSessionId: 'owner-session-1',
+        parentTaskId: TASK_ID,
+        taskId: CHILD_TASK_ID,
+      });
+      expect(sibling.snapshot).toHaveBeenCalledOnce();
+      expect(sibling.wait).not.toHaveBeenCalled();
+      expect(sibling.cancel).not.toHaveBeenCalled();
+      expect(handles.diagnostics()).toEqual({
+        entries: 0,
+        resolvedHandles: 0,
+        pendingResolutions: 0,
+        activeOperations: 0,
+        activeSubscribers: 0,
+      });
+    }
+  });
+
+  it('returns 10,000 unknown authoritative handle lookups to the registry baseline', async () => {
+    const handles = new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+    const resolver = vi.fn(() => null);
+    const dispatcher = createSubAgentTransportControlDispatcher({
+      control: createTrustedControl().control,
+      taskId: TASK_ID,
+      ownerSessionId: 'owner-session-1',
+      taskHandles: handles,
+      resolveTaskHandle: resolver,
+    });
+    const methods = ['task.snapshot', 'task.wait', 'task.cancel'] as const;
+
+    for (let index = 0; index < 10_000; index += 1) {
+      const method = methods[index % methods.length] as (typeof methods)[number];
+      const taskId = `unknown-child-${index}`;
+      const args =
+        method === 'task.cancel' ? { taskId, reason: 'must not reach a raw handle' } : { taskId };
+      const reply = await dispatcher.dispatch(request(method, args));
+      expect(reply).toMatchObject({
+        method,
+        ok: false,
+        error: { code: 'RESOURCE_NOT_FOUND', retryable: false },
+      });
+    }
+
+    expect(resolver).toHaveBeenCalledTimes(10_000);
+    expect(handles.diagnostics()).toEqual({
+      entries: 0,
+      resolvedHandles: 0,
+      pendingResolutions: 0,
+      activeOperations: 0,
+      activeSubscribers: 0,
+    });
+  }, 30_000);
 
   it('maps trusted exceptions to closed safe replies without raw error details', async () => {
     const trusted = createTrustedControl();

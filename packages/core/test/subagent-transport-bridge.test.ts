@@ -8,6 +8,7 @@ import {
   createSubAgentTransportTargetBridge,
   type SubAgentTransportModelRequestContext,
   type SubAgentTransportModelRequestHandler,
+  type SubAgentTransportTargetCatalog,
 } from '../src/subagent/transport-bridge';
 import type { SubAgentChildCheckpoint } from '../src/subagent/checkpoint';
 import type { SubAgentChildRunRequest, SubAgentChildRunner } from '../src/subagent/child-runner';
@@ -19,7 +20,7 @@ import type {
   SubAgentExecutionRequest,
   SubAgentExecutorBinding,
 } from '../src/subagent/executor';
-import type { JsonValue } from '../src/subagent/json';
+import { canonicalJsonSha256, type JsonValue } from '../src/subagent/json';
 import { DEFAULT_SUBAGENT_LIMITS } from '../src/subagent/limits';
 import {
   SubAgentTransportPeer,
@@ -33,6 +34,7 @@ import type { SubAgentTransportRpcPayloadMap } from '../src/subagent/transport-r
 import { createSubAgentExecutionRequestWire } from '../src/subagent/transport-codec';
 import { SubAgentTargetRunnerRegistry } from '../src/subagent/target-runner-registry';
 import type { SubAgentExecutionOutcome } from '../src/subagent/result';
+import type { SubAgentTaskHandle } from '../src/subagent/runtime';
 import type { SubAgentTaskEvent } from '../src/subagent/telemetry';
 
 const NOW = 1_000;
@@ -190,6 +192,99 @@ function taskEvent(request: SubAgentExecutionRequest, sequence: number): SubAgen
   });
 }
 
+function createDelegatingRequest(
+  overrides: Partial<SubAgentExecutionRequest> = {},
+): SubAgentExecutionRequest {
+  const request = createRequest(overrides);
+  return Object.freeze({
+    ...request,
+    delegation: Object.freeze({
+      ...request.delegation,
+      definitions: Object.freeze([
+        Object.freeze({
+          name: definition.name,
+          version: definition.version,
+          executors: Object.freeze([descriptor.name]),
+        }),
+      ]),
+    }),
+  });
+}
+
+function createNestedCatalog(): SubAgentTransportTargetCatalog {
+  const executor = Object.freeze({ ...descriptor, status: 'available' as const });
+  return Object.freeze({
+    catalog: Object.freeze({
+      revision: 1,
+      capturedAt: NOW,
+      executors: Object.freeze([
+        Object.freeze({
+          descriptor,
+          status: 'available' as const,
+          supportedDefinitions: Object.freeze([
+            Object.freeze({ name: definition.name, version: definition.version }),
+          ]),
+        }),
+      ]),
+    }),
+    catalogEntries: Object.freeze([
+      Object.freeze({
+        definition: Object.freeze({ name: definition.name, version: definition.version }),
+        description: definition.description,
+        inputSchema: definition.inputSchema,
+        executors: Object.freeze([executor]),
+      }),
+    ]),
+  });
+}
+
+function createNestedHostHandle(
+  parent: SubAgentExecutionRequest,
+  taskId = `nested-${parent.taskId}`,
+): SubAgentTaskHandle {
+  const snapshot = Object.freeze({
+    taskId,
+    subAgent: Object.freeze({ name: definition.name, version: definition.version }),
+    ownerSessionId: parent.ownerSessionId,
+    runId: parent.runId,
+    subagentSessionId: `session-${taskId}`,
+    parentTaskId: parent.taskId,
+    path: Object.freeze([...parent.path, taskId]),
+    executor: descriptor.name,
+    state: 'running' as const,
+    revision: 1,
+    attempt: 1,
+    createdAt: NOW,
+    updatedAt: NOW,
+    startedAt: NOW,
+    recoveryRequired: false,
+  });
+  const outcome: SubAgentExecutionOutcome = Object.freeze({
+    type: 'terminal',
+    result: Object.freeze({
+      status: 'succeeded',
+      task: Object.freeze({ taskId, subAgent: snapshot.subAgent }),
+      executor: descriptor.name,
+      output: Object.freeze({ answer: 'nested-done' }),
+    }),
+  });
+  return Object.freeze({
+    taskId,
+    snapshot: vi.fn(async () => snapshot),
+    wait: vi.fn(async () => outcome),
+    cancel: vi.fn(async () =>
+      Object.freeze({
+        ...snapshot,
+        state: 'cancelled' as const,
+        revision: 2,
+        updatedAt: NOW + 1,
+        completedAt: NOW + 1,
+      }),
+    ),
+    events: () => emptyEvents(),
+  });
+}
+
 function childCheckpoint(): SubAgentChildCheckpoint {
   return Object.freeze({
     version: '1',
@@ -221,6 +316,39 @@ function childCheckpoint(): SubAgentChildCheckpoint {
     }),
     modelIteration: 0,
     maxIterations: 8,
+  });
+}
+
+function approvalCheckpoint(approvalId: string): SubAgentChildCheckpoint {
+  const checkpoint = childCheckpoint();
+  const input = Object.freeze({});
+  return Object.freeze({
+    ...checkpoint,
+    pendingBatch: Object.freeze({
+      version: '1' as const,
+      batchId: 'outer-approval-batch-1',
+      assistantMessage: Object.freeze({
+        protocol: 'openai-chat',
+        codecVersion: '1',
+        value: Object.freeze([]),
+      }),
+      calls: Object.freeze([
+        Object.freeze({
+          version: '1' as const,
+          operationId: 'outer-sensitive-operation-1',
+          kind: 'tool' as const,
+          callId: 'outer-sensitive-call',
+          name: 'outer-sensitive-tool',
+          input,
+          inputHash: canonicalJsonSha256(input),
+          status: 'waiting_approval' as const,
+          order: 0,
+          approvals: Object.freeze([approvalId]),
+        }),
+      ]),
+      endRequested: false,
+      createdAt: NOW,
+    }),
   });
 }
 
@@ -275,6 +403,13 @@ function createControl() {
   const commitCheckpoint = vi.fn(async () => undefined);
   const reportProgress = vi.fn(async () => undefined);
   const consumeBudget = vi.fn(async () => undefined);
+  const authorizeTool = vi.fn(async () => {
+    throw new Error('not used');
+  });
+  const pauseDelegation = vi.fn(async () => {
+    throw new Error('not used');
+  });
+  const emit = vi.fn(async () => undefined);
   const submitResult = vi.fn(async () => ({
     schemaVersion: '1' as const,
     receiptId: 'result-receipt-1',
@@ -294,6 +429,9 @@ function createControl() {
     completedAt: NOW,
     status: 'completed' as const,
   }));
+  const fail = vi.fn(async () => {
+    throw new Error('not used');
+  });
   const control: SubAgentExecutionControl = {
     signal: new AbortController().signal,
     deadlineAt: NOW + 120_000,
@@ -319,21 +457,15 @@ function createControl() {
     completion: {
       submitResult,
       complete,
-      fail: async () => {
-        throw new Error('not used');
-      },
+      fail,
     },
     commitBinding,
     commitCheckpoint,
-    authorizeTool: async () => {
-      throw new Error('not used');
-    },
-    pauseDelegation: async () => {
-      throw new Error('not used');
-    },
+    authorizeTool,
+    pauseDelegation,
     reportProgress,
     consumeBudget,
-    emit: async () => undefined,
+    emit,
   };
   return {
     control,
@@ -341,8 +473,12 @@ function createControl() {
     commitCheckpoint,
     reportProgress,
     consumeBudget,
+    authorizeTool,
+    pauseDelegation,
+    emit,
     submitResult,
     complete,
+    fail,
   };
 }
 
@@ -362,6 +498,12 @@ interface LoopbackOptions {
   readonly validateBinding?: Parameters<
     typeof createSubAgentTransportTargetBridge
   >[0]['validateBinding'];
+  readonly resolveCatalog?: Parameters<
+    typeof createSubAgentTransportTargetBridge
+  >[0]['resolveCatalog'];
+  readonly resolveNestedTaskHandle?: Parameters<
+    typeof createSubAgentTransportExecutorBridge
+  >[0]['resolveNestedTaskHandle'];
   readonly maxRetainedTasks?: number;
   readonly maxRetainedOperations?: number;
 }
@@ -410,6 +552,9 @@ function createLoopback(options: LoopbackOptions) {
     now: options.now ?? (() => NOW),
     createOperationId: ({ kind, sequence }) => `controller-${kind}-${sequence}`,
     ...(options.model === undefined ? {} : { model: options.model }),
+    ...(options.resolveNestedTaskHandle === undefined
+      ? {}
+      : { resolveNestedTaskHandle: options.resolveNestedTaskHandle }),
   });
   const target = createSubAgentTransportTargetBridge({
     ownerSessionId: 'owner-session-1',
@@ -419,6 +564,7 @@ function createLoopback(options: LoopbackOptions) {
     peer: () => requirePeer('target'),
     createBinding: ({ request }) => targetCreateBinding(request),
     ...(options.validateBinding === undefined ? {} : { validateBinding: options.validateBinding }),
+    ...(options.resolveCatalog === undefined ? {} : { resolveCatalog: options.resolveCatalog }),
     now: options.now ?? (() => NOW),
     createOperationId: ({ kind, sequence }) => `target-${kind}-${sequence}`,
     maxEventPageSize: descriptor.maxEventPageSize,
@@ -552,6 +698,39 @@ describe('Subagent transport controller/target bridge', () => {
     expect(fixtures.consumeBudget).not.toHaveBeenCalled();
     expect(fixtures.submitResult).not.toHaveBeenCalled();
     expect(fixtures.complete).not.toHaveBeenCalled();
+    expect(model).not.toHaveBeenCalled();
+  });
+
+  it('validates delegated catalog and control scope before binding or runner factories', async () => {
+    const run = vi.fn(async (request: SubAgentChildRunRequest) => terminalOutcome(request));
+    const model = vi.fn<SubAgentTransportModelRequestHandler>();
+    const fixtures = createControl();
+    const loopback = createLoopback({
+      run,
+      model,
+      resolveCatalog: () =>
+        ({
+          catalog: { revision: 1, capturedAt: NOW, executors: null },
+          catalogEntries: [],
+        }) as unknown as SubAgentTransportTargetCatalog,
+    });
+
+    await expect(
+      loopback.controller.execute(createRequest(), fixtures.control),
+    ).rejects.toMatchObject({ code: 'INTERNAL_ERROR' });
+    expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
+    expect(loopback.factory).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(fixtures.commitBinding).not.toHaveBeenCalled();
+    expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+    expect(fixtures.authorizeTool).not.toHaveBeenCalled();
+    expect(fixtures.pauseDelegation).not.toHaveBeenCalled();
+    expect(fixtures.reportProgress).not.toHaveBeenCalled();
+    expect(fixtures.consumeBudget).not.toHaveBeenCalled();
+    expect(fixtures.emit).not.toHaveBeenCalled();
+    expect(fixtures.submitResult).not.toHaveBeenCalled();
+    expect(fixtures.complete).not.toHaveBeenCalled();
+    expect(fixtures.fail).not.toHaveBeenCalled();
     expect(model).not.toHaveBeenCalled();
   });
 
@@ -739,6 +918,239 @@ describe('Subagent transport controller/target bridge', () => {
     });
     await vi.waitFor(() => expect(loopback.target.diagnostics().running).toBe(0));
     expect(loopback.factory).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases an unobserved nested handle when its parent reaches a terminal outcome', async () => {
+    const request = createDelegatingRequest();
+    const nested = createNestedHostHandle(request);
+    const fixtures = createControl();
+    const spawn = vi.fn(async () => nested);
+    const control: SubAgentExecutionControl = Object.freeze({
+      ...fixtures.control,
+      delegation: Object.freeze({ ...fixtures.control.delegation, spawn }),
+    });
+    const loopback = createLoopback({
+      resolveCatalog: () => createNestedCatalog(),
+      run: async (_child, remoteControl) => {
+        await remoteControl.delegation.spawn({
+          requestId: 'nested-unobserved-spawn',
+          subAgent: definition.name,
+          executor: descriptor.name,
+          input: { query: 'nested work' },
+        });
+        return terminalOutcome(request);
+      },
+    });
+
+    await expect(loopback.controller.execute(request, control)).resolves.toEqual(
+      terminalOutcome(request),
+    );
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(nested.wait).not.toHaveBeenCalled();
+    expect(loopback.controller.diagnostics()).toEqual({
+      activeExecutions: 0,
+      taskHandles: 0,
+      handleBindings: 0,
+      nestedTaskHandles: 0,
+    });
+  });
+
+  it('releases an unobserved nested handle after a spawned parent settles in the background', async () => {
+    const request = createDelegatingRequest();
+    const nested = createNestedHostHandle(request);
+    const fixtures = createControl();
+    const control: SubAgentExecutionControl = Object.freeze({
+      ...fixtures.control,
+      delegation: Object.freeze({
+        ...fixtures.control.delegation,
+        spawn: vi.fn(async () => nested),
+      }),
+    });
+    const loopback = createLoopback({
+      resolveCatalog: () => createNestedCatalog(),
+      run: async (_child, remoteControl) => {
+        await remoteControl.delegation.spawn({
+          requestId: 'nested-unobserved-background-spawn',
+          subAgent: definition.name,
+          executor: descriptor.name,
+          input: { query: 'nested background work' },
+        });
+        return terminalOutcome(request);
+      },
+    });
+
+    const parent = await loopback.controller.spawn(request, control);
+    if (!('taskId' in parent)) throw new Error('Expected a spawned parent handle.');
+    await expect(parent.wait()).resolves.toEqual(terminalOutcome(request));
+    await vi.waitFor(() =>
+      expect(loopback.controller.diagnostics()).toEqual({
+        activeExecutions: 0,
+        taskHandles: 0,
+        handleBindings: 0,
+        nestedTaskHandles: 0,
+      }),
+    );
+    expect(nested.wait).not.toHaveBeenCalled();
+  });
+
+  it('keeps a paused parent nested handle through approval resume, then evicts it on child wait', async () => {
+    let currentNow = NOW;
+    const request = createDelegatingRequest({
+      limits: Object.freeze({ ...DEFAULT_SUBAGENT_LIMITS, timeoutMs: 60_000 }),
+      deadlineAt: currentNow + 60_000,
+    });
+    const nested = createNestedHostHandle(request);
+    const firstFixtures = createControl();
+    const spawn = vi.fn(async () => nested);
+    const firstControl: SubAgentExecutionControl = Object.freeze({
+      ...firstFixtures.control,
+      delegation: Object.freeze({ ...firstFixtures.control.delegation, spawn }),
+    });
+    let nestedTaskId: string | undefined;
+    const approval = Object.freeze({
+      approvalId: 'outer-approval-1',
+      ownerSessionId: request.ownerSessionId,
+      taskId: request.taskId,
+      callId: 'outer-sensitive-call',
+      toolName: 'outer-sensitive-tool',
+      summary: 'Approve the outer child continuation.',
+      createdAt: NOW,
+      revision: 1,
+    });
+    const loopback = createLoopback({
+      now: () => currentNow,
+      resolveCatalog: () => createNestedCatalog(),
+      run: async (child, remoteControl) => {
+        if (child.attempt === 1) {
+          const handle = await remoteControl.delegation.spawn({
+            requestId: 'nested-before-approval',
+            subAgent: definition.name,
+            executor: descriptor.name,
+            input: { query: 'continue after approval' },
+          });
+          nestedTaskId = handle.taskId;
+          return Object.freeze({
+            type: 'paused' as const,
+            reason: 'approval' as const,
+            task: Object.freeze({ taskId: child.taskId, subAgent: child.definition }),
+            approvals: Object.freeze([approval]),
+            checkpointRevision: 1,
+          });
+        }
+        if (nestedTaskId === undefined) throw new Error('The nested task was not spawned.');
+        const resumed = await remoteControl.delegation.resumeTool(nestedTaskId);
+        await resumed.wait();
+        return terminalOutcome(request);
+      },
+    });
+
+    const paused = await loopback.controller.execute(request, firstControl);
+    expect(paused).toMatchObject({ type: 'paused', reason: 'approval' });
+    expect(loopback.controller.diagnostics()).toEqual({
+      activeExecutions: 0,
+      taskHandles: 0,
+      handleBindings: 0,
+      nestedTaskHandles: 1,
+    });
+
+    const resumeTool = vi.fn(async () => nested);
+    const resumeFixtures = createControl();
+    const resumeControl: SubAgentExecutionControl = Object.freeze({
+      ...resumeFixtures.control,
+      delegation: Object.freeze({ ...resumeFixtures.control.delegation, resumeTool }),
+    });
+    currentNow += 30_000;
+    const resume = createDelegatingRequest({
+      operation: Object.freeze({
+        type: 'resume',
+        operationId: 'outer-approval-resume-1',
+        reason: 'approval',
+        binding: createBinding(request),
+        checkpoint: approvalCheckpoint(approval.approvalId),
+        approvals: Object.freeze([
+          Object.freeze({
+            approvalId: approval.approvalId,
+            decision: 'approved' as const,
+            expectedRevision: approval.revision,
+          }),
+        ]),
+      }),
+      attempt: 2,
+      executionEpoch: 'epoch-2',
+      executionFencingToken: '2',
+      delegation: Object.freeze({
+        ...request.delegation,
+        catalogRevision: request.delegation.catalogRevision + 1,
+      }),
+      limits: Object.freeze({ ...request.limits, timeoutMs: 50_000 }),
+      deadlineAt: currentNow + 50_000,
+    });
+
+    await expect(loopback.controller.execute(resume, resumeControl)).resolves.toEqual(
+      terminalOutcome(request),
+    );
+    expect(resumeTool).toHaveBeenCalledWith(nested.taskId);
+    expect(nested.wait).toHaveBeenCalledOnce();
+    expect(resume.deadlineAt).toBeGreaterThan(request.deadlineAt);
+    expect(resume.delegation.catalogRevision).toBeGreaterThan(request.delegation.catalogRevision);
+    expect(loopback.controller.diagnostics()).toEqual({
+      activeExecutions: 0,
+      taskHandles: 0,
+      handleBindings: 0,
+      nestedTaskHandles: 0,
+    });
+  });
+
+  it('rejects resume timeout expansion and stale business scope before replacing a resident', async () => {
+    const created = createRequest();
+    const loopback = createLoopback({ run: async () => terminalOutcome(created) });
+    await expect(loopback.controller.execute(created, createControl().control)).resolves.toEqual(
+      terminalOutcome(created),
+    );
+
+    const invalidResumes = [
+      createRequest({
+        operation: {
+          type: 'resume',
+          operationId: 'resume-expanded-timeout',
+          reason: 'checkpoint',
+          binding: createBinding(created),
+          checkpoint: childCheckpoint(),
+        },
+        attempt: 2,
+        executionEpoch: 'epoch-expanded-timeout',
+        executionFencingToken: '2',
+        limits: Object.freeze({
+          ...created.limits,
+          timeoutMs: created.limits.timeoutMs + 1,
+        }),
+        deadlineAt: created.deadlineAt + 1,
+      }),
+      createRequest({
+        operation: {
+          type: 'resume',
+          operationId: 'resume-stale-delegation-scope',
+          reason: 'checkpoint',
+          binding: createBinding(created),
+          checkpoint: childCheckpoint(),
+        },
+        attempt: 2,
+        executionEpoch: 'epoch-stale-delegation',
+        executionFencingToken: '2',
+        retryOf: 'different-retry-lineage',
+        delegation: Object.freeze({
+          ...created.delegation,
+          catalogRevision: created.delegation.catalogRevision + 1,
+        }),
+      }),
+    ];
+
+    for (const resume of invalidResumes) {
+      await expect(
+        loopback.controller.execute(resume, createControl().control),
+      ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+    }
+    expect(loopback.factory).toHaveBeenCalledOnce();
   });
 
   it('evicts process-local handle state when an accepted spawn loses its settlement channel', async () => {
@@ -1141,6 +1553,75 @@ describe('Subagent transport controller/target bridge', () => {
 
     release();
     await expect(handle.wait()).resolves.toEqual(terminalOutcome(created));
+  });
+
+  it('uses a distinct control signal to abort the controller-side execution exchange', async () => {
+    const requestAbort = new AbortController();
+    const controlAbort = new AbortController();
+    let markStarted!: () => void;
+    let markTargetAborted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const targetAborted = new Promise<void>((resolve) => {
+      markTargetAborted = resolve;
+    });
+    const request = createRequest({ signal: requestAbort.signal });
+    const loopback = createLoopback({
+      run: async (childRequest) => {
+        markStarted();
+        await new Promise<void>((resolve) => {
+          const onAbort = (): void => {
+            markTargetAborted();
+            resolve();
+          };
+          if (childRequest.signal.aborted) onAbort();
+          else childRequest.signal.addEventListener('abort', onAbort, { once: true });
+        });
+        return terminalOutcome(request, 'cancelled');
+      },
+    });
+    const fixtures = createControl();
+    const control: SubAgentExecutionControl = {
+      ...fixtures.control,
+      signal: controlAbort.signal,
+    };
+
+    const execution = loopback.controller.execute(request, control);
+    await started;
+    controlAbort.abort(new Error('distinct control scope cancelled'));
+
+    await expect(execution).rejects.toMatchObject({
+      reason: 'aborted',
+      descriptor: { code: 'CANCELLED', causeCode: 'TRANSPORT_REQUEST_ABORTED' },
+    });
+    expect(requestAbort.signal.aborted).toBe(false);
+    expect(loopback.controller.diagnostics()).toMatchObject({ activeExecutions: 0 });
+
+    await loopback.target.dispose();
+    await targetAborted;
+  });
+
+  it('serializes the earliest control deadline into the target execution scope', async () => {
+    const request = createRequest({ deadlineAt: NOW + 120_000 });
+    const fixtures = createControl();
+    const control: SubAgentExecutionControl = {
+      ...fixtures.control,
+      deadlineAt: NOW + 40_000,
+    };
+    const run = vi.fn(
+      async (childRequest: SubAgentChildRunRequest, childControl: SubAgentExecutionControl) => {
+        expect(childRequest.deadlineAt).toBe(NOW + 40_000);
+        expect(childControl.deadlineAt).toBe(NOW + 40_000);
+        return terminalOutcome(childRequest);
+      },
+    );
+    const loopback = createLoopback({ run });
+
+    await expect(loopback.controller.execute(request, control)).resolves.toEqual(
+      terminalOutcome(request),
+    );
+    expect(run).toHaveBeenCalledTimes(1);
   });
 
   acceptanceIt(

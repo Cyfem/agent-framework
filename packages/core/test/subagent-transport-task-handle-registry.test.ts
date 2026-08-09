@@ -182,6 +182,44 @@ describe('SubAgentTransportTaskHandleRegistry', () => {
     await expect(wrongFacade.snapshot()).rejects.toMatchObject({ code: 'RESOURCE_NOT_FOUND' });
   });
 
+  it('requires exact parent scope for Core snapshots, cancellations, and events', async () => {
+    const scope = { ...SCOPE, parentTaskId: 'parent-task-1' };
+    const siblingSnapshot = createHostSnapshot({
+      parentTaskId: 'parent-task-2',
+      path: ['parent-task-2', SCOPE.taskId],
+    });
+
+    const snapshotRegistry = new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+    const snapshotFacade = rememberSubAgentTaskHandle(snapshotRegistry, {
+      ...scope,
+      resolver: () => createHostHandle({ snapshot: async () => siblingSnapshot }),
+    });
+    await expect(snapshotFacade.snapshot()).rejects.toMatchObject({ code: 'RESOURCE_NOT_FOUND' });
+
+    const cancelRegistry = new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+    const cancelFacade = rememberSubAgentTaskHandle(cancelRegistry, {
+      ...scope,
+      resolver: () => createHostHandle({ cancel: async () => siblingSnapshot }),
+    });
+    await expect(cancelFacade.cancel()).rejects.toMatchObject({ code: 'RESOURCE_NOT_FOUND' });
+
+    const eventRegistry = new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+    const eventFacade = rememberSubAgentTaskHandle(eventRegistry, {
+      ...scope,
+      resolver: () =>
+        createHostHandle({
+          events: () =>
+            oneThenPending(async () => ({ done: true, value: undefined }), {
+              ...createTaskEvent(),
+              parentTaskId: 'parent-task-2',
+            }),
+        }),
+    });
+    await expect(eventFacade.events()[Symbol.asyncIterator]().next()).rejects.toMatchObject({
+      code: 'RESOURCE_NOT_FOUND',
+    });
+  });
+
   it('returns closed owned projections when raw operations add handle wrappers', async () => {
     const snapshot = createHostSnapshot();
     const outcome = createTerminalOutcome();
@@ -279,6 +317,97 @@ describe('SubAgentTransportTaskHandleRegistry', () => {
         }),
     });
     await facade.snapshot();
+    expect(registry.diagnostics()).toEqual(zeroDiagnostics());
+  });
+
+  it('evicts resolved Core handles after terminal wait, snapshot, and cancellation results', async () => {
+    const operations = [
+      {
+        name: 'wait',
+        invoke: (handle: SubAgentTaskHandle) => handle.wait(),
+        raw: createHostHandle(),
+      },
+      {
+        name: 'snapshot',
+        invoke: (handle: SubAgentTaskHandle) => handle.snapshot(),
+        raw: createHostHandle({
+          snapshot: async () => createHostSnapshot({ state: 'succeeded', completedAt: 2 }),
+        }),
+      },
+      {
+        name: 'cancel',
+        invoke: (handle: SubAgentTaskHandle) => handle.cancel('terminal cleanup'),
+        raw: createHostHandle(),
+      },
+    ] as const;
+
+    for (const operation of operations) {
+      const registry = new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+      registry.remember({ ...SCOPE, resolver: () => operation.raw });
+      await operation.invoke(resolveSubAgentTaskHandle(registry, SCOPE));
+      expect(registry.diagnostics(), operation.name).toEqual(zeroDiagnostics());
+    }
+  });
+
+  it('forgets only one owner and parent scope after active operations become idle', async () => {
+    const registry = new SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>();
+    const parentScope = {
+      ownerSessionId: SCOPE.ownerSessionId,
+      parentTaskId: 'parent-task-1',
+      taskId: 'child-task-1',
+    };
+    const siblingParentScope = { ...parentScope, parentTaskId: 'parent-task-2' };
+    const foreignOwnerScope = { ...parentScope, ownerSessionId: 'owner-session-2' };
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const active = rememberSubAgentTaskHandle(registry, {
+      ...parentScope,
+      resolver: () =>
+        createHostHandle({
+          taskId: parentScope.taskId,
+          snapshot: async () => {
+            await barrier;
+            return createHostSnapshot({
+              taskId: parentScope.taskId,
+              ownerSessionId: parentScope.ownerSessionId,
+              parentTaskId: parentScope.parentTaskId,
+              path: [parentScope.parentTaskId, parentScope.taskId],
+            });
+          },
+        }),
+    });
+    registry.remember({
+      ...siblingParentScope,
+      resolver: () => createHostHandle({ taskId: siblingParentScope.taskId }),
+    });
+    registry.remember({
+      ...foreignOwnerScope,
+      resolver: () =>
+        createHostHandle({
+          taskId: foreignOwnerScope.taskId,
+          ownerSessionId: foreignOwnerScope.ownerSessionId,
+        }),
+    });
+
+    const pending = active.snapshot();
+    await vi.waitFor(() => expect(registry.diagnostics().activeOperations).toBe(1));
+    expect(registry.forgetParentScope(parentScope.ownerSessionId, parentScope.parentTaskId)).toBe(
+      1,
+    );
+    expect(registry.diagnostics()).toMatchObject({ entries: 3, activeOperations: 1 });
+
+    release();
+    await pending;
+    expect(registry.diagnostics()).toMatchObject({ entries: 2, activeOperations: 0 });
+    expect(registry.has(siblingParentScope)).toBe(true);
+    expect(registry.has(foreignOwnerScope)).toBe(true);
+    expect(registry.forgetParentScope(parentScope.ownerSessionId, parentScope.parentTaskId)).toBe(
+      0,
+    );
+    registry.forget(siblingParentScope);
+    registry.forget(foreignOwnerScope);
     expect(registry.diagnostics()).toEqual(zeroDiagnostics());
   });
 

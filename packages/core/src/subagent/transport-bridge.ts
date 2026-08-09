@@ -187,6 +187,11 @@ interface ActiveControllerExecution {
   references: number;
 }
 
+interface BoundControllerExecution {
+  readonly request: SubAgentExecutionRequest;
+  readonly release: () => void;
+}
+
 /**
  * Controller-side placement-neutral Executor. The peer carries only wire data; the authoritative
  * control object remains in this process and is reachable solely through the reverse RPC handler.
@@ -259,14 +264,16 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<SubAgentExecutorOperationResult> {
-    const release = this.#bindControl(request, control);
+    const bound = this.#bindControl(request, control);
     try {
-      const exchange = this.#openExecutorRequest(request, 'execute');
+      const exchange = this.#openExecutorRequest(bound.request, 'execute');
       const response = await requireNext(exchange);
+      const outcome = readExecutorSettlement(response, 'execute');
+      this.#releaseTerminalNestedHandles(bound.request, outcome);
       await requireDone(exchange);
-      return readExecutorSettlement(response, 'execute');
+      return outcome;
     } finally {
-      release();
+      bound.release();
     }
   }
 
@@ -274,10 +281,10 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<ExecutorTaskHandle | SubAgentExecutorRecoveryRequired> {
-    const release = this.#bindControl(request, control);
+    const bound = this.#bindControl(request, control);
     let exchange: SubAgentTransportPeerExchange | undefined;
     try {
-      exchange = this.#openExecutorRequest(request, 'spawn');
+      exchange = this.#openExecutorRequest(bound.request, 'spawn');
       const first = await requireNext(exchange);
       if (first.envelope.kind === 'protocol.error') {
         await requireDone(exchange);
@@ -286,7 +293,7 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
       if (first.envelope.kind === 'executor.settled') {
         const outcome = readExecutorSettlement(first, 'spawn');
         await requireDone(exchange);
-        release();
+        bound.release();
         if (outcome.type !== 'recovery_required') {
           throw bridgeInternalError(
             'A spawn may settle before acceptance only when recovery is required.',
@@ -299,10 +306,10 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
       }
 
       const binding = first.envelope.payload.binding;
-      this.#assertBinding(binding, request);
+      this.#assertBinding(binding, bound.request);
       const scope = Object.freeze({
-        ownerSessionId: request.ownerSessionId,
-        taskId: request.taskId,
+        ownerSessionId: bound.request.ownerSessionId,
+        taskId: bound.request.taskId,
       });
       const handleScope = transportHandleScopeKey(scope);
       const bindingIdentity = canonicalizeJson(binding as unknown as JsonValue);
@@ -329,12 +336,12 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
           this.#handles.forget(scope);
           throw error;
         })
-        .finally(release);
+        .finally(bound.release);
       void background.catch(() => undefined);
       exchange = undefined;
       return facade;
     } catch (error) {
-      release();
+      bound.release();
       if (exchange !== undefined) await closeExchange(exchange);
       throw error;
     }
@@ -390,7 +397,10 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
     });
   }
 
-  #bindControl(request: SubAgentExecutionRequest, control: SubAgentExecutionControl): () => void {
+  #bindControl(
+    request: SubAgentExecutionRequest,
+    control: SubAgentExecutionControl,
+  ): BoundControllerExecution {
     const existing = this.#active.get(request.taskId);
     if (existing !== undefined) {
       if (existing.ownerSessionId !== request.ownerSessionId) throw createResourceNotFoundError();
@@ -430,8 +440,13 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
       references: 1,
     };
     this.#active.set(request.taskId, active);
+    const scopedRequest = Object.freeze({
+      ...request,
+      signal: scope.signal,
+      deadlineAt,
+    });
     let released = false;
-    return () => {
+    const release = (): void => {
       if (released) return;
       released = true;
       active.references -= 1;
@@ -443,6 +458,7 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
         this.#active.delete(request.taskId);
       }
     };
+    return Object.freeze({ request: scopedRequest, release });
   }
 
   async #consumeSpawnSettlement(
@@ -450,9 +466,20 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
     scope: Readonly<{ readonly ownerSessionId: string; readonly taskId: string }>,
   ): Promise<void> {
     const response = await requireNext(exchange);
-    await requireDone(exchange);
     const outcome = readExecutorSettlement(response, 'spawn');
-    if (outcome.type === 'terminal') this.#handles.markTerminal(scope);
+    if (outcome.type === 'terminal') {
+      this.#handles.markTerminal(scope);
+      this.#nestedTaskHandles.forgetParentScope(scope.ownerSessionId, scope.taskId);
+    }
+    await requireDone(exchange);
+  }
+
+  #releaseTerminalNestedHandles(
+    request: Pick<SubAgentExecutionRequest, 'ownerSessionId' | 'taskId'>,
+    outcome: SubAgentExecutorOperationResult,
+  ): void {
+    if (outcome.type !== 'terminal') return;
+    this.#nestedTaskHandles.forgetParentScope(request.ownerSessionId, request.taskId);
   }
 
   #createRawHandle(binding: SubAgentExecutorBinding): ExecutorTaskHandle {
@@ -1141,23 +1168,6 @@ export class SubAgentTransportTargetBridge {
           retryable: false,
         });
       }
-      const bindingCandidate =
-        request.operation.type === 'create'
-          ? await this.#createBinding({ request, runner: prepared.runner, modelBinding })
-          : request.operation.binding;
-      if (this.#disposed) throw createResourceNotFoundError();
-      const binding = ownedBinding(bindingCandidate);
-      this.#assertCreatedBinding(binding, request, prepared.runner, modelBinding);
-      await this.#validateBinding(Object.freeze({ request, binding }));
-      if (this.#disposed) throw createResourceNotFoundError();
-      const runner =
-        request.operation.type === 'resume' &&
-        request.operation.reason === 'approval' &&
-        resident !== undefined
-          ? resident.runner
-          : await prepared.create();
-      if (this.#disposed) throw createResourceNotFoundError();
-
       const catalog = this.#resolveCatalog(request);
       const control = createRemoteSubAgentExecutionControl({
         taskId: request.taskId,
@@ -1174,6 +1184,22 @@ export class SubAgentTransportTargetBridge {
           this.#nextControlOperation(request.taskId, method, identity),
         events: (taskId, eventOptions) => this.#remoteControllerEvents(taskId, eventOptions),
       });
+      const bindingCandidate =
+        request.operation.type === 'create'
+          ? await this.#createBinding({ request, runner: prepared.runner, modelBinding })
+          : request.operation.binding;
+      if (this.#disposed) throw createResourceNotFoundError();
+      const binding = ownedBinding(bindingCandidate);
+      this.#assertCreatedBinding(binding, request, prepared.runner, modelBinding);
+      await this.#validateBinding(Object.freeze({ request, binding }));
+      if (this.#disposed) throw createResourceNotFoundError();
+      const runner =
+        request.operation.type === 'resume' &&
+        request.operation.reason === 'approval' &&
+        resident !== undefined
+          ? resident.runner
+          : await prepared.create();
+      if (this.#disposed) throw createResourceNotFoundError();
       if (request.operation.type === 'create') {
         await control.commitBinding(request.operation.operationId, binding);
       }
@@ -1705,11 +1731,10 @@ function assertForwardResume(
     ...(previous.parentTaskId === undefined ? {} : { parentTaskId: previous.parentTaskId }),
     subagentSessionId: previous.subagentSessionId,
     path: previous.path,
+    ...(previous.retryOf === undefined ? {} : { retryOf: previous.retryOf }),
     definition: previous.definition,
     input: previous.input,
     projectedContext: previous.projectedContext,
-    delegation: previous.delegation,
-    limits: previous.limits,
   } as unknown as JsonValue;
   const currentStable = {
     ownerSessionId: current.ownerSessionId,
@@ -1718,19 +1743,22 @@ function assertForwardResume(
     ...(current.parentTaskId === undefined ? {} : { parentTaskId: current.parentTaskId }),
     subagentSessionId: current.subagentSessionId,
     path: current.path,
+    ...(current.retryOf === undefined ? {} : { retryOf: current.retryOf }),
     definition: current.definition,
     input: current.input,
     projectedContext: current.projectedContext,
-    delegation: current.delegation,
-    limits: current.limits,
   } as unknown as JsonValue;
   if (
     canonicalizeJson(previousStable) !== canonicalizeJson(currentStable) ||
+    !sameTransportDelegationScope(previous.delegation, current.delegation) ||
+    !sameTransportStableLimits(previous.limits, current.limits) ||
     current.attempt <= previous.attempt ||
     current.executionEpoch === previous.executionEpoch ||
     parseExecutionFencingToken(current.executionFencingToken) <=
       parseExecutionFencingToken(previous.executionFencingToken) ||
-    current.deadlineAt > previous.deadlineAt
+    !Number.isSafeInteger(current.limits.timeoutMs) ||
+    current.limits.timeoutMs < 1 ||
+    current.limits.timeoutMs > previous.limits.timeoutMs
   ) {
     throw new SubAgentRuntimeError({
       code: 'BINDING_INVALID',
@@ -1738,6 +1766,37 @@ function assertForwardResume(
       retryable: false,
     });
   }
+}
+
+function sameTransportDelegationScope(
+  left: SubAgentExecutionRequest['delegation'],
+  right: SubAgentExecutionRequest['delegation'],
+): boolean {
+  return (
+    left.version === right.version &&
+    left.ownerSessionId === right.ownerSessionId &&
+    left.runId === right.runId &&
+    left.parentTaskId === right.parentTaskId &&
+    left.depth === right.depth &&
+    left.path.length === right.path.length &&
+    left.path.every((part, index) => part === right.path[index])
+  );
+}
+
+function sameTransportStableLimits(
+  left: SubAgentExecutionRequest['limits'],
+  right: SubAgentExecutionRequest['limits'],
+): boolean {
+  return (
+    left.maxDepth === right.maxDepth &&
+    left.maxDescendants === right.maxDescendants &&
+    left.maxConcurrent === right.maxConcurrent &&
+    left.maxTurns === right.maxTurns &&
+    left.maxProviderCalls === right.maxProviderCalls &&
+    left.maxInputTokens === right.maxInputTokens &&
+    left.maxOutputTokens === right.maxOutputTokens &&
+    left.maxCost === right.maxCost
+  );
 }
 
 function parseExecutionFencingToken(value: string): bigint {

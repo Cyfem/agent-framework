@@ -1,0 +1,46 @@
+{
+  "name": "@ruixutong.manee/maneeagent-executor-worker",
+  "version": "2.0.0",
+  "description": "Official worker_threads Subagent Executor for Manee Agent Framework.",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "pretest": "pnpm --filter @ruixutong.manee/maneeagent-framework build && pnpm run build",
+    "build": "vite build && tsc -p tsconfig.build.json && node ../../tooling/typescript/fix-declaration-specifiers.mjs dist",
+    "test": "vitest run",
+    "pretest:worker": "pnpm --filter @ruixutong.manee/maneeagent-framework build && pnpm run build && pnpm run build:test-worker-protocol",
+    "build:test-worker-protocol": "vite build --config vite.worker-test-build.config.ts",
+    "test:worker": "vitest run --config vitest.worker.config.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "prepublishOnly": "npm run typecheck && npm run lint && npm run build"
+  },
+  "peerDependencies": {
+    "@ruixutong.manee/maneeagent-framework": "^2.0.0"
+  },
+  "devDependencies": {
+    "@ruixutong.manee/maneeagent-framework": "workspace:^",
+    "zod": "^4.4.3"
+  }
+}

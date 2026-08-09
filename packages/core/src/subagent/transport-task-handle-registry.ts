@@ -353,6 +353,28 @@ export class SubAgentTransportTaskHandleRegistry<H extends { readonly taskId: st
     return this.forget(scope);
   }
 
+  /**
+   * Schedules every raw child capability owned by one parent execution for deferred eviction.
+   * Active operations, resolutions and event subscribers keep their entry until they settle.
+   */
+  forgetParentScope(ownerSessionId: string, parentTaskId: string): number {
+    if (!isIdentifier(ownerSessionId) || !isIdentifier(parentTaskId)) {
+      throw new TypeError(
+        'Task handle parent scope has an invalid owner session or parent task ID.',
+      );
+    }
+    const sessionEntries = this.#entries.get(ownerSessionId);
+    if (sessionEntries === undefined) return 0;
+    const matches = [...sessionEntries.values()].filter(
+      (entry) => entry.scope.parentTaskId === parentTaskId,
+    );
+    for (const entry of matches) {
+      entry.evictWhenIdle = true;
+      this.#evictIfIdle(entry);
+    }
+    return matches.length;
+  }
+
   diagnostics(): Readonly<SubAgentTransportTaskHandleRegistryDiagnostics> {
     let resolvedHandles = 0;
     let pendingResolutions = 0;
@@ -403,6 +425,11 @@ export class SubAgentTransportTaskHandleRegistry<H extends { readonly taskId: st
     entry.pending = pending;
     try {
       return await pending;
+    } catch (error) {
+      // A failed authoritative lookup must not leave an attacker-controlled task ID resident.
+      // Facades that retain their trusted resolver may register a fresh entry on a later channel.
+      entry.evictWhenIdle = true;
+      throw error;
     } finally {
       if (entry.pending === pending) entry.pending = undefined;
     }
@@ -588,7 +615,7 @@ export function resolveSubAgentTaskHandle(
   registry: SubAgentTransportTaskHandleRegistry<SubAgentTaskHandle>,
   scope: SubAgentTransportTaskHandleScope,
 ): SubAgentTaskHandle {
-  return registry.subAgentTaskHandle(scope, { evictTerminal: false });
+  return registry.subAgentTaskHandle(scope);
 }
 
 function projectExecutorSnapshot(
@@ -747,7 +774,11 @@ function assertHostSnapshotScope(
   snapshot: Awaited<ReturnType<SubAgentTaskHandle['snapshot']>>,
   scope: SubAgentTransportTaskHandleScope,
 ): void {
-  if (snapshot.taskId !== scope.taskId || snapshot.ownerSessionId !== scope.ownerSessionId) {
+  if (
+    snapshot.taskId !== scope.taskId ||
+    snapshot.ownerSessionId !== scope.ownerSessionId ||
+    (scope.parentTaskId !== undefined && snapshot.parentTaskId !== scope.parentTaskId)
+  ) {
     throw createResourceNotFoundError();
   }
 }
@@ -763,7 +794,11 @@ function assertOutcomeTaskScope(
 }
 
 function assertEventScope(event: SubAgentTaskEvent, scope: SubAgentTransportTaskHandleScope): void {
-  if (event.taskId !== scope.taskId || event.sessionId !== scope.ownerSessionId) {
+  if (
+    event.taskId !== scope.taskId ||
+    event.sessionId !== scope.ownerSessionId ||
+    (scope.parentTaskId !== undefined && event.parentTaskId !== scope.parentTaskId)
+  ) {
     throw createResourceNotFoundError();
   }
 }

@@ -1053,25 +1053,32 @@ describe('Subagent transport Model gateway', () => {
   });
 
   it('bounds an in-flight observer without changing authoritative state', async () => {
-    let injected = false;
-    const fixture = createFixture({
-      watchTimeoutMs: 5,
-      failpoint: (phase) => {
-        if (!injected && phase === 'after_in_flight_before_provider') {
-          injected = true;
-          throw new Error('controller-crash');
-        }
-      },
-    });
-    const payload = modelPayload();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    try {
+      let injected = false;
+      const fixture = createFixture({
+        watchTimeoutMs: 5,
+        failpoint: (phase) => {
+          if (!injected && phase === 'after_in_flight_before_provider') {
+            injected = true;
+            throw new Error('controller-crash');
+          }
+        },
+      });
+      const payload = modelPayload();
 
-    const first = await fixture.handler.handle(handleRequest(payload));
-    const observer = await fixture.handler.handle(handleRequest(payload));
+      const first = await fixture.handler.handle(handleRequest(payload));
+      const observer = fixture.handler.handle(handleRequest(payload));
+      await vi.advanceTimersByTimeAsync(5);
 
-    expect(first).toMatchObject({ ok: false, error: { outcomeUnknown: true } });
-    expect(observer).toMatchObject({ ok: false, error: { code: 'TIMED_OUT' } });
-    expect(fixture.store.snapshot()[0]?.phase).toBe('in_flight');
-    expect(fixture.model.requests).toHaveLength(0);
+      expect(first).toMatchObject({ ok: false, error: { outcomeUnknown: true } });
+      await expect(observer).resolves.toMatchObject({ ok: false, error: { code: 'TIMED_OUT' } });
+      expect(fixture.store.snapshot()[0]?.phase).toBe('in_flight');
+      expect(fixture.model.requests).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('classifies provider failure without exposing Error, provider body, metadata or raw response', async () => {

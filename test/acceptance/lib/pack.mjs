@@ -84,6 +84,11 @@ const RELEASE_PACKAGE_CONTRACTS = Object.freeze({
       '@ruixutong.manee/maneeagent-framework': '^2.0.0',
     }),
   }),
+  '@ruixutong.manee/maneeagent-executor-worker': Object.freeze({
+    peerDependencies: Object.freeze({
+      '@ruixutong.manee/maneeagent-framework': '^2.0.0',
+    }),
+  }),
 });
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDirectory, '..', '..', '..');
@@ -521,6 +526,65 @@ void localContractAssertions;
 localExecutorNamespace.__maneeMissingExport;
 `;
   }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-worker') {
+    return `import * as workerExecutorNamespace from '${packageName}';
+import {
+  WORKER_SUBAGENT_ADAPTER_STATE_VERSION,
+  WORKER_SUBAGENT_BINDING_KIND,
+  WorkerSubAgentExecutor,
+  decodeWorkerBinding,
+  serveWorkerSubAgentTarget,
+  workerSubAgentBindingCodec,
+  type ServeWorkerSubAgentTargetOptions,
+  type WorkerSubAgentBindingState,
+  type WorkerSubAgentExecutorDiagnostics,
+  type WorkerSubAgentExecutorOptions,
+  type WorkerSubAgentTargetRegistryContext,
+} from '${packageName}';
+
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type AssertFalse<T extends false> = T;
+type AssertTrue<T extends true> = T;
+type Equal<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+  (<Value>() => Value extends Right ? 1 : 2) ? true : false;
+type WorkerContractAssertions = [
+  AssertFalse<IsAny<typeof WorkerSubAgentExecutor>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof WorkerSubAgentExecutor>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof WorkerSubAgentExecutor>[0]>>,
+  AssertFalse<IsAny<WorkerSubAgentExecutorOptions>>,
+  AssertFalse<IsAny<WorkerSubAgentExecutorDiagnostics>>,
+  AssertFalse<IsAny<ServeWorkerSubAgentTargetOptions>>,
+  AssertFalse<IsAny<WorkerSubAgentTargetRegistryContext>>,
+  AssertFalse<IsAny<WorkerSubAgentBindingState>>,
+  AssertFalse<IsAny<typeof decodeWorkerBinding>>,
+  AssertFalse<IsAny<typeof serveWorkerSubAgentTarget>>,
+  AssertFalse<IsAny<typeof workerSubAgentBindingCodec>>,
+  AssertTrue<Equal<typeof WORKER_SUBAGENT_ADAPTER_STATE_VERSION, '1'>>,
+  AssertTrue<Equal<typeof WORKER_SUBAGENT_BINDING_KIND, 'maneeagent-worker/v1'>>,
+];
+
+const publicValues = [
+  WORKER_SUBAGENT_ADAPTER_STATE_VERSION,
+  WORKER_SUBAGENT_BINDING_KIND,
+  WorkerSubAgentExecutor,
+  decodeWorkerBinding,
+  serveWorkerSubAgentTarget,
+  workerSubAgentBindingCodec,
+] as const;
+declare const workerContractAssertions: WorkerContractAssertions;
+void publicValues;
+void workerContractAssertions;
+// @ts-expect-error The packed declaration surface must not degrade to any.
+workerExecutorNamespace.__maneeMissingExport;
+// @ts-expect-error The Worker channel wire is internal to the adapter.
+workerExecutorNamespace.decodeWorkerMessage;
+// @ts-expect-error The Worker channel version is not a package-root contract.
+workerExecutorNamespace.WORKER_SUBAGENT_CHANNEL_VERSION;
+// @ts-expect-error Worker test failpoints must never become public API.
+workerExecutorNamespace.workerFailpointForTest;
+`;
+  }
   return `import * as packageApi from '${packageName}';
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type AssertFalse<T extends false> = T;
@@ -675,6 +739,52 @@ void localContractAssertions;
 localExecutor.__maneeMissingExport;
 `;
   }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-worker') {
+    return `import workerExecutor = require('${packageName}');
+
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type AssertFalse<T extends false> = T;
+type AssertTrue<T extends true> = T;
+type Equal<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+  (<Value>() => Value extends Right ? 1 : 2) ? true : false;
+type WorkerContractAssertions = [
+  AssertFalse<IsAny<typeof workerExecutor.WorkerSubAgentExecutor>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof workerExecutor.WorkerSubAgentExecutor>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof workerExecutor.WorkerSubAgentExecutor>[0]>>,
+  AssertFalse<IsAny<workerExecutor.WorkerSubAgentExecutorOptions>>,
+  AssertFalse<IsAny<workerExecutor.WorkerSubAgentExecutorDiagnostics>>,
+  AssertFalse<IsAny<workerExecutor.ServeWorkerSubAgentTargetOptions>>,
+  AssertFalse<IsAny<workerExecutor.WorkerSubAgentTargetRegistryContext>>,
+  AssertFalse<IsAny<workerExecutor.WorkerSubAgentBindingState>>,
+  AssertFalse<IsAny<typeof workerExecutor.decodeWorkerBinding>>,
+  AssertFalse<IsAny<typeof workerExecutor.serveWorkerSubAgentTarget>>,
+  AssertFalse<IsAny<typeof workerExecutor.workerSubAgentBindingCodec>>,
+  AssertTrue<Equal<typeof workerExecutor.WORKER_SUBAGENT_ADAPTER_STATE_VERSION, '1'>>,
+  AssertTrue<Equal<typeof workerExecutor.WORKER_SUBAGENT_BINDING_KIND, 'maneeagent-worker/v1'>>,
+];
+
+const publicValues = [
+  workerExecutor.WORKER_SUBAGENT_ADAPTER_STATE_VERSION,
+  workerExecutor.WORKER_SUBAGENT_BINDING_KIND,
+  workerExecutor.WorkerSubAgentExecutor,
+  workerExecutor.decodeWorkerBinding,
+  workerExecutor.serveWorkerSubAgentTarget,
+  workerExecutor.workerSubAgentBindingCodec,
+] as const;
+declare const workerContractAssertions: WorkerContractAssertions;
+void publicValues;
+void workerContractAssertions;
+// @ts-expect-error The packed declaration surface must not degrade to any.
+workerExecutor.__maneeMissingExport;
+// @ts-expect-error The Worker channel wire is internal to the adapter.
+workerExecutor.decodeWorkerMessage;
+// @ts-expect-error The Worker channel version is not a package-root contract.
+workerExecutor.WORKER_SUBAGENT_CHANNEL_VERSION;
+// @ts-expect-error Worker test failpoints must never become public API.
+workerExecutor.workerFailpointForTest;
+`;
+  }
   return `import packageApi = require('${packageName}');
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type AssertFalse<T extends false> = T;
@@ -762,6 +872,31 @@ function expectType([value, name, expected]) {
   if (typeof value !== expected) throw new Error(\`${packageName} \${name} must be \${expected}\`);
 }
 for (const check of [${checks.join(', ')}]) expectType(check);
+`;
+  }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-worker') {
+    checks.push(
+      `[packageApi.WorkerSubAgentExecutor, 'WorkerSubAgentExecutor', 'function']`,
+      `[packageApi.decodeWorkerBinding, 'decodeWorkerBinding', 'function']`,
+      `[packageApi.serveWorkerSubAgentTarget, 'serveWorkerSubAgentTarget', 'function']`,
+      `[packageApi.workerSubAgentBindingCodec, 'workerSubAgentBindingCodec', 'object']`,
+    );
+    return `${load}
+function expectType([value, name, expected]) {
+  if (typeof value !== expected) throw new Error(\`${packageName} \${name} must be \${expected}\`);
+}
+for (const check of [${checks.join(', ')}]) expectType(check);
+if (packageApi.WORKER_SUBAGENT_ADAPTER_STATE_VERSION !== '1') {
+  throw new Error('${packageName} adapter state version must equal "1"');
+}
+if (packageApi.WORKER_SUBAGENT_BINDING_KIND !== 'maneeagent-worker/v1') {
+  throw new Error('${packageName} binding kind is invalid');
+}
+for (const name of ['decodeWorkerMessage', 'WORKER_SUBAGENT_CHANNEL_VERSION', 'workerFailpointForTest']) {
+  if (Object.prototype.hasOwnProperty.call(packageApi, name)) {
+    throw new Error(\`${packageName} must not expose internal root export \${name}\`);
+  }
+}
 `;
   }
   return `${load}
@@ -973,6 +1108,12 @@ function assertSafePackageFiles(fileList, packageName) {
     assert(
       !/\.(?:cts|mts|tsx?)$/iu.test(file) || /\.d\.(?:cts|mts|ts)$/iu.test(file),
       `${packageName} npm pack output leaks TypeScript source: ${file}`,
+    );
+  }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-worker') {
+    assert(
+      !fileList.some((file) => /(?:^|\/)(?:worker-executor-internals|.*failpoint)/iu.test(file)),
+      `${packageName} npm pack output must not publish test-only Worker hooks`,
     );
   }
   return files;
@@ -1201,7 +1342,7 @@ export async function validatePackageArtifact({
       await createPackageArtifact({
         packageDirectory: peerPackageDirectory,
         expectedPackageName:
-          expectedPackageName === '@ruixutong.manee/maneeagent-executor-local'
+          expectedPackageName !== '@ruixutong.manee/maneeagent-framework'
             ? '@ruixutong.manee/maneeagent-framework'
             : expectedPackageName,
         expectedVersion,

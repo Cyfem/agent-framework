@@ -1476,7 +1476,338 @@
       "phase": "phase-2",
       "requiredLayers": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"],
       "requiredVariants": ["worker-conformance", "worker-crash-recovery", "worker-ark-placement"],
-      "cases": []
+      "cases": [
+        {
+          "caseId": "C7-WORKER-01.l2.conformance",
+          "variant": "worker-thread",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-executor.test.ts",
+            "testName": "[acceptance:C7-WORKER-01.l2.conformance][variant:worker-thread]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-02.l2.bootstrap-manifest-mismatch",
+          "variant": "manifest-digest-and-canonical-body",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-executor.test.ts",
+            "testName": "[acceptance:C7-WORKER-02.l2.bootstrap-manifest-mismatch][variant:manifest-digest-and-canonical-body]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-03.l2.environment-secret-boundary",
+          "variant": "env-argv-execargv-workerdata",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-executor.test.ts",
+            "testName": "[acceptance:C7-WORKER-03.l2.environment-secret-boundary][variant:env-argv-execargv-workerdata]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-04.l2.static-entry-wire-boundary",
+          "variant": "forged-entry-path-not-routable",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-executor.test.ts",
+            "testName": "[acceptance:C7-WORKER-04.l2.static-entry-wire-boundary][variant:forged-entry-path-not-routable]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-05.l2.session-task-isolation",
+          "variant": "owner-session-and-job-scope",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-executor.test.ts",
+            "testName": "[acceptance:C7-WORKER-05.l2.session-task-isolation][variant:owner-session-and-job-scope]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-06.l2.reconnect-none",
+          "variant": "checkpoint-only",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-executor.test.ts",
+            "testName": "[acceptance:C7-WORKER-06.l2.reconnect-none][variant:checkpoint-only]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-07.l2.resource-cleanup",
+          "variant": "bounded-terminal-retention",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-executor.test.ts",
+            "testName": "[acceptance:C7-WORKER-07.l2.resource-cleanup][variant:bounded-terminal-retention]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-08.l4.chat-model-proxy",
+          "variant": "fake-openai-chat-sdk",
+          "phase": "phase-2",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-protocol-proxy.test.ts",
+            "testName": "[acceptance:C7-WORKER-08.l4.chat-model-proxy][variant:fake-openai-chat-sdk]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-09.l4.responses-model-proxy",
+          "variant": "fake-openai-responses-sdk",
+          "phase": "phase-2",
+          "layer": "L4",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-protocol-proxy.test.ts",
+            "testName": "[acceptance:C7-WORKER-09.l4.responses-model-proxy][variant:fake-openai-responses-sdk]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-10.l1.binding-closed-shape",
+          "variant": "hostile-object-boundary",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-binding.test.ts",
+            "testName": "[acceptance:C7-WORKER-10.l1.binding-closed-shape][variant:hostile-object-boundary]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-11.l2.transferable-owned-sidecar",
+          "variant": "arraybuffer-transfer-and-owned-copy",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-protocol.test.ts",
+            "testName": "[acceptance:C7-WORKER-11.l2.transferable-owned-sidecar][variant:arraybuffer-transfer-and-owned-copy]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-11.l3.target-sidecar-roundtrip",
+          "variant": "owned-transfer-digest-length",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-sidecar.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-11.l3.target-sidecar-roundtrip][variant:owned-transfer-digest-length]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-12.l3.strict-startup-handshake",
+          "variant": "timeout-order-duplicate-closed-manifest",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-12.l3.strict-startup-handshake][variant:timeout-order-duplicate-closed-manifest]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-13.l3.post-admission-unbound-retry",
+          "variant": "same-task-attempt-two",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-13.l3.post-admission-unbound-retry][variant:same-task-attempt-two]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-14.l3.checkpoint-crash-recovery",
+          "variant": "fresh-worker-resume",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-14.l3.checkpoint-crash-recovery][variant:fresh-worker-resume]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-15.l3.cancel-terminate-fallback",
+          "variant": "request-signal-executor-handle",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-15.l3.cancel-terminate-fallback][variant:request-signal-executor-handle]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-16.l3.active-scope-and-create-identity",
+          "variant": "singleflight-before-capacity-mode-cross-session-stale-job",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-16.l3.active-scope-and-create-identity][variant:singleflight-before-capacity-mode-cross-session-stale-job]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-17.l3.max-concurrency-and-cleanup",
+          "variant": "starting-plus-active-bounded",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-17.l3.max-concurrency-and-cleanup][variant:starting-plus-active-bounded]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-18.l3.stdio-secret-discard",
+          "variant": "captured-not-forwarded",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-18.l3.stdio-secret-discard][variant:captured-not-forwarded]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-19.l3.fresh-executor-resume-scope",
+          "variant": "binding-and-checkpoint-imported-before-crash",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-19.l3.fresh-executor-resume-scope][variant:binding-and-checkpoint-imported-before-crash]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-20.l3.result-ready-reply-loss",
+          "variant": "execute-and-spawn-wait-same-provider-operation",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-f19.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-20.l3.result-ready-reply-loss][variant:execute-and-spawn-wait-same-provider-operation]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-21.l3.provider-in-flight-unknown",
+          "variant": "execute-and-spawn-wait-no-provider-resend",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-f19.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-21.l3.provider-in-flight-unknown][variant:execute-and-spawn-wait-no-provider-resend]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-22.l3.cancel-idempotency",
+          "variant": "concurrent-terminal-conflict-and-hidden-resource",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-22.l3.cancel-idempotency][variant:concurrent-terminal-conflict-and-hidden-resource]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-23.l3.channel-and-output-policy-fail-close",
+          "variant": "unsolicited-port-close-and-stdio-overflow",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-23.l3.channel-and-output-policy-fail-close][variant:unsolicited-port-close-and-stdio-overflow]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-24.l3.binding-integrity-before-target",
+          "variant": "cancel-and-resume-closed-binding",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-24.l3.binding-integrity-before-target][variant:cancel-and-resume-closed-binding]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-25.l3.internal-recovery-epoch-quota",
+          "variant": "one-rebuild-per-core-execution-scope",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-f19.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-25.l3.internal-recovery-epoch-quota][variant:one-rebuild-per-core-execution-scope]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-26.l3.spawn-terminal-replay",
+          "variant": "terminal-handle-without-new-worker-or-side-effect",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-26.l3.spawn-terminal-replay][variant:terminal-handle-without-new-worker-or-side-effect]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-27.l3.cancel-receipt-capacity",
+          "variant": "closed-capacity-byte-boundary-and-aborted-replay",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-lifecycle.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-27.l3.cancel-receipt-capacity][variant:closed-capacity-byte-boundary-and-aborted-replay]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-28.l3.result-receipt-cas-reply-loss",
+          "variant": "authoritative-partial-no-replacement-job",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-completion-crash.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-28.l3.result-receipt-cas-reply-loss][variant:authoritative-partial-no-replacement-job]"
+          }
+        },
+        {
+          "caseId": "C7-WORKER-29.l3.terminal-cas-completion-reply-loss",
+          "variant": "authoritative-success-no-replacement-job",
+          "phase": "phase-2",
+          "layer": "L3",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-worker/test/worker-completion-crash.worker.test.ts",
+            "testName": "[acceptance:C7-WORKER-29.l3.terminal-cas-completion-reply-loss][variant:authoritative-success-no-replacement-job]"
+          }
+        }
+      ]
     },
     {
       "requirementId": "C7-PROCESS",
