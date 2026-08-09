@@ -2213,7 +2213,63 @@
       "phase": "phase-2",
       "requiredLayers": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"],
       "requiredVariants": ["http-conformance", "http-loopback-reconnect", "http-ark-placement"],
-      "cases": []
+      "cases": [
+        {
+          "caseId": "C7C-HTTP-MP01.l1.closed-packet-json",
+          "variant": "closed-first-part-and-json-bounds",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-multipart.test.ts",
+            "testName": "[acceptance:C7C-HTTP-MP01.l1.closed-packet-json][variant:closed-first-part-and-json-bounds]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-MP02.l2.atomic-sidecar-parts",
+          "variant": "ordered-header-allowlist-and-cleanup",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-multipart.test.ts",
+            "testName": "[acceptance:C7C-HTTP-MP02.l2.atomic-sidecar-parts][variant:ordered-header-allowlist-and-cleanup]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-MP03.l2.multipart-byte-limits",
+          "variant": "exact-boundaries-and-plus-one",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-multipart.test.ts",
+            "testName": "[acceptance:C7C-HTTP-MP03.l2.multipart-byte-limits][variant:exact-boundaries-and-plus-one]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-MP04.l2.owned-copy-body-integrity",
+          "variant": "mutation-and-raw-byte-tamper",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-multipart.test.ts",
+            "testName": "[acceptance:C7C-HTTP-MP04.l2.owned-copy-body-integrity][variant:mutation-and-raw-byte-tamper]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-MP05.l1.exact-route-policy",
+          "variant": "raw-method-path-and-no-fallback",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-multipart.test.ts",
+            "testName": "[acceptance:C7C-HTTP-MP05.l1.exact-route-policy][variant:raw-method-path-and-no-fallback]"
+          }
+        }
+      ]
     },
     {
       "requirementId": "C7-AUTH",
@@ -2221,7 +2277,85 @@
       "phase": "phase-2",
       "requiredLayers": ["L0", "L1", "L2", "L6"],
       "requiredVariants": ["tls-hmac-v1", "session-authorization", "replay-cache"],
-      "cases": []
+      "cases": [
+        {
+          "caseId": "C7C-HTTP-AUTH01.l1.closed-auth-headers",
+          "variant": "six-single-value-headers",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-auth.test.ts",
+            "testName": "[acceptance:C7C-HTTP-AUTH01.l1.closed-auth-headers][variant:six-single-value-headers]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-AUTH02.l1.raw-request-canonicalization",
+          "variant": "method-path-body-byte-exact",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-auth.test.ts",
+            "testName": "[acceptance:C7C-HTTP-AUTH02.l1.raw-request-canonicalization][variant:method-path-body-byte-exact]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-AUTH03.l1.timestamp-window",
+          "variant": "manual-clock-inclusive-boundaries",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-auth.test.ts",
+            "testName": "[acceptance:C7C-HTTP-AUTH03.l1.timestamp-window][variant:manual-clock-inclusive-boundaries]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-AUTH04.l1.encoding-and-key-strength",
+          "variant": "nonce-key-signature-validation",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-auth.test.ts",
+            "testName": "[acceptance:C7C-HTTP-AUTH04.l1.encoding-and-key-strength][variant:nonce-key-signature-validation]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-AUTH05.l2.atomic-replay-cache",
+          "variant": "hundred-way-two-verifier-race",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-auth.test.ts",
+            "testName": "[acceptance:C7C-HTTP-AUTH05.l2.atomic-replay-cache][variant:hundred-way-two-verifier-race]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-AUTH06.l2.authorization-order",
+          "variant": "authenticated-scope-before-peer",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-auth.test.ts",
+            "testName": "[acceptance:C7C-HTTP-AUTH06.l2.authorization-order][variant:authenticated-scope-before-peer]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-AUTH07.l2.safe-auth-diagnostics",
+          "variant": "safe-status-and-diagnostics",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-auth.test.ts",
+            "testName": "[acceptance:C7C-HTTP-AUTH07.l2.safe-auth-diagnostics][variant:safe-status-and-diagnostics]"
+          }
+        }
+      ]
     },
     {
       "requirementId": "C7-PACK",

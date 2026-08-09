@@ -100,6 +100,12 @@ importers:
         specifier: ^3.25.2
         version: 3.25.2(zod@4.4.3)
 
+  packages/executor-http:
+    devDependencies:
+      '@ruixutong.manee/maneeagent-framework':
+        specifier: workspace:^
+        version: link:../core
+
   packages/executor-local:
     devDependencies:
       '@ruixutong.manee/maneeagent-framework':

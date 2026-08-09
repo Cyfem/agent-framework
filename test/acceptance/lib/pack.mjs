@@ -94,6 +94,11 @@ const RELEASE_PACKAGE_CONTRACTS = Object.freeze({
       '@ruixutong.manee/maneeagent-framework': '^2.0.0',
     }),
   }),
+  '@ruixutong.manee/maneeagent-executor-http': Object.freeze({
+    peerDependencies: Object.freeze({
+      '@ruixutong.manee/maneeagent-framework': '^2.0.0',
+    }),
+  }),
 });
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDirectory, '..', '..', '..');
@@ -649,6 +654,84 @@ processExecutorNamespace.PROCESS_SUBAGENT_CHANNEL_VERSION;
 processExecutorNamespace.processFailpointForTest;
 `;
   }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-http') {
+    return `import * as httpExecutorNamespace from '${packageName}';
+import {
+  HTTP_SUBAGENT_AUTH_VERSION,
+  HTTP_SUBAGENT_HMAC_SCHEME,
+  HTTP_SUBAGENT_PACKET_MEDIA_TYPE,
+  HTTP_SUBAGENT_PACKET_VERSION,
+  HttpSubAgentSecurityError,
+  MemoryHttpSubAgentReplayCache,
+  admitHttpSubAgentPacket,
+  createHttpSubAgentHmacHeaders,
+  createHttpSubAgentHmacVerifier,
+  createStaticHttpSubAgentHmacKeyResolver,
+  decodeHttpSubAgentMultipartPacket,
+  encodeHttpSubAgentMultipartPacket,
+  parseHttpSubAgentRoute,
+  type AdmitHttpSubAgentPacketOptions,
+  type HttpSubAgentAuthContext,
+  type HttpSubAgentHmacVerifier,
+  type HttpSubAgentMultipartLimits,
+  type HttpSubAgentRawRequest,
+  type HttpSubAgentReplayCache,
+  type HttpSubAgentRoute,
+} from '${packageName}';
+
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type AssertFalse<T extends false> = T;
+type AssertTrue<T extends true> = T;
+type Equal<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+  (<Value>() => Value extends Right ? 1 : 2) ? true : false;
+type HttpContractAssertions = [
+  AssertFalse<IsAny<typeof admitHttpSubAgentPacket>>,
+  AssertFalse<IsAny<Parameters<typeof admitHttpSubAgentPacket>[0]>>,
+  AssertFalse<IsAny<Parameters<typeof admitHttpSubAgentPacket>[1]>>,
+  AssertFalse<IsAny<typeof createHttpSubAgentHmacHeaders>>,
+  AssertFalse<IsAny<typeof createHttpSubAgentHmacVerifier>>,
+  AssertFalse<IsAny<typeof createStaticHttpSubAgentHmacKeyResolver>>,
+  AssertFalse<IsAny<typeof decodeHttpSubAgentMultipartPacket>>,
+  AssertFalse<IsAny<typeof encodeHttpSubAgentMultipartPacket>>,
+  AssertFalse<IsAny<typeof parseHttpSubAgentRoute>>,
+  AssertFalse<IsAny<AdmitHttpSubAgentPacketOptions>>,
+  AssertFalse<IsAny<HttpSubAgentAuthContext>>,
+  AssertFalse<IsAny<HttpSubAgentHmacVerifier>>,
+  AssertFalse<IsAny<HttpSubAgentMultipartLimits>>,
+  AssertFalse<IsAny<HttpSubAgentRawRequest>>,
+  AssertFalse<IsAny<HttpSubAgentReplayCache>>,
+  AssertFalse<IsAny<HttpSubAgentRoute>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_PACKET_VERSION, '1'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_AUTH_VERSION, '1'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_HMAC_SCHEME, 'MANEE-HMAC-SHA256-V1'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_PACKET_MEDIA_TYPE, 'application/vnd.maneeagent.packet+json'>>,
+];
+
+const publicValues = [
+  HttpSubAgentSecurityError,
+  MemoryHttpSubAgentReplayCache,
+  admitHttpSubAgentPacket,
+  createHttpSubAgentHmacHeaders,
+  createHttpSubAgentHmacVerifier,
+  createStaticHttpSubAgentHmacKeyResolver,
+  decodeHttpSubAgentMultipartPacket,
+  encodeHttpSubAgentMultipartPacket,
+  parseHttpSubAgentRoute,
+] as const;
+declare const httpContractAssertions: HttpContractAssertions;
+void publicValues;
+void httpContractAssertions;
+// @ts-expect-error The packed declaration surface must not degrade to any.
+httpExecutorNamespace.__maneeMissingExport;
+// @ts-expect-error The owned-body decoder is internal to admission composition.
+httpExecutorNamespace.decodeOwnedHttpSubAgentMultipartPacket;
+// @ts-expect-error Multipart configuration normalization is package-internal.
+httpExecutorNamespace.normalizeHttpSubAgentMultipartLimits;
+// @ts-expect-error HTTP security test failpoints must never become public API.
+httpExecutorNamespace.httpSecurityFailpointForTest;
+`;
+  }
   return `import * as packageApi from '${packageName}';
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type AssertFalse<T extends false> = T;
@@ -895,6 +978,62 @@ processExecutor.PROCESS_SUBAGENT_CHANNEL_VERSION;
 processExecutor.processFailpointForTest;
 `;
   }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-http') {
+    return `import httpExecutor = require('${packageName}');
+
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type AssertFalse<T extends false> = T;
+type AssertTrue<T extends true> = T;
+type Equal<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+  (<Value>() => Value extends Right ? 1 : 2) ? true : false;
+type HttpContractAssertions = [
+  AssertFalse<IsAny<typeof httpExecutor.admitHttpSubAgentPacket>>,
+  AssertFalse<IsAny<Parameters<typeof httpExecutor.admitHttpSubAgentPacket>[0]>>,
+  AssertFalse<IsAny<Parameters<typeof httpExecutor.admitHttpSubAgentPacket>[1]>>,
+  AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentHmacHeaders>>,
+  AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentHmacVerifier>>,
+  AssertFalse<IsAny<typeof httpExecutor.createStaticHttpSubAgentHmacKeyResolver>>,
+  AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentMultipartPacket>>,
+  AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentMultipartPacket>>,
+  AssertFalse<IsAny<typeof httpExecutor.parseHttpSubAgentRoute>>,
+  AssertFalse<IsAny<httpExecutor.AdmitHttpSubAgentPacketOptions>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentAuthContext>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentHmacVerifier>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentMultipartLimits>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentRawRequest>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentReplayCache>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentRoute>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_PACKET_VERSION, '1'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_AUTH_VERSION, '1'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_HMAC_SCHEME, 'MANEE-HMAC-SHA256-V1'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_PACKET_MEDIA_TYPE, 'application/vnd.maneeagent.packet+json'>>,
+];
+
+const publicValues = [
+  httpExecutor.HttpSubAgentSecurityError,
+  httpExecutor.MemoryHttpSubAgentReplayCache,
+  httpExecutor.admitHttpSubAgentPacket,
+  httpExecutor.createHttpSubAgentHmacHeaders,
+  httpExecutor.createHttpSubAgentHmacVerifier,
+  httpExecutor.createStaticHttpSubAgentHmacKeyResolver,
+  httpExecutor.decodeHttpSubAgentMultipartPacket,
+  httpExecutor.encodeHttpSubAgentMultipartPacket,
+  httpExecutor.parseHttpSubAgentRoute,
+] as const;
+declare const httpContractAssertions: HttpContractAssertions;
+void publicValues;
+void httpContractAssertions;
+// @ts-expect-error The packed declaration surface must not degrade to any.
+httpExecutor.__maneeMissingExport;
+// @ts-expect-error The owned-body decoder is internal to admission composition.
+httpExecutor.decodeOwnedHttpSubAgentMultipartPacket;
+// @ts-expect-error Multipart configuration normalization is package-internal.
+httpExecutor.normalizeHttpSubAgentMultipartLimits;
+// @ts-expect-error HTTP security test failpoints must never become public API.
+httpExecutor.httpSecurityFailpointForTest;
+`;
+  }
   return `import packageApi = require('${packageName}');
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type AssertFalse<T extends false> = T;
@@ -1046,6 +1185,63 @@ for (const name of [
   'decodeProcessMessage',
   'PROCESS_SUBAGENT_CHANNEL_VERSION',
   'processFailpointForTest',
+]) {
+  if (Object.prototype.hasOwnProperty.call(packageApi, name)) {
+    throw new Error(\`${packageName} must not expose internal root export \${name}\`);
+  }
+}
+`;
+  }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-http') {
+    checks.push(
+      `[packageApi.HttpSubAgentSecurityError, 'HttpSubAgentSecurityError', 'function']`,
+      `[packageApi.MemoryHttpSubAgentReplayCache, 'MemoryHttpSubAgentReplayCache', 'function']`,
+      `[packageApi.admitHttpSubAgentPacket, 'admitHttpSubAgentPacket', 'function']`,
+      `[packageApi.createHttpSubAgentHmacHeaders, 'createHttpSubAgentHmacHeaders', 'function']`,
+      `[packageApi.createHttpSubAgentHmacVerifier, 'createHttpSubAgentHmacVerifier', 'function']`,
+      `[packageApi.createStaticHttpSubAgentHmacKeyResolver, 'createStaticHttpSubAgentHmacKeyResolver', 'function']`,
+      `[packageApi.decodeHttpSubAgentMultipartPacket, 'decodeHttpSubAgentMultipartPacket', 'function']`,
+      `[packageApi.encodeHttpSubAgentMultipartPacket, 'encodeHttpSubAgentMultipartPacket', 'function']`,
+      `[packageApi.parseHttpSubAgentRoute, 'parseHttpSubAgentRoute', 'function']`,
+    );
+    return `${load}
+function expectType([value, name, expected]) {
+  if (typeof value !== expected) throw new Error(\`${packageName} \${name} must be \${expected}\`);
+}
+for (const check of [${checks.join(', ')}]) expectType(check);
+const expectedHttpRuntimeExports = ${JSON.stringify(
+      [
+        'HTTP_SUBAGENT_AUTH_HEADER_NAMES',
+        'HTTP_SUBAGENT_AUTH_VERSION',
+        'HTTP_SUBAGENT_DEFAULT_CLOCK_SKEW_MS',
+        'HTTP_SUBAGENT_HMAC_SCHEME',
+        'HTTP_SUBAGENT_MAX_MULTIPART_BODY_BYTES',
+        'HTTP_SUBAGENT_MAX_PACKET_JSON_BYTES',
+        'HTTP_SUBAGENT_MAX_PART_HEADER_BYTES',
+        'HTTP_SUBAGENT_PACKET_MEDIA_TYPE',
+        'HTTP_SUBAGENT_PACKET_VERSION',
+        'HTTP_SUBAGENT_REPLAY_TTL_MS',
+        'HttpSubAgentSecurityError',
+        'MemoryHttpSubAgentReplayCache',
+        'admitHttpSubAgentPacket',
+        'createHttpSubAgentHmacHeaders',
+        'createHttpSubAgentHmacVerifier',
+        'createStaticHttpSubAgentHmacKeyResolver',
+        'decodeHttpSubAgentMultipartPacket',
+        'encodeHttpSubAgentMultipartPacket',
+        'parseHttpSubAgentRoute',
+      ].sort(),
+    )};
+if (JSON.stringify(Object.keys(packageApi).sort()) !== JSON.stringify(expectedHttpRuntimeExports)) {
+  throw new Error('${packageName} must expose exactly the documented HTTP security runtime exports');
+}
+if (packageApi.HTTP_SUBAGENT_PACKET_VERSION !== '1' || packageApi.HTTP_SUBAGENT_AUTH_VERSION !== '1') {
+  throw new Error('${packageName} HTTP packet and auth versions must equal "1"');
+}
+for (const name of [
+  'decodeOwnedHttpSubAgentMultipartPacket',
+  'normalizeHttpSubAgentMultipartLimits',
+  'httpSecurityFailpointForTest',
 ]) {
   if (Object.prototype.hasOwnProperty.call(packageApi, name)) {
     throw new Error(\`${packageName} must not expose internal root export \${name}\`);

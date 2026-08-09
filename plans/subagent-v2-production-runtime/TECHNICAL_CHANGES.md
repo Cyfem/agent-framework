@@ -2,14 +2,14 @@
 
 ## 1. 文档状态
 
-- 设计状态：总体方向与 Phase 1 Oracle 已冻结；当前 checkout 已完成 C0～C6、C7a/C7b、C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway，以及 C7c-2/C7c-3 的离线 Worker/Process placement；HTTP placement 仍待实施。
+- 设计状态：总体方向与 Phase 1 Oracle 已冻结；当前 checkout 已完成 C0～C6、C7a/C7b、C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway、C7c-2/C7c-3 的离线 Worker/Process placement，以及 C7c-4 的 HTTP signed multipart/HMAC/replay/authz 安全基础；HTTP Executor/job/listener/reconnect 仍待 C7c-5。
 - 目标版本：Core 与所有公开 Executor/State/Artifact/Observability 包统一首发 `2.0.0`。
 - 实施范围：Phase 1 Core/Local、Phase 2 Worker/Process/HTTP Remote、Phase 3 PostgreSQL/BullMQ/Docker/S3/OTel、Compose、测试、demo 与文档迁移。
 - 明确排除：conversation handoff、active-agent 所有权转移、Core 内置云 transport 或认证系统。
 
 本文件细化 [PLAN.md](./PLAN.md) 中已经确认的设计。接口名称是实施基线；文件名可以在不改变职责边界和公共语义的前提下微调。分层测试、故障注入与真实方舟 Agent Plan 的逐项发布门禁见 [TEST_ACCEPTANCE_PLAN.md](./TEST_ACCEPTANCE_PLAN.md)。
 
-当前实现边界以源码与包 README 为准：Core v2、官方 Local、Memory/Atomic File StateStore、公开 Agent durable loop、跨协议/跨进程 Phase 1 恢复和离线验收，以及 C7 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge、controller-owned Model gateway 和 C7c-2/C7c-3 离线 Worker/Process placement已经落地；`C7-WORKER` 与 `C7-PROCESS` requirement 因缺少 L5/L6/Ark 仍为 `planned`，HTTP 与 Phase 3 适配器仍按后续章节实施，Phase 2 尚未通过。真实方舟与 Docker/Linux live gate 未执行时不得标记为通过。
+当前实现边界以源码与包 README 为准：Core v2、官方 Local、Memory/Atomic File StateStore、公开 Agent durable loop、跨协议/跨进程 Phase 1 恢复和离线验收，以及 C7 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge、controller-owned Model gateway、C7c-2/C7c-3 离线 Worker/Process placement和 C7c-4 HTTP wire-security 基础已经落地；`C7-WORKER`、`C7-PROCESS`、`C7-HTTP` 与 `C7-AUTH` requirement 因缺少 L5/L6/Ark 或完整 HTTP placement 证据仍为 `planned`，HTTP job/runtime 与 Phase 3 适配器仍按后续章节实施，Phase 2 尚未通过。真实方舟与 Docker/Linux live gate 未执行时不得标记为通过。
 
 ## 2. 设计目标与硬性不变量
 
@@ -1207,7 +1207,7 @@ Local factory 接收 SubAgentExecutionControl.delegation 并把它作为 child �
 
 C7 的三个 placement 共用 Core 导出的协议无关 transport v1 contract，不允许各包复制或扩展不兼容 wire：
 
-当前 Core 实现已经冻结并公开该公共层：C7b 基线与 C7c-1 扩展后的 14-kind strict RPC、16-method control dispatcher/proxy、双向 `SubAgentTransportPeer`、canonical replay/reply cache、同步 writer admission receipt、带 settlement headroom 的 drain/rollover、spawn 的 `accepted → settled` 或 direct `unbound_create` recovery settlement、有界 abort/timeout tombstone、默认 32 MiB artifact sidecar、controller/target bridge 与 `model.request`/`model.reply` gateway。writer 的可选 `settled` 只报告 I/O 完成，不参与下一帧准入排序；非法同步 receipt 在调用返回前失败，准入前 abort 不发送 packet。Peer 对 accepted/settled/events/model reply 与原 request 做语义关联，超长 timeout 分段调度；soft drain 仍允许所有 reply/replay 和 active executor task 的 control/cancel/snapshot/events continuation，hard sequence bound 才 fail-close。它们通过 closed schema、scope/receipt/outcome 重验、owner partition 和 safe-error 白名单把远端 runner 接回 Core control plane。C7c-2/C7c-3 已在这套公共层上交付离线 Worker/Process transport，以及各自的 `worker_threads`/`child_process` 生命周期；HTTP transport、鉴权和网络生命周期仍未实现。Worker/Process 的 L5/L6/Ark 证据同样未完成，因此不能把本节状态写成 Phase 2 通过。
+当前 Core 实现已经冻结并公开该公共层：C7b 基线与 C7c-1 扩展后的 14-kind strict RPC、16-method control dispatcher/proxy、双向 `SubAgentTransportPeer`、canonical replay/reply cache、同步 writer admission receipt、带 settlement headroom 的 drain/rollover、spawn 的 `accepted → settled` 或 direct `unbound_create` recovery settlement、有界 abort/timeout tombstone、默认 32 MiB artifact sidecar、controller/target bridge 与 `model.request`/`model.reply` gateway。writer 的可选 `settled` 只报告 I/O 完成，不参与下一帧准入排序；非法同步 receipt 在调用返回前失败，准入前 abort 不发送 packet。Peer 对 accepted/settled/events/model reply 与原 request 做语义关联，超长 timeout 分段调度；soft drain 仍允许所有 reply/replay 和 active executor task 的 control/cancel/snapshot/events continuation，hard sequence bound 才 fail-close。它们通过 closed schema、scope/receipt/outcome 重验、owner partition 和 safe-error 白名单把远端 runner 接回 Core control plane。C7c-2/C7c-3 已在这套公共层上交付离线 Worker/Process transport，以及各自的 `worker_threads`/`child_process` 生命周期；C7c-4 已交付 HTTP signed multipart、HMAC、replay、authz 与 admission wire-security 基础，HTTP Executor、job、listener 和网络生命周期仍待 C7c-5 实现。Worker/Process 的 L5/L6/Ark 证据同样未完成，因此不能把本节状态写成 Phase 2 通过。
 
 - JSON envelope 固定为 `{ version: '1', channelId, sequence, messageId, correlationId?, taskId?, operationId?, kind, payload }`，所有 object 都是 closed shape；默认单个 JSON frame 上限 16 MiB。
 - 每个方向的 `sequence` 从 1 连续递增。相同 `messageId + canonical decoded envelope` 是协议重放并返回原 reply，sidecar 以 `sidecarId` 无序比较；相同 ID 不同语义或 bytes 为冲突；sequence gap、未知字段、错版本、超限或非 JSON-safe payload 都在调用 Executor/Core 前失败。
@@ -1308,7 +1308,7 @@ HTTP 包通过 conformance suite 证明语义一致；Core 不规定 HTTP、gRPC
 
 HTTP v1 固定行为：
 
-- 所有 RPC 使用 signed POST：`/v1/heartbeat`、`/v1/jobs/create`、`/v1/jobs/{id}/resume`、`/reconnect`、`/cancel`、`/poll`、`/control/{requestId}/reply`。create 以授权主体、owner session 与 idempotency key 唯一；响应不确定时只可重放同一 operation 取回原 job。
+- 所有 RPC 使用 signed POST：`/v1/heartbeat`、`/v1/jobs/create`、`/v1/jobs/{jobId}/resume`、`/v1/jobs/{jobId}/reconnect`、`/v1/jobs/{jobId}/cancel`、`/v1/jobs/{jobId}/poll`、`/v1/jobs/{jobId}/control/{requestId}/reply`。`jobId` 与 `requestId` 只允许 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`；route matcher 是无 fallback、无用户正则的 closed parser。create 以授权主体、owner session 与 idempotency key 唯一；响应不确定时只可重放同一 operation 取回原 job。
 - binding recovery data 只含 `{ kind: 'maneeagent-http/v1', endpointId, jobId }`。`endpointId` 在本地可信 registry 中解析 base URL 与 auth；binding 不含 URL、credential、cursor 或临时授权。
 - heartbeat 默认 10 秒；最近成功小于 30 秒为 available、30–60 秒为 degraded、达到 60 秒为 unavailable。只有 Runtime init/显式 `refreshCatalog()` 更新模型目录 revision；schema 构建不联网，执行前仍 preflight 且无 fallback。
 - remote job event cursor 与 Core task event sequence 是两个独立域。controller 断线时 job 进入 remote 内部 `awaiting_control`，reconnect 用原 binding/cursor 继续；丢失 job 返回 `RECOVERY_TARGET_LOST`，不能 create 替代。
@@ -1316,9 +1316,9 @@ HTTP v1 固定行为：
 
 HTTP transport sidecar 固定使用单请求 signed `multipart/mixed`，不设计独立 upload/stage route。完整格式如下：
 
-- 首 part 必须且只能是 `Content-Type: application/vnd.maneeagent.packet+json`，body 为 closed JSON `{ version: '1', frame: string, sidecars: descriptor[] }`；`frame` 是已经序列化的 RPC JSON string，不是嵌套 JSON object，也不能由 multipart parser 重序列化，descriptor 使用 Core sidecar closed schema。
-- 后续每个 part 必须是 `Content-Type: application/octet-stream`，`Content-ID` 精确等于对应 `sidecarId`，并严格按首 part 的 descriptor 顺序出现；不允许额外/missing/duplicate part、未知 MIME header、nested multipart、content-transfer-encoding 或 base64。
-- 每件最多 32 MiB，每 packet 最多 8 件且 sidecar 合计最多 128 MiB；HTTP server 还必须在解析前执行总 body/header/boundary 上限。每件复制到 owned buffer 后校验 descriptor size 与 SHA-256，全部 part 收齐并通过 frame/sidecar 校验后才一次调用 `Peer.receive()`。
+- top-level `Content-Type` 只接受 unquoted canonical token `multipart/mixed; boundary=<token>`，不接受 preamble、epilogue 或 content negotiation。首 part 必须且只能有一行精确 `Content-Type: application/vnd.maneeagent.packet+json`，body 为 closed JSON `{ version: '1', frame: string, sidecars: descriptor[] }`；`frame` 是已经序列化的 RPC JSON string，不是嵌套 JSON object，也不能由 multipart parser 重序列化，descriptor 使用 Core sidecar closed schema。
+- 后续每个 part 必须按顺序且只包含 `Content-Type: application/octet-stream`、`Content-ID: <sidecarId>` 两行，大小写、顺序、单个 `: ` 与 CRLF 都是 wire 的一部分；`Content-ID` 精确等于对应 descriptor 的 `sidecarId`。不允许额外/missing/duplicate part、未知 MIME header、nested multipart、content-transfer-encoding 或 base64；closing boundary 后只能有一个 CRLF。
+- hard cap 固定为完整 body 161 MiB、首 JSON 32 MiB + 64 KiB、单个 part headers 16 KiB、boundary 70 bytes、frame 16 MiB、JSON depth 128/nodes 1,000,000、单件 sidecar 32 MiB、每 packet 8 件且 sidecar 合计 128 MiB；公开 limit 只能收紧、不能放宽。每件复制到 owned buffer 后校验 descriptor size 与 SHA-256，全部 part 收齐并通过 strict RPC frame/sidecar 校验后才一次调用 `Peer.receive()`。binary payload 按已签 descriptor 的 `byteLength` 读取，不扫描 payload 中可能出现的 boundary 字节序列。
 - 任一 MIME、长度、digest、frame 或 HMAC 校验失败都丢弃整个请求，不调用 Peer/Core、不保留 stage/orphan。完整原始 multipart body bytes（包括 boundary、CRLF、part headers 和顺序）参与 `Manee-Body-SHA256`，因此 frame 与 sidecar 被同一签名原子覆盖。
 
 HMAC-SHA256 v1 固定使用六个 headers：`Manee-Auth-Version: 1`、`Manee-Key-Id`、`Manee-Timestamp`、`Manee-Nonce`、`Manee-Body-SHA256`、`Manee-Signature`。canonical string 是 UTF-8、字段间仅 LF (`0x0a`)、**无尾换行**的精确字符串：
@@ -1327,11 +1327,11 @@ HMAC-SHA256 v1 固定使用六个 headers：`Manee-Auth-Version: 1`、`Manee-Key
 MANEE-HMAC-SHA256-V1\n${keyId}\n${timestamp}\n${nonce}\n${METHOD}\n${path}\n${bodyDigest}
 ```
 
-其中 `timestamp` 是无符号十进制 Unix milliseconds，除值 `0` 外不得有前导零；默认时间窗口为 `abs(now - timestamp) <= 60000`，正负边界均有效。`nonce` 必须是无 padding base64url，解码后 16～64 bytes；`bodyDigest` 必须是完整原始 body 的 64 字符 lowercase hex SHA-256；key 至少 32 bytes；signature 必须是无 padding base64url、解码后恰好 32 bytes 的 HMAC-SHA256，并用 constant-time compare。任何字段禁止 CR/LF。
+其中 `timestamp` 是无符号十进制 Unix milliseconds，除值 `0` 外不得有前导零；默认时间窗口为 `abs(now - timestamp) <= 60000`，正负边界均有效。`nonce` 必须是无 padding base64url，解码后 16～64 bytes；`bodyDigest` 必须是完整原始 body 的 64 字符 lowercase hex SHA-256；key 至少 32 bytes；signature 必须是无 padding base64url、解码后恰好 32 bytes 的 HMAC-SHA256，并用 constant-time compare。任何字段禁止 CR/LF。Node.js 22 的 `http`/`https` parser 会在 `IncomingMessage.rawHeaders` 暴露 header value 前去掉外围 OWS，因此生产 verifier 把这些 HTTP OWS 视为等价；`rawHeaders` 仍用于保留 header name 与重复项，并拒绝重复、合并多值、空值、内部 SP/TAB 及控制字符。不得用手工构造的 `rawHeaders` 测试宣称能够观察 socket 上已被 llhttp 去掉的外围 OWS。
 
 `METHOD` 必须已经是 endpoint allowlist 中的 uppercase ASCII method；v1 当前只允许 `POST`。raw request path 必须在到达 verifier 时就已经是与预注册 route template 匹配的唯一 canonical form，动态 job/request ID 只允许 route 定义的 opaque ASCII identifier alphabet。请求 target 禁止 query（包括空 `?`）、fragment、任何 `%` percent-encoding、反斜杠、ASCII control、`.`/`..` 独立 segment、重复 `/` 与 trailing slash；verifier、HTTP framework 和前置代理都不得先 percent decode、dot removal、slash collapse、Unicode normalize 或改写大小写再验签，validated raw path 本身就是 canonical `path`。无法从代理/框架无损取得原始 request-target，或代理可能在 verifier 前改写 path 时，部署必须 fail closed，不能用已归一化 URL 猜测签名输入。
 
-验证顺序固定为：closed headers/route/body bounds → raw body digest → timestamp/key/encoding → signature constant-time compare → 原子 `ReplayCache.consume(keyId, nonce, expiresAt)`（TTL 固定 120 秒）→ `authorize(authContext, ownerSessionId, method)` → multipart/RPC/Core。生产 handler 要求 distributed replay cache，内存实现只允许显式 loopback/test。未知 key、错签名、过期、replay、path/query 不规范、未授权及其他认证失败对外都返回同一安全 401，且进入 Core/Peer/runner 的 callback 次数必须为 0；session ID 本身不构成授权。
+验证顺序固定为：closed headers/route/body bounds → raw body digest → timestamp/key/encoding → signature constant-time compare → 原子 `ReplayCache.consume(keyId, nonce, expiresAt)`（TTL 固定 120 秒）→ 无业务副作用地完整解码 multipart/closed packet → 由 route、packet 或 C7c-5 的受信 job state 解析 owner session → `authorize(authContext, { ownerSessionId, method, routeId })` → Peer/Core。authorization scope 的 `method` 固定为 canonical HTTP `POST`，endpoint 权限由 `routeId` 表示；C7c-5 必须另用 closed route policy 约束 route 与 strict Core RPC kind，不能把未经 decode 的 frame 字符串当权限字段。owner session 位于签名 body 或受信 job state，不能通过新增未签名 header 绕过；heartbeat 是唯一允许 `ownerSessionId = null` 的 endpoint-scope route，其余 route 缺失或非法 owner scope 固定为认证后的 400。生产 handler 要求 distributed replay cache，内存实现只允许显式 loopback/test。未知 key、错签名、过期、replay、path/query 不规范和未授权对外都返回同一安全 401；认证成功后的 multipart/RPC/scope malformed 返回固定 400，key/replay/authz backend 不可用返回固定 503，Peer/Core callback 异常返回固定 500。所有错误都必须脱敏；授权拒绝时进入 Peer/Core/runner 的 callback 次数为 0，session ID 本身不构成授权。
 
 ### 17.3 Phase 3 生产适配器
 
