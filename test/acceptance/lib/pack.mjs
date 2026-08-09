@@ -659,24 +659,37 @@ processExecutorNamespace.processFailpointForTest;
 import {
   HTTP_SUBAGENT_AUTH_VERSION,
   HTTP_SUBAGENT_HMAC_SCHEME,
+  HTTP_SUBAGENT_MAX_POLL_BODY_BYTES,
+  HTTP_SUBAGENT_MAX_POLL_WAIT_MS,
   HTTP_SUBAGENT_PACKET_MEDIA_TYPE,
   HTTP_SUBAGENT_PACKET_VERSION,
+  HTTP_SUBAGENT_POLL_MEDIA_TYPE,
+  HTTP_SUBAGENT_POLL_VERSION,
   HttpSubAgentSecurityError,
   MemoryHttpSubAgentReplayCache,
   admitHttpSubAgentPacket,
   createHttpSubAgentHmacHeaders,
   createHttpSubAgentHmacVerifier,
   createStaticHttpSubAgentHmacKeyResolver,
+  createHttpSubAgentPacketSemanticReceipt,
   decodeHttpSubAgentMultipartPacket,
+  decodeHttpSubAgentPollCommand,
+  decodeHttpSubAgentRoutedPacket,
   encodeHttpSubAgentMultipartPacket,
+  encodeHttpSubAgentPollCommand,
   parseHttpSubAgentRoute,
   type AdmitHttpSubAgentPacketOptions,
   type HttpSubAgentAuthContext,
   type HttpSubAgentHmacVerifier,
   type HttpSubAgentMultipartLimits,
+  type HttpSubAgentEncodedPollCommand,
+  type HttpSubAgentPacketSemanticReceiptInput,
+  type HttpSubAgentPollCommand,
+  type HttpSubAgentPollInput,
   type HttpSubAgentRawRequest,
   type HttpSubAgentReplayCache,
   type HttpSubAgentRoute,
+  type HttpSubAgentRoutedPacket,
 } from '${packageName}';
 
 type IsAny<T> = 0 extends 1 & T ? true : false;
@@ -692,20 +705,33 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<typeof createHttpSubAgentHmacHeaders>>,
   AssertFalse<IsAny<typeof createHttpSubAgentHmacVerifier>>,
   AssertFalse<IsAny<typeof createStaticHttpSubAgentHmacKeyResolver>>,
+  AssertFalse<IsAny<typeof createHttpSubAgentPacketSemanticReceipt>>,
   AssertFalse<IsAny<typeof decodeHttpSubAgentMultipartPacket>>,
+  AssertFalse<IsAny<typeof decodeHttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<typeof decodeHttpSubAgentRoutedPacket>>,
   AssertFalse<IsAny<typeof encodeHttpSubAgentMultipartPacket>>,
+  AssertFalse<IsAny<typeof encodeHttpSubAgentPollCommand>>,
   AssertFalse<IsAny<typeof parseHttpSubAgentRoute>>,
   AssertFalse<IsAny<AdmitHttpSubAgentPacketOptions>>,
   AssertFalse<IsAny<HttpSubAgentAuthContext>>,
   AssertFalse<IsAny<HttpSubAgentHmacVerifier>>,
   AssertFalse<IsAny<HttpSubAgentMultipartLimits>>,
+  AssertFalse<IsAny<HttpSubAgentEncodedPollCommand>>,
+  AssertFalse<IsAny<HttpSubAgentPacketSemanticReceiptInput>>,
+  AssertFalse<IsAny<HttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<HttpSubAgentPollInput>>,
   AssertFalse<IsAny<HttpSubAgentRawRequest>>,
   AssertFalse<IsAny<HttpSubAgentReplayCache>>,
   AssertFalse<IsAny<HttpSubAgentRoute>>,
+  AssertFalse<IsAny<HttpSubAgentRoutedPacket>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_PACKET_VERSION, '1'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_AUTH_VERSION, '1'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_HMAC_SCHEME, 'MANEE-HMAC-SHA256-V1'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_PACKET_MEDIA_TYPE, 'application/vnd.maneeagent.packet+json'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_POLL_VERSION, '1'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_POLL_MEDIA_TYPE, 'application/vnd.maneeagent.poll+json'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_MAX_POLL_BODY_BYTES, 4096>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_MAX_POLL_WAIT_MS, 10000>>,
 ];
 
 const publicValues = [
@@ -715,8 +741,12 @@ const publicValues = [
   createHttpSubAgentHmacHeaders,
   createHttpSubAgentHmacVerifier,
   createStaticHttpSubAgentHmacKeyResolver,
+  createHttpSubAgentPacketSemanticReceipt,
   decodeHttpSubAgentMultipartPacket,
+  decodeHttpSubAgentPollCommand,
+  decodeHttpSubAgentRoutedPacket,
   encodeHttpSubAgentMultipartPacket,
+  encodeHttpSubAgentPollCommand,
   parseHttpSubAgentRoute,
 ] as const;
 declare const httpContractAssertions: HttpContractAssertions;
@@ -995,19 +1025,32 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentHmacVerifier>>,
   AssertFalse<IsAny<typeof httpExecutor.createStaticHttpSubAgentHmacKeyResolver>>,
   AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentMultipartPacket>>,
+  AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentRoutedPacket>>,
   AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentMultipartPacket>>,
+  AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentPollCommand>>,
   AssertFalse<IsAny<typeof httpExecutor.parseHttpSubAgentRoute>>,
+  AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentPacketSemanticReceipt>>,
   AssertFalse<IsAny<httpExecutor.AdmitHttpSubAgentPacketOptions>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentAuthContext>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentHmacVerifier>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentMultipartLimits>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentEncodedPollCommand>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentPacketSemanticReceiptInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentPollInput>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentRawRequest>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentReplayCache>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentRoute>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentRoutedPacket>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_PACKET_VERSION, '1'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_AUTH_VERSION, '1'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_HMAC_SCHEME, 'MANEE-HMAC-SHA256-V1'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_PACKET_MEDIA_TYPE, 'application/vnd.maneeagent.packet+json'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_POLL_VERSION, '1'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_POLL_MEDIA_TYPE, 'application/vnd.maneeagent.poll+json'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_MAX_POLL_BODY_BYTES, 4096>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_MAX_POLL_WAIT_MS, 10000>>,
 ];
 
 const publicValues = [
@@ -1017,8 +1060,12 @@ const publicValues = [
   httpExecutor.createHttpSubAgentHmacHeaders,
   httpExecutor.createHttpSubAgentHmacVerifier,
   httpExecutor.createStaticHttpSubAgentHmacKeyResolver,
+  httpExecutor.createHttpSubAgentPacketSemanticReceipt,
   httpExecutor.decodeHttpSubAgentMultipartPacket,
+  httpExecutor.decodeHttpSubAgentPollCommand,
+  httpExecutor.decodeHttpSubAgentRoutedPacket,
   httpExecutor.encodeHttpSubAgentMultipartPacket,
+  httpExecutor.encodeHttpSubAgentPollCommand,
   httpExecutor.parseHttpSubAgentRoute,
 ] as const;
 declare const httpContractAssertions: HttpContractAssertions;
@@ -1200,8 +1247,12 @@ for (const name of [
       `[packageApi.createHttpSubAgentHmacHeaders, 'createHttpSubAgentHmacHeaders', 'function']`,
       `[packageApi.createHttpSubAgentHmacVerifier, 'createHttpSubAgentHmacVerifier', 'function']`,
       `[packageApi.createStaticHttpSubAgentHmacKeyResolver, 'createStaticHttpSubAgentHmacKeyResolver', 'function']`,
+      `[packageApi.createHttpSubAgentPacketSemanticReceipt, 'createHttpSubAgentPacketSemanticReceipt', 'function']`,
       `[packageApi.decodeHttpSubAgentMultipartPacket, 'decodeHttpSubAgentMultipartPacket', 'function']`,
+      `[packageApi.decodeHttpSubAgentPollCommand, 'decodeHttpSubAgentPollCommand', 'function']`,
+      `[packageApi.decodeHttpSubAgentRoutedPacket, 'decodeHttpSubAgentRoutedPacket', 'function']`,
       `[packageApi.encodeHttpSubAgentMultipartPacket, 'encodeHttpSubAgentMultipartPacket', 'function']`,
+      `[packageApi.encodeHttpSubAgentPollCommand, 'encodeHttpSubAgentPollCommand', 'function']`,
       `[packageApi.parseHttpSubAgentRoute, 'parseHttpSubAgentRoute', 'function']`,
     );
     return `${load}
@@ -1218,8 +1269,12 @@ const expectedHttpRuntimeExports = ${JSON.stringify(
         'HTTP_SUBAGENT_MAX_MULTIPART_BODY_BYTES',
         'HTTP_SUBAGENT_MAX_PACKET_JSON_BYTES',
         'HTTP_SUBAGENT_MAX_PART_HEADER_BYTES',
+        'HTTP_SUBAGENT_MAX_POLL_BODY_BYTES',
+        'HTTP_SUBAGENT_MAX_POLL_WAIT_MS',
         'HTTP_SUBAGENT_PACKET_MEDIA_TYPE',
         'HTTP_SUBAGENT_PACKET_VERSION',
+        'HTTP_SUBAGENT_POLL_MEDIA_TYPE',
+        'HTTP_SUBAGENT_POLL_VERSION',
         'HTTP_SUBAGENT_REPLAY_TTL_MS',
         'HttpSubAgentSecurityError',
         'MemoryHttpSubAgentReplayCache',
@@ -1227,16 +1282,24 @@ const expectedHttpRuntimeExports = ${JSON.stringify(
         'createHttpSubAgentHmacHeaders',
         'createHttpSubAgentHmacVerifier',
         'createStaticHttpSubAgentHmacKeyResolver',
+        'createHttpSubAgentPacketSemanticReceipt',
         'decodeHttpSubAgentMultipartPacket',
+        'decodeHttpSubAgentPollCommand',
+        'decodeHttpSubAgentRoutedPacket',
         'encodeHttpSubAgentMultipartPacket',
+        'encodeHttpSubAgentPollCommand',
         'parseHttpSubAgentRoute',
       ].sort(),
     )};
 if (JSON.stringify(Object.keys(packageApi).sort()) !== JSON.stringify(expectedHttpRuntimeExports)) {
   throw new Error('${packageName} must expose exactly the documented HTTP security runtime exports');
 }
-if (packageApi.HTTP_SUBAGENT_PACKET_VERSION !== '1' || packageApi.HTTP_SUBAGENT_AUTH_VERSION !== '1') {
-  throw new Error('${packageName} HTTP packet and auth versions must equal "1"');
+if (
+  packageApi.HTTP_SUBAGENT_PACKET_VERSION !== '1' ||
+  packageApi.HTTP_SUBAGENT_AUTH_VERSION !== '1' ||
+  packageApi.HTTP_SUBAGENT_POLL_VERSION !== '1'
+) {
+  throw new Error('${packageName} HTTP packet, auth and poll versions must equal "1"');
 }
 for (const name of [
   'decodeOwnedHttpSubAgentMultipartPacket',

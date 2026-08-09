@@ -189,6 +189,31 @@ describe('Subagent transport artifact sidecars', () => {
     ).toThrow(/must not be a Proxy/u);
   });
 
+  it('uses intrinsic byte brands without consulting hostile prototype chains', () => {
+    const fixture = createFixture();
+    let prototypeTraps = 0;
+    const hostilePrototype = (prototype: object): object =>
+      new Proxy(prototype, {
+        getPrototypeOf() {
+          prototypeTraps += 1;
+          throw new Error('byte prototype trap must not run');
+        },
+      });
+
+    const view = fixture.data.slice();
+    Object.setPrototypeOf(view, hostilePrototype(Uint8Array.prototype));
+    expect(decodeSubAgentTransportArtifactSidecar(fixture.descriptor, view).data).toEqual(
+      fixture.data,
+    );
+
+    const buffer = fixture.data.slice().buffer;
+    Object.setPrototypeOf(buffer, hostilePrototype(ArrayBuffer.prototype));
+    expect(decodeSubAgentTransportArtifactSidecar(fixture.descriptor, buffer).data).toEqual(
+      fixture.data,
+    );
+    expect(prototypeTraps).toBe(0);
+  });
+
   it('rejects non-closed descriptors, invalid opaque IDs, media types and hashes', () => {
     const fixture = createFixture();
 

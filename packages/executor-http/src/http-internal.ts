@@ -21,10 +21,10 @@ export type HttpBytes = Uint8Array | ArrayBuffer;
 
 export function observedHttpByteLength(value: unknown, label: string): number {
   if (nodeTypes.isProxy(value)) throw new TypeError(`${label} must not be a Proxy.`);
-  if (value instanceof Uint8Array) {
+  if (nodeTypes.isUint8Array(value)) {
     return Reflect.apply(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []);
   }
-  if (value instanceof ArrayBuffer) {
+  if (nodeTypes.isArrayBuffer(value)) {
     return Reflect.apply(ARRAY_BUFFER_BYTE_LENGTH_GETTER, value, []);
   }
   throw new TypeError(`${label} must be a Uint8Array or ArrayBuffer.`);
@@ -35,7 +35,7 @@ export function copyHttpBytes(value: HttpBytes, label: string, maxBytes: number)
   if (observed > maxBytes) throw new RangeError(`${label} exceeds the configured byte limit.`);
 
   let source: Uint8Array;
-  if (value instanceof Uint8Array) {
+  if (nodeTypes.isUint8Array(value)) {
     const buffer = Reflect.apply(TYPED_ARRAY_BUFFER_GETTER, value, []);
     const offset = Reflect.apply(TYPED_ARRAY_BYTE_OFFSET_GETTER, value, []);
     source = new Uint8Array(buffer, offset, observed);

@@ -1,5 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
+import { types as nodeTypes } from 'node:util';
+
 import {
   DEFAULT_SUBAGENT_TRANSPORT_MAX_FRAME_BYTES,
   DEFAULT_SUBAGENT_TRANSPORT_MAX_JSON_DEPTH,
@@ -209,7 +211,11 @@ export function decodeOwnedHttpSubAgentMultipartPacket(
     ['contentType', 'body'],
     'Owned HTTP multipart input',
   );
-  if (typeof record.contentType !== 'string' || !(record.body instanceof Uint8Array)) {
+  if (
+    typeof record.contentType !== 'string' ||
+    nodeTypes.isProxy(record.body) ||
+    !nodeTypes.isUint8Array(record.body)
+  ) {
     throw new TypeError('Owned HTTP multipart input is invalid.');
   }
   const bodyLength = observedHttpByteLength(record.body, 'Owned HTTP multipart body');

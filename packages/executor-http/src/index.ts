@@ -1,5 +1,8 @@
 export * from './http-constants';
 export * from './http-route';
+export * from './http-poll';
+export * from './http-route-policy';
+export * from './http-semantic-receipt';
 export {
   HTTP_SUBAGENT_MAX_MULTIPART_BODY_BYTES,
   HTTP_SUBAGENT_MAX_PACKET_JSON_BYTES,

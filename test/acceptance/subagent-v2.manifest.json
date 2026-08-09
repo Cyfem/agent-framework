@@ -2268,6 +2268,50 @@
             "file": "packages/executor-http/test/http-multipart.test.ts",
             "testName": "[acceptance:C7C-HTTP-MP05.l1.exact-route-policy][variant:raw-method-path-and-no-fallback]"
           }
+        },
+        {
+          "caseId": "C7C-HTTP-POLL01.l1.closed-poll-json",
+          "variant": "closed-fields-owned-and-byte-bounded",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-wire.test.ts",
+            "testName": "[acceptance:C7C-HTTP-POLL01.l1.closed-poll-json][variant:closed-fields-owned-and-byte-bounded]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-POLL02.l1.canonical-uint64-wait",
+          "variant": "uint64-and-long-poll-bounds",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-wire.test.ts",
+            "testName": "[acceptance:C7C-HTTP-POLL02.l1.canonical-uint64-wait][variant:uint64-and-long-poll-bounds]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-RECEIPT01.l1.semantic-delivery-receipt",
+          "variant": "nonce-boundary-peer-sequence-invariant",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-wire.test.ts",
+            "testName": "[acceptance:C7C-HTTP-RECEIPT01.l1.semantic-delivery-receipt][variant:nonce-boundary-peer-sequence-invariant]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-ROUTE01.l1.closed-route-kind-policy",
+          "variant": "route-operation-kind-table",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-wire.test.ts",
+            "testName": "[acceptance:C7C-HTTP-ROUTE01.l1.closed-route-kind-policy][variant:route-operation-kind-table]"
+          }
         }
       ]
     },

@@ -1,8 +1,8 @@
 # `@ruixutong.manee/maneeagent-executor-http`
 
-Manee Agent Framework 的 HTTP Subagent wire-security 基础包。当前 `2.0.0` checkout 提供严格的单包 `multipart/mixed` 编解码、HMAC-SHA256 v1 验签、原子 replay cache SPI、owner scope 授权顺序和脱敏 admission 结果。
+Manee Agent Framework 的 HTTP Subagent wire 基础包。当前 `2.0.0` checkout 提供严格的单包 `multipart/mixed` 编解码、HMAC-SHA256 v1 验签、原子 replay cache SPI、owner scope 授权顺序、脱敏 admission 结果，以及 C7c-5b 的 closed poll command、route↔RPC policy 和 semantic packet receipt。
 
-> **当前范围与发布状态**：该包尚未发布到 npm，也还不是可运行的 HTTP Executor。它不包含 HTTP listener/client、job store、heartbeat handler、event cursor、approval resume、external reconnect 或 Remote `SubAgentExecutor`。这些能力属于后续 C7c-5；因此当前 Phase 2 仍未通过。`npm pack` 成功不等于已经发布。
+> **当前范围与发布状态**：该包尚未发布到 npm，也还不是可运行的 HTTP Executor。它不包含 HTTP listener/client、job store、heartbeat handler、durable remote cursor、delivery response、approval resume、external reconnect 或 Remote `SubAgentExecutor`。这些能力仍属于后续 C7c-5；因此当前 Phase 2 仍未通过。`npm pack` 成功不等于已经发布。
 
 要求 Node.js >= 22。包同时输出 ESM、CJS、TypeScript 声明和 source map，peer dependency 为 `@ruixutong.manee/maneeagent-framework@^2.0.0`。
 
@@ -23,6 +23,8 @@ npm install @ruixutong.manee/maneeagent-framework@^2.0.0 \
 - 在签名通过后原子消费 `(keyId, nonce)` replay receipt；生产模式只接受调用方提供的 distributed cache。
 - 在无业务副作用的 multipart/strict RPC decode 后解析 owner scope，再独立执行 authorization；只有授权成功才调用 `onPacket`。
 - 返回固定、`no-store` 的 401/400/503/500 安全响应，并只允许脱敏 diagnostic。
+- 编解码最大 4 KiB 的 closed poll command，并将 `channelGeneration`、`ackCursor` 与 Core event sequence/Peer sequence 分离。
+- 对七条 route 与 strict RPC kind/operation/mode 做 closed 匹配，并为合法 packet 计算忽略 HTTP/Peer 重试身份的 semantic SHA-256 receipt。
 
 当前包不打开端口、不访问网络、不读取环境变量或 API key，也不会发起真实模型请求。
 
@@ -65,6 +67,36 @@ top-level `Content-Type` 必须是未加引号的精确 `multipart/mixed; bounda
 
 不支持 nested multipart、`Content-Transfer-Encoding`、base64 fallback、未知 part header、preamble/epilogue 或任意 content sniffing。decoder 根据已验 descriptor 的 `byteLength` 读取 binary，不在任意二进制里搜索 boundary；完整 packet、RPC frame、sidecar count/order/ID/length/SHA-256 全部通过后才返回 owned copy。
 
+## Poll command、route policy 与 semantic receipt
+
+poll transport command 使用精确 `Content-Type: application/vnd.maneeagent.poll+json`，body 是最大 4 KiB 的 closed JSON：
+
+```json
+{
+  "version": "1",
+  "channelId": "trusted-channel-id",
+  "channelGeneration": "1",
+  "ackCursor": "0",
+  "waitMs": 10000
+}
+```
+
+`channelId` 是最多 128 字符的 opaque ASCII token；`channelGeneration` 与 `ackCursor` 是 canonical decimal uint64 string；`waitMs` 是 `0..10000` 的整数。它们只定义后续 HTTP job transport 的 signed command wire，不会自行查找 job、确认 delivery、启动 long poll 或推进任何 cursor。remote cursor、Core task-event `sequence` 与 Peer envelope `sequence` 是三个独立域，不能互相复用。
+
+`decodeHttpSubAgentRoutedPacket()` 会重新验证 parsed route、strict RPC frame、sidecar bytes/digest 和默认 Core hard cap，再执行以下纯 policy；它不调用 Peer/Core：
+
+| route                      | 允许的 packet                                                                                                   |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `heartbeat`                | 不允许 packet                                                                                                   |
+| `jobs.create`              | `executor.request` + `operation=create` + `mode=execute` 或 `mode=spawn`                                        |
+| `jobs.resume`              | `executor.request` + `operation=resume` + `mode=execute`                                                        |
+| `jobs.reconnect`           | `executor.request` + `operation=reconnect` + `mode=spawn`                                                       |
+| `jobs.cancel`              | `cancel.request`                                                                                                |
+| `jobs.poll` multipart 分支 | `snapshot.request` 或 `events.request`                                                                          |
+| `jobs.control-reply`       | `control.reply`、`model.reply`、`events.page` 或 `protocol.error`，且 path `requestId` 等于 RPC `correlationId` |
+
+`createHttpSubAgentPacketSemanticReceipt()` 对合法 routed packet 计算 JCS SHA-256。投影保留 route kind/job scope、RPC kind/task/operation/payload 和按 `sidecarId` 排序的完整 descriptor；排除 HMAC nonce/timestamp/signature、multipart boundary，以及 Peer `channelId/sequence/messageId/correlationId` 和 control-reply path requestId。相同业务重试因此稳定，任何业务 payload、task/operation、job scope 或已验 sidecar 内容变化都会得到不同 receipt。它不是 job store、delivery ACK 或 create idempotency ledger。
+
 固定 hard cap：
 
 | 资源                   |            上限 |
@@ -81,7 +113,7 @@ top-level `Content-Type` 必须是未加引号的精确 `multipart/mixed; bounda
 
 `HttpSubAgentMultipartLimits` 只能收紧这些值，不能放宽。admission 会在验签或消费 replay receipt 前、没有请求副作用时预校验配置；配置和编程错误使 async 调用返回 rejected Promise，不会被伪装成安全 HTTP 请求失败。
 
-## 组合 admission
+## C7c-4 admission 基础组合
 
 ```ts
 import { Buffer } from 'node:buffer';
@@ -110,11 +142,14 @@ const result = await admitHttpSubAgentPacket(rawRequest, {
   replayCache,
   resolveOwnerSessionId: ({ route, packet }) => lookupSignedOwnerScope(route, packet),
   authorize: async (authContext, scope) => policyAllows(authContext.principalId, scope),
-  onPacket: async ({ packet, ownerSessionId }) => peerFor(ownerSessionId).receive(packet),
+  // 这里只记录已授权输入，不连接 Peer/Core。
+  onPacket: async (context) => recordAuthorizedPacketForTest(context),
 });
 ```
 
-`rawRequest.rawHeaders` 必须来自 Node `IncomingMessage.rawHeaders` 的 owned snapshot；body、header array 和 transport facts 应在第一次异步调用前固定。`resolveOwnerSessionId` 只能读取已经签名并严格 decode 的 packet、route 或后续 C7c-5 的受信 job state。`scope.method` 当前固定为 canonical HTTP `POST`，`routeId` 表示 endpoint 权限；C7c-5 还必须用 closed route policy 约束 route 与 Core RPC kind 的对应关系。
+该示例只展示 C7c-4 的认证/授权 admission，并故意不调用 Peer/Core。当前 `admitHttpSubAgentPacket()` 尚未把 C7c-5b route policy 组合进 protocol-error 映射；不能把示例中的测试 sink 直接替换为 `peer.receive()`。后续 endpoint 层必须在 Peer/Core 副作用前调用 `decodeHttpSubAgentRoutedPacket()`，把 route-kind mismatch 投影为认证后的固定 400，再交付合法的 `routed.packet`。
+
+`rawRequest.rawHeaders` 必须来自 Node `IncomingMessage.rawHeaders` 的 owned snapshot；body、header array 和 transport facts 应在第一次异步调用前固定。`resolveOwnerSessionId` 只能读取已经签名并严格 decode 的 packet、route 或后续 C7c-5 的受信 job state。`scope.method` 当前固定为 canonical HTTP `POST`，`routeId` 表示 endpoint 权限。
 
 验证顺序固定为：配置预校验 → route/header/body bounds → body digest/HMAC → 原子 replay → 完整 multipart/strict RPC decode → owner scope → authorization → `onPacket`。`/v1/heartbeat` 不是第十五种 Core RPC，也不能调用 packet admission；它将在后续 HTTP endpoint 层单独组合 verifier、endpoint authorization 和 heartbeat handler。
 
@@ -146,12 +181,14 @@ pnpm acceptance:subagent:v2:http-security:offline
 pnpm validate:subagent:v2:pack:http
 ```
 
-其中 Vitest/acceptance 测试加载 network-deny guard；整组离线命令均不读取 API key、不访问真实 HTTP endpoint 或模型，也不产生费用。当前 acceptance 只证明 multipart/HMAC/replay/authz/admission 的 L1/L2 安全基础；没有证明真实 listener、job 生命周期、external reconnect、L5 方舟或 L6 Docker/Linux，因此 `C7-HTTP`、`C7-AUTH` 和 Phase 2 requirement 仍保持 `planned`。
+其中 Vitest/acceptance 测试加载 network-deny guard；整组离线命令均不读取 API key、不访问真实 HTTP endpoint 或模型，也不产生费用。当前 acceptance 只证明 multipart/HMAC/replay/authz/admission 与 poll/route/receipt 的 L1/L2 wire 基础；没有证明真实 listener、job 生命周期、delivery/cursor store、external reconnect、L5 方舟或 L6 Docker/Linux，因此 `C7-HTTP`、`C7-AUTH` 和 Phase 2 requirement 仍保持 `planned`。
 
 ## 公共 API
 
 - route/常量：`parseHttpSubAgentRoute()`、`HTTP_SUBAGENT_*`
 - multipart：`encodeHttpSubAgentMultipartPacket()`、`decodeHttpSubAgentMultipartPacket()` 与相关 types/limits
+- poll：`encodeHttpSubAgentPollCommand()`、`decodeHttpSubAgentPollCommand()` 与相关 types/constants
+- route/receipt：`decodeHttpSubAgentRoutedPacket()`、`createHttpSubAgentPacketSemanticReceipt()` 与相关 types
 - HMAC：`createHttpSubAgentHmacHeaders()`、`createHttpSubAgentHmacVerifier()`、`createStaticHttpSubAgentHmacKeyResolver()`、`HttpSubAgentSecurityError` 与 auth/replay contracts
 - replay：`HttpSubAgentReplayCache`、`MemoryHttpSubAgentReplayCache`
 - admission：`admitHttpSubAgentPacket()` 与 owner resolver、authorization、diagnostic/result contracts

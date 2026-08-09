@@ -243,7 +243,7 @@ function copySidecarBytes(value: Uint8Array | ArrayBuffer): Uint8Array {
   if (nodeTypes.isProxy(value)) {
     throw new TypeError('Artifact sidecar byte payload must not be a Proxy.');
   }
-  if (value instanceof Uint8Array) {
+  if (nodeTypes.isUint8Array(value)) {
     // A length-tracking view over a growable SharedArrayBuffer can change size while another
     // worker is running. Pin the first observed length before copying so descriptor validation and
     // packet accounting always refer to one owned snapshot rather than a later, larger view.
@@ -255,7 +255,7 @@ function copySidecarBytes(value: Uint8Array | ArrayBuffer): Uint8Array {
     owned.set(fixedLengthView);
     return owned;
   }
-  if (value instanceof ArrayBuffer) {
+  if (nodeTypes.isArrayBuffer(value)) {
     // Avoid ArrayBuffer#slice because a subclass can redirect it through Symbol.species and retain
     // the alleged copy. A plain view plus a plain owned destination has no species or iterator hook.
     const observedByteLength = Reflect.apply(ARRAY_BUFFER_BYTE_LENGTH_GETTER, value, []);
