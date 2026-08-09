@@ -1,8 +1,8 @@
 # `@ruixutong.manee/maneeagent-executor-http`
 
-Manee Agent Framework 的 HTTP Subagent wire 基础包。当前 `2.0.0` checkout 提供严格的单包 `multipart/mixed` 编解码、HMAC-SHA256 v1 验签、原子 replay cache SPI、owner scope 授权顺序、脱敏 admission 结果，以及 C7c-5b 的 closed poll command、route↔RPC policy 和 semantic packet receipt。
+Manee Agent Framework 的 HTTP Subagent wire 基础包。当前 `2.0.0` checkout 提供严格的单包 `multipart/mixed` 编解码、HMAC-SHA256 v1 验签、原子 replay cache SPI、owner scope 授权顺序、脱敏 admission 结果，C7c-5b 的 closed poll command、route↔RPC policy 和 semantic packet receipt，以及 C7c-5c 的 create/replay Job Store 地基。
 
-> **当前范围与发布状态**：该包尚未发布到 npm，也还不是可运行的 HTTP Executor。它不包含 HTTP listener/client、job store、heartbeat handler、durable remote cursor、delivery response、approval resume、external reconnect 或 Remote `SubAgentExecutor`。这些能力仍属于后续 C7c-5；因此当前 Phase 2 仍未通过。`npm pack` 成功不等于已经发布。
+> **当前范围与发布状态**：该包尚未发布到 npm，也还不是可运行的 HTTP Executor。C7c-5c 只增加 create/replay 原子 Store SPI 和显式 loopback-test 的 bounded Memory 实现；它不包含 production durable Store adapter、Store IO context、HTTP listener/client、heartbeat handler、delivery envelope/response、poll wait/ACK、可变 revision/generation/cursor CAS、approval resume、external reconnect 或 Remote `SubAgentExecutor`。这些能力仍属于后续 C7c-5；因此当前 Phase 2 仍未通过。`npm pack` 成功不等于已经发布。
 
 要求 Node.js >= 22。包同时输出 ESM、CJS、TypeScript 声明和 source map，peer dependency 为 `@ruixutong.manee/maneeagent-framework@^2.0.0`。
 
@@ -25,6 +25,8 @@ npm install @ruixutong.manee/maneeagent-framework@^2.0.0 \
 - 返回固定、`no-store` 的 401/400/503/500 安全响应，并只允许脱敏 diagnostic。
 - 编解码最大 4 KiB 的 closed poll command，并将 `channelGeneration`、`ackCursor` 与 Core event sequence/Peer sequence 分离。
 - 对七条 route 与 strict RPC kind/operation/mode 做 closed 匹配，并为合法 packet 计算忽略 HTTP/Peer 重试身份的 semantic SHA-256 receipt。
+- 从一次严格 owned `jobs.create` decode 生成排除 transport-relative `remainingMs` 的 create identity，并通过三条唯一索引原子 create/replay 初始 job record。
+- 提供 full-scope load、只返回 owner 的 pre-authorization lookup，以及同时受 job 数和 protocol-retained bytes 限制的 loopback-test Memory Store。
 
 当前包不打开端口、不访问网络、不读取环境变量或 API key，也不会发起真实模型请求。
 
@@ -96,6 +98,27 @@ poll transport command 使用精确 `Content-Type: application/vnd.maneeagent.po
 | `jobs.control-reply`       | `control.reply`、`model.reply`、`events.page` 或 `protocol.error`，且 path `requestId` 等于 RPC `correlationId` |
 
 `createHttpSubAgentPacketSemanticReceipt()` 对合法 routed packet 计算 JCS SHA-256。投影保留 route kind/job scope、RPC kind/task/operation/payload 和按 `sidecarId` 排序的完整 descriptor；排除 HMAC nonce/timestamp/signature、multipart boundary，以及 Peer `channelId/sequence/messageId/correlationId` 和 control-reply path requestId。相同业务重试因此稳定，任何业务 payload、task/operation、job scope 或已验 sidecar 内容变化都会得到不同 receipt。它不是 job store、delivery ACK 或 create idempotency ledger。
+
+## C7c-5c create/replay Job Store 地基
+
+`createHttpSubAgentJobCreateIdentity({ route, packet })` 只接受通过 `jobs.create` policy 的 strict `executor.request + operation=create`。它只 decode/own 完整 packet 一次，并从同一 snapshot 返回 owner/run/task/operation/idempotency/mode/channel/remaining metadata、owned packet、`createIdentity` 和首包 `createReceipt`：
+
+- `createIdentity` 是 `{ version, mode, requestWithoutRemainingMs, sidecarDescriptorsSortedBySidecarId }` 的 JCS SHA-256。它排除 HTTP/HMAC/multipart 与 Peer `channelId/sequence/messageId/correlationId`，也排除会随重试衰减的 `remainingMs`；完整 create request 业务字段和已验 sidecar descriptor 仍参与 hash。
+- `createReceipt` 是 C7c-5b 的完整 semantic packet receipt，保留首次请求的 `remainingMs` 业务快照；它用于审计首写证据，不替代 `createIdentity`。
+
+`HttpSubAgentJobStore.createOrReplay()` 的原子唯一域固定为三条索引：
+
+1. create key：`principalId + ownerSessionId + idempotencyKey`；
+2. route job：`principalId + jobId`；
+3. logical task：`principalId + ownerSessionId + taskId`。
+
+首写创建 closed `HttpSubAgentJobRecordV1`：`state='created'`、`revision='0'`、`channelGeneration='0'`，并保留首次 `channelId`、`remainingMsCeiling`、Store clock 生成且相等的 `createdAt/updatedAt` 及完整 owned `createPacket`。相同 create key 只有在 `createIdentity` 相同且新的 `remainingMs <= remainingMsCeiling` 时返回原 record；replay 的 candidate `jobId` 被忽略，且不会读取 clock、修改 timestamp/revision 或扩张 deadline。identity 变化、deadline 扩张、principal-scoped jobId 冲突或 logical task 冲突统一以 `HttpSubAgentJobStoreError.category='idempotency_conflict'` fail closed。
+
+`load({ principalId, ownerSessionId, jobId })` 必须完整命中 scope；错 principal、错 owner 与 unknown 都返回 `undefined`。`resolveForAuthorization({ principalId, jobId })` 只向受信 handler 返回 frozen `{ ownerSessionId }`，用于随后立即调用独立 authorizer；它不会在授权前复制或暴露 task/hash/full packet，也不能把 found/missing/owner 差异直接映射到外部响应。
+
+`MemoryHttpSubAgentJobStore` 只能用 `{ mode: 'loopback-test' }` 构造，默认最多保留 10,000 个 job、256 MiB protocol-retained bytes。`retainedBytes` 精确定义为 canonical frame UTF-8 bytes，加每个 canonical sidecar descriptor JSON UTF-8 bytes，再加 raw sidecar bytes；它不是 JavaScript heap 总量估算。job 数或 bytes 任一耗尽时，新 create 返回 `capacity_exhausted`，不会 LRU/TTL/逐 job 删除；已经保留的合法 replay 仍优先命中。`dispose()` 幂等地归零 Store-owned sidecar bytes并清空三个 Memory 索引，之后 create/load/authorization lookup 固定返回 `disposed`。每次公开 create/load 结果都重新复制 packet bytes，调用方修改返回的 `Uint8Array` 不会改变 Store 内部 record。
+
+本批没有 delivery/spool、`enqueue`/`ackPoll`、long-poll wait、listener/client、heartbeat、approval/resume、external reconnect 或任何 mutable cursor/revision/generation CAS。production durable Store、signal/deadline IO context、delivery fencing 与 reconnect 状态机留给 C7c-5d；当前 API 不构成完整 job lifecycle。
 
 固定 hard cap：
 
@@ -181,7 +204,7 @@ pnpm acceptance:subagent:v2:http-security:offline
 pnpm validate:subagent:v2:pack:http
 ```
 
-其中 Vitest/acceptance 测试加载 network-deny guard；整组离线命令均不读取 API key、不访问真实 HTTP endpoint 或模型，也不产生费用。当前 acceptance 只证明 multipart/HMAC/replay/authz/admission 与 poll/route/receipt 的 L1/L2 wire 基础；没有证明真实 listener、job 生命周期、delivery/cursor store、external reconnect、L5 方舟或 L6 Docker/Linux，因此 `C7-HTTP`、`C7-AUTH` 和 Phase 2 requirement 仍保持 `planned`。
+其中 Vitest/acceptance 测试加载 network-deny guard；整组离线命令均不读取 API key、不访问真实 HTTP endpoint 或模型，也不产生费用。当前 acceptance 只证明 multipart/HMAC/replay/authz/admission、poll/route/receipt wire 和 create/replay Store 的 L1/L2 基础；没有证明真实 listener、完整 job 生命周期、durable delivery/cursor store、external reconnect、L5 方舟或 L6 Docker/Linux，因此 `C7-HTTP`、`C7-AUTH` 和 Phase 2 requirement 仍保持 `planned`。
 
 ## 公共 API
 
@@ -189,6 +212,7 @@ pnpm validate:subagent:v2:pack:http
 - multipart：`encodeHttpSubAgentMultipartPacket()`、`decodeHttpSubAgentMultipartPacket()` 与相关 types/limits
 - poll：`encodeHttpSubAgentPollCommand()`、`decodeHttpSubAgentPollCommand()` 与相关 types/constants
 - route/receipt：`decodeHttpSubAgentRoutedPacket()`、`createHttpSubAgentPacketSemanticReceipt()` 与相关 types
+- job/create Store：`createHttpSubAgentJobCreateIdentity()`、`normalizeHttpSubAgentJobRecord()`、`HttpSubAgentJobStore`、`MemoryHttpSubAgentJobStore`、`HttpSubAgentJobStoreError` 与相关 constants/types
 - HMAC：`createHttpSubAgentHmacHeaders()`、`createHttpSubAgentHmacVerifier()`、`createStaticHttpSubAgentHmacKeyResolver()`、`HttpSubAgentSecurityError` 与 auth/replay contracts
 - replay：`HttpSubAgentReplayCache`、`MemoryHttpSubAgentReplayCache`
 - admission：`admitHttpSubAgentPacket()` 与 owner resolver、authorization、diagnostic/result contracts

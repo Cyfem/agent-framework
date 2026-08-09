@@ -1,7 +1,7 @@
 {
   "name": "@ruixutong.manee/maneeagent-executor-http",
   "version": "2.0.0",
-  "description": "Signed HTTP Subagent wire-security primitives for Manee Agent Framework.",
+  "description": "Signed HTTP Subagent wire and bounded job Store primitives for Manee Agent Framework.",
   "type": "module",
   "license": "MIT",
   "sideEffects": false,

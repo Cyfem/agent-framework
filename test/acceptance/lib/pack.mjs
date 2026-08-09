@@ -657,30 +657,49 @@ processExecutorNamespace.processFailpointForTest;
   if (packageName === '@ruixutong.manee/maneeagent-executor-http') {
     return `import * as httpExecutorNamespace from '${packageName}';
 import {
+  DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY,
+  DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES,
   HTTP_SUBAGENT_AUTH_VERSION,
   HTTP_SUBAGENT_HMAC_SCHEME,
+  HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION,
+  HTTP_SUBAGENT_JOB_RECORD_VERSION,
   HTTP_SUBAGENT_MAX_POLL_BODY_BYTES,
   HTTP_SUBAGENT_MAX_POLL_WAIT_MS,
   HTTP_SUBAGENT_PACKET_MEDIA_TYPE,
   HTTP_SUBAGENT_PACKET_VERSION,
   HTTP_SUBAGENT_POLL_MEDIA_TYPE,
   HTTP_SUBAGENT_POLL_VERSION,
+  HttpSubAgentJobStoreError,
   HttpSubAgentSecurityError,
+  MemoryHttpSubAgentJobStore,
   MemoryHttpSubAgentReplayCache,
   admitHttpSubAgentPacket,
   createHttpSubAgentHmacHeaders,
   createHttpSubAgentHmacVerifier,
   createStaticHttpSubAgentHmacKeyResolver,
+  createHttpSubAgentJobCreateIdentity,
   createHttpSubAgentPacketSemanticReceipt,
   decodeHttpSubAgentMultipartPacket,
   decodeHttpSubAgentPollCommand,
   decodeHttpSubAgentRoutedPacket,
   encodeHttpSubAgentMultipartPacket,
   encodeHttpSubAgentPollCommand,
+  normalizeHttpSubAgentJobRecord,
   parseHttpSubAgentRoute,
   type AdmitHttpSubAgentPacketOptions,
   type HttpSubAgentAuthContext,
   type HttpSubAgentHmacVerifier,
+  type HttpSubAgentJobAuthorizationLookup,
+  type HttpSubAgentJobAuthorizationResolution,
+  type HttpSubAgentJobCreateIdentity,
+  type HttpSubAgentJobCreateIdentityInput,
+  type HttpSubAgentJobCreateInput,
+  type HttpSubAgentJobCreateResult,
+  type HttpSubAgentJobRecordV1,
+  type HttpSubAgentJobScope,
+  type HttpSubAgentJobStore,
+  type HttpSubAgentJobStoreErrorCategory,
+  type HttpSubAgentJobStoreMode,
   type HttpSubAgentMultipartLimits,
   type HttpSubAgentEncodedPollCommand,
   type HttpSubAgentPacketSemanticReceiptInput,
@@ -690,6 +709,8 @@ import {
   type HttpSubAgentReplayCache,
   type HttpSubAgentRoute,
   type HttpSubAgentRoutedPacket,
+  type MemoryHttpSubAgentJobStoreDiagnostics,
+  type MemoryHttpSubAgentJobStoreOptions,
 } from '${packageName}';
 
 type IsAny<T> = 0 extends 1 & T ? true : false;
@@ -705,16 +726,29 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<typeof createHttpSubAgentHmacHeaders>>,
   AssertFalse<IsAny<typeof createHttpSubAgentHmacVerifier>>,
   AssertFalse<IsAny<typeof createStaticHttpSubAgentHmacKeyResolver>>,
+  AssertFalse<IsAny<typeof createHttpSubAgentJobCreateIdentity>>,
   AssertFalse<IsAny<typeof createHttpSubAgentPacketSemanticReceipt>>,
   AssertFalse<IsAny<typeof decodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof decodeHttpSubAgentPollCommand>>,
   AssertFalse<IsAny<typeof decodeHttpSubAgentRoutedPacket>>,
   AssertFalse<IsAny<typeof encodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof encodeHttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<typeof normalizeHttpSubAgentJobRecord>>,
   AssertFalse<IsAny<typeof parseHttpSubAgentRoute>>,
   AssertFalse<IsAny<AdmitHttpSubAgentPacketOptions>>,
   AssertFalse<IsAny<HttpSubAgentAuthContext>>,
   AssertFalse<IsAny<HttpSubAgentHmacVerifier>>,
+  AssertFalse<IsAny<HttpSubAgentJobAuthorizationLookup>>,
+  AssertFalse<IsAny<HttpSubAgentJobAuthorizationResolution>>,
+  AssertFalse<IsAny<HttpSubAgentJobCreateIdentity>>,
+  AssertFalse<IsAny<HttpSubAgentJobCreateIdentityInput>>,
+  AssertFalse<IsAny<HttpSubAgentJobCreateInput>>,
+  AssertFalse<IsAny<HttpSubAgentJobCreateResult>>,
+  AssertFalse<IsAny<HttpSubAgentJobRecordV1>>,
+  AssertFalse<IsAny<HttpSubAgentJobScope>>,
+  AssertFalse<IsAny<HttpSubAgentJobStore>>,
+  AssertFalse<IsAny<HttpSubAgentJobStoreErrorCategory>>,
+  AssertFalse<IsAny<HttpSubAgentJobStoreMode>>,
   AssertFalse<IsAny<HttpSubAgentMultipartLimits>>,
   AssertFalse<IsAny<HttpSubAgentEncodedPollCommand>>,
   AssertFalse<IsAny<HttpSubAgentPacketSemanticReceiptInput>>,
@@ -724,6 +758,8 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<HttpSubAgentReplayCache>>,
   AssertFalse<IsAny<HttpSubAgentRoute>>,
   AssertFalse<IsAny<HttpSubAgentRoutedPacket>>,
+  AssertFalse<IsAny<MemoryHttpSubAgentJobStoreDiagnostics>>,
+  AssertFalse<IsAny<MemoryHttpSubAgentJobStoreOptions>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_PACKET_VERSION, '1'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_AUTH_VERSION, '1'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_HMAC_SCHEME, 'MANEE-HMAC-SHA256-V1'>>,
@@ -732,21 +768,29 @@ type HttpContractAssertions = [
   AssertTrue<Equal<typeof HTTP_SUBAGENT_POLL_MEDIA_TYPE, 'application/vnd.maneeagent.poll+json'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_MAX_POLL_BODY_BYTES, 4096>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_MAX_POLL_WAIT_MS, 10000>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_JOB_RECORD_VERSION, '1'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION, '0'>>,
+  AssertTrue<Equal<typeof DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY, 10000>>,
+  AssertTrue<Equal<typeof DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES, 268435456>>,
 ];
 
 const publicValues = [
+  HttpSubAgentJobStoreError,
   HttpSubAgentSecurityError,
+  MemoryHttpSubAgentJobStore,
   MemoryHttpSubAgentReplayCache,
   admitHttpSubAgentPacket,
   createHttpSubAgentHmacHeaders,
   createHttpSubAgentHmacVerifier,
   createStaticHttpSubAgentHmacKeyResolver,
+  createHttpSubAgentJobCreateIdentity,
   createHttpSubAgentPacketSemanticReceipt,
   decodeHttpSubAgentMultipartPacket,
   decodeHttpSubAgentPollCommand,
   decodeHttpSubAgentRoutedPacket,
   encodeHttpSubAgentMultipartPacket,
   encodeHttpSubAgentPollCommand,
+  normalizeHttpSubAgentJobRecord,
   parseHttpSubAgentRoute,
 ] as const;
 declare const httpContractAssertions: HttpContractAssertions;
@@ -760,6 +804,10 @@ httpExecutorNamespace.decodeOwnedHttpSubAgentMultipartPacket;
 httpExecutorNamespace.normalizeHttpSubAgentMultipartLimits;
 // @ts-expect-error HTTP security test failpoints must never become public API.
 httpExecutorNamespace.httpSecurityFailpointForTest;
+// @ts-expect-error Routed receipt projection helpers are package-internal.
+httpExecutorNamespace.createHttpSubAgentRoutedPacketSemanticReceipt;
+// @ts-expect-error Sidecar descriptor sorting is package-internal.
+httpExecutorNamespace.sortedHttpSubAgentSidecarDescriptors;
 `;
   }
   return `import * as packageApi from '${packageName}';
@@ -1024,16 +1072,29 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentHmacHeaders>>,
   AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentHmacVerifier>>,
   AssertFalse<IsAny<typeof httpExecutor.createStaticHttpSubAgentHmacKeyResolver>>,
+  AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentJobCreateIdentity>>,
+  AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentPacketSemanticReceipt>>,
   AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentPollCommand>>,
   AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentRoutedPacket>>,
   AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<typeof httpExecutor.normalizeHttpSubAgentJobRecord>>,
   AssertFalse<IsAny<typeof httpExecutor.parseHttpSubAgentRoute>>,
-  AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentPacketSemanticReceipt>>,
   AssertFalse<IsAny<httpExecutor.AdmitHttpSubAgentPacketOptions>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentAuthContext>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentHmacVerifier>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobAuthorizationLookup>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobAuthorizationResolution>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobCreateIdentity>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobCreateIdentityInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobCreateInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobCreateResult>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobRecordV1>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobScope>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobStore>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobStoreErrorCategory>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobStoreMode>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentMultipartLimits>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentEncodedPollCommand>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentPacketSemanticReceiptInput>>,
@@ -1043,6 +1104,8 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<httpExecutor.HttpSubAgentReplayCache>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentRoute>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentRoutedPacket>>,
+  AssertFalse<IsAny<httpExecutor.MemoryHttpSubAgentJobStoreDiagnostics>>,
+  AssertFalse<IsAny<httpExecutor.MemoryHttpSubAgentJobStoreOptions>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_PACKET_VERSION, '1'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_AUTH_VERSION, '1'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_HMAC_SCHEME, 'MANEE-HMAC-SHA256-V1'>>,
@@ -1051,21 +1114,29 @@ type HttpContractAssertions = [
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_POLL_MEDIA_TYPE, 'application/vnd.maneeagent.poll+json'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_MAX_POLL_BODY_BYTES, 4096>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_MAX_POLL_WAIT_MS, 10000>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_JOB_RECORD_VERSION, '1'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION, '0'>>,
+  AssertTrue<Equal<typeof httpExecutor.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY, 10000>>,
+  AssertTrue<Equal<typeof httpExecutor.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES, 268435456>>,
 ];
 
 const publicValues = [
+  httpExecutor.HttpSubAgentJobStoreError,
   httpExecutor.HttpSubAgentSecurityError,
+  httpExecutor.MemoryHttpSubAgentJobStore,
   httpExecutor.MemoryHttpSubAgentReplayCache,
   httpExecutor.admitHttpSubAgentPacket,
   httpExecutor.createHttpSubAgentHmacHeaders,
   httpExecutor.createHttpSubAgentHmacVerifier,
   httpExecutor.createStaticHttpSubAgentHmacKeyResolver,
+  httpExecutor.createHttpSubAgentJobCreateIdentity,
   httpExecutor.createHttpSubAgentPacketSemanticReceipt,
   httpExecutor.decodeHttpSubAgentMultipartPacket,
   httpExecutor.decodeHttpSubAgentPollCommand,
   httpExecutor.decodeHttpSubAgentRoutedPacket,
   httpExecutor.encodeHttpSubAgentMultipartPacket,
   httpExecutor.encodeHttpSubAgentPollCommand,
+  httpExecutor.normalizeHttpSubAgentJobRecord,
   httpExecutor.parseHttpSubAgentRoute,
 ] as const;
 declare const httpContractAssertions: HttpContractAssertions;
@@ -1079,6 +1150,10 @@ httpExecutor.decodeOwnedHttpSubAgentMultipartPacket;
 httpExecutor.normalizeHttpSubAgentMultipartLimits;
 // @ts-expect-error HTTP security test failpoints must never become public API.
 httpExecutor.httpSecurityFailpointForTest;
+// @ts-expect-error Routed receipt projection helpers are package-internal.
+httpExecutor.createHttpSubAgentRoutedPacketSemanticReceipt;
+// @ts-expect-error Sidecar descriptor sorting is package-internal.
+httpExecutor.sortedHttpSubAgentSidecarDescriptors;
 `;
   }
   return `import packageApi = require('${packageName}');
@@ -1241,18 +1316,22 @@ for (const name of [
   }
   if (packageName === '@ruixutong.manee/maneeagent-executor-http') {
     checks.push(
+      `[packageApi.HttpSubAgentJobStoreError, 'HttpSubAgentJobStoreError', 'function']`,
       `[packageApi.HttpSubAgentSecurityError, 'HttpSubAgentSecurityError', 'function']`,
+      `[packageApi.MemoryHttpSubAgentJobStore, 'MemoryHttpSubAgentJobStore', 'function']`,
       `[packageApi.MemoryHttpSubAgentReplayCache, 'MemoryHttpSubAgentReplayCache', 'function']`,
       `[packageApi.admitHttpSubAgentPacket, 'admitHttpSubAgentPacket', 'function']`,
       `[packageApi.createHttpSubAgentHmacHeaders, 'createHttpSubAgentHmacHeaders', 'function']`,
       `[packageApi.createHttpSubAgentHmacVerifier, 'createHttpSubAgentHmacVerifier', 'function']`,
       `[packageApi.createStaticHttpSubAgentHmacKeyResolver, 'createStaticHttpSubAgentHmacKeyResolver', 'function']`,
+      `[packageApi.createHttpSubAgentJobCreateIdentity, 'createHttpSubAgentJobCreateIdentity', 'function']`,
       `[packageApi.createHttpSubAgentPacketSemanticReceipt, 'createHttpSubAgentPacketSemanticReceipt', 'function']`,
       `[packageApi.decodeHttpSubAgentMultipartPacket, 'decodeHttpSubAgentMultipartPacket', 'function']`,
       `[packageApi.decodeHttpSubAgentPollCommand, 'decodeHttpSubAgentPollCommand', 'function']`,
       `[packageApi.decodeHttpSubAgentRoutedPacket, 'decodeHttpSubAgentRoutedPacket', 'function']`,
       `[packageApi.encodeHttpSubAgentMultipartPacket, 'encodeHttpSubAgentMultipartPacket', 'function']`,
       `[packageApi.encodeHttpSubAgentPollCommand, 'encodeHttpSubAgentPollCommand', 'function']`,
+      `[packageApi.normalizeHttpSubAgentJobRecord, 'normalizeHttpSubAgentJobRecord', 'function']`,
       `[packageApi.parseHttpSubAgentRoute, 'parseHttpSubAgentRoute', 'function']`,
     );
     return `${load}
@@ -1262,10 +1341,14 @@ function expectType([value, name, expected]) {
 for (const check of [${checks.join(', ')}]) expectType(check);
 const expectedHttpRuntimeExports = ${JSON.stringify(
       [
+        'DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY',
+        'DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES',
         'HTTP_SUBAGENT_AUTH_HEADER_NAMES',
         'HTTP_SUBAGENT_AUTH_VERSION',
         'HTTP_SUBAGENT_DEFAULT_CLOCK_SKEW_MS',
         'HTTP_SUBAGENT_HMAC_SCHEME',
+        'HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION',
+        'HTTP_SUBAGENT_JOB_RECORD_VERSION',
         'HTTP_SUBAGENT_MAX_MULTIPART_BODY_BYTES',
         'HTTP_SUBAGENT_MAX_PACKET_JSON_BYTES',
         'HTTP_SUBAGENT_MAX_PART_HEADER_BYTES',
@@ -1276,35 +1359,49 @@ const expectedHttpRuntimeExports = ${JSON.stringify(
         'HTTP_SUBAGENT_POLL_MEDIA_TYPE',
         'HTTP_SUBAGENT_POLL_VERSION',
         'HTTP_SUBAGENT_REPLAY_TTL_MS',
+        'HttpSubAgentJobStoreError',
         'HttpSubAgentSecurityError',
+        'MemoryHttpSubAgentJobStore',
         'MemoryHttpSubAgentReplayCache',
         'admitHttpSubAgentPacket',
         'createHttpSubAgentHmacHeaders',
         'createHttpSubAgentHmacVerifier',
         'createStaticHttpSubAgentHmacKeyResolver',
+        'createHttpSubAgentJobCreateIdentity',
         'createHttpSubAgentPacketSemanticReceipt',
         'decodeHttpSubAgentMultipartPacket',
         'decodeHttpSubAgentPollCommand',
         'decodeHttpSubAgentRoutedPacket',
         'encodeHttpSubAgentMultipartPacket',
         'encodeHttpSubAgentPollCommand',
+        'normalizeHttpSubAgentJobRecord',
         'parseHttpSubAgentRoute',
       ].sort(),
     )};
 if (JSON.stringify(Object.keys(packageApi).sort()) !== JSON.stringify(expectedHttpRuntimeExports)) {
-  throw new Error('${packageName} must expose exactly the documented HTTP security runtime exports');
+  throw new Error('${packageName} must expose exactly the documented HTTP runtime exports');
 }
 if (
   packageApi.HTTP_SUBAGENT_PACKET_VERSION !== '1' ||
   packageApi.HTTP_SUBAGENT_AUTH_VERSION !== '1' ||
-  packageApi.HTTP_SUBAGENT_POLL_VERSION !== '1'
+  packageApi.HTTP_SUBAGENT_POLL_VERSION !== '1' ||
+  packageApi.HTTP_SUBAGENT_JOB_RECORD_VERSION !== '1' ||
+  packageApi.HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION !== '0'
 ) {
-  throw new Error('${packageName} HTTP packet, auth and poll versions must equal "1"');
+  throw new Error('${packageName} HTTP packet, auth, poll and job record constants are invalid');
+}
+if (
+  packageApi.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY !== 10000 ||
+  packageApi.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES !== 268435456
+) {
+  throw new Error('${packageName} Memory HTTP job Store defaults are invalid');
 }
 for (const name of [
   'decodeOwnedHttpSubAgentMultipartPacket',
   'normalizeHttpSubAgentMultipartLimits',
   'httpSecurityFailpointForTest',
+  'createHttpSubAgentRoutedPacketSemanticReceipt',
+  'sortedHttpSubAgentSidecarDescriptors',
 ]) {
   if (Object.prototype.hasOwnProperty.call(packageApi, name)) {
     throw new Error(\`${packageName} must not expose internal root export \${name}\`);

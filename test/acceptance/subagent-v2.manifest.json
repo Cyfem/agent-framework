@@ -2312,6 +2312,72 @@
             "file": "packages/executor-http/test/http-job-wire.test.ts",
             "testName": "[acceptance:C7C-HTTP-ROUTE01.l1.closed-route-kind-policy][variant:route-operation-kind-table]"
           }
+        },
+        {
+          "caseId": "C7C-HTTP-STORE01.l1.atomic-create-replay",
+          "variant": "first-write-deadline-ceiling-conflict",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-store.test.ts",
+            "testName": "[acceptance:C7C-HTTP-STORE01.l1.atomic-create-replay][variant:first-write-deadline-ceiling-conflict]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-STORE02.l2.concurrent-create-linearization",
+          "variant": "hundred-way-single-winner",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-store.test.ts",
+            "testName": "[acceptance:C7C-HTTP-STORE02.l2.concurrent-create-linearization][variant:hundred-way-single-winner]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-STORE05.l1.owned-frozen-scope",
+          "variant": "full-scope-and-authorization-resolution",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-store.test.ts",
+            "testName": "[acceptance:C7C-HTTP-STORE05.l1.owned-frozen-scope][variant:full-scope-and-authorization-resolution]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-STORE06.l2.bounded-memory-retention",
+          "variant": "count-bytes-no-lru-and-dispose",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-store.test.ts",
+            "testName": "[acceptance:C7C-HTTP-STORE06.l2.bounded-memory-retention][variant:count-bytes-no-lru-and-dispose]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-STORE08.l1.hostile-store-input",
+          "variant": "proxy-accessor-zero-side-effect",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-store.test.ts",
+            "testName": "[acceptance:C7C-HTTP-STORE08.l1.hostile-store-input][variant:proxy-accessor-zero-side-effect]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-STORE09.l1.create-semantic-identity",
+          "variant": "transport-deadline-invariant-business-sensitive",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-store.test.ts",
+            "testName": "[acceptance:C7C-HTTP-STORE09.l1.create-semantic-identity][variant:transport-deadline-invariant-business-sensitive]"
+          }
         }
       ]
     },
