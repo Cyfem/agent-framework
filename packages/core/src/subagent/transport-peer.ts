@@ -205,6 +205,8 @@ export interface SubAgentTransportPeerResponse {
 }
 
 export interface SubAgentTransportPeerHandlerRequest {
+  /** Trusted logical channel identity owned by the receiving Peer. */
+  readonly channelId: string;
   readonly envelope: RpcRequestEnvelope;
   readonly sidecars: readonly SubAgentTransportArtifactSidecar[];
   readonly receivedAt: number;
@@ -957,6 +959,7 @@ export class SubAgentTransportPeer {
       if (this.#handler === undefined) throw new Error('No handler.');
       await this.#handler(
         Object.freeze({
+          channelId: this.channelId,
           envelope: request.envelope,
           sidecars: cloneSidecars(request.sidecars),
           receivedAt: readNow(this.#now),

@@ -22,6 +22,7 @@ import type {
 } from '../src/subagent/executor';
 import { canonicalJsonSha256, type JsonValue } from '../src/subagent/json';
 import { DEFAULT_SUBAGENT_LIMITS } from '../src/subagent/limits';
+import { hashSubAgentTransportModelRequest } from '../src/subagent/transport-model-gateway';
 import {
   SubAgentTransportPeer,
   createSubAgentTransportPeerWriterAdmission,
@@ -409,23 +410,28 @@ function modelPayload(
   request: SubAgentChildRunRequest | SubAgentExecutionRequest,
   operationId: string,
 ): SubAgentTransportRpcPayloadMap['model.request'] {
-  return Object.freeze({
-    providerOperationId: operationId,
+  const context = Object.freeze([]);
+  const tools = Object.freeze([]);
+  const canonical = Object.freeze({
     gatewayId: 'controller-model',
     protocol: 'openai-chat',
     codecVersion: '1',
     runId: request.runId,
+    checkpointOperationId: `checkpoint-${request.taskId}`,
+    checkpointDigest: 'c'.repeat(64),
+    purpose: 'agent' as const,
+    iteration: 0,
+    requestAttempt: 1,
+    context,
+    tools,
+  });
+  return Object.freeze({
+    providerOperationId: operationId,
+    ...canonical,
     executionAttempt: request.attempt,
     executionEpoch: request.executionEpoch,
     executionFencingToken: request.executionFencingToken,
-    checkpointOperationId: `checkpoint-${request.taskId}`,
-    checkpointDigest: 'c'.repeat(64),
-    purpose: 'agent',
-    iteration: 0,
-    requestAttempt: 1,
-    requestHash: 'd'.repeat(64),
-    context: Object.freeze([]),
-    tools: Object.freeze([]),
+    requestHash: hashSubAgentTransportModelRequest(canonical),
     remainingMs: request.deadlineAt - NOW,
   });
 }
@@ -708,6 +714,7 @@ async function invokeTarget(
 ): Promise<readonly SubAgentTransportPeerReply[]> {
   const replies: SubAgentTransportPeerReply[] = [];
   await target.handler({
+    channelId: 'direct-target-handler',
     envelope,
     sidecars: [],
     receivedAt: NOW,
@@ -1281,7 +1288,7 @@ describe('Subagent transport controller/target bridge', () => {
     expect(model).not.toHaveBeenCalled();
   });
 
-  it('validates a reconnect binding before looking up a resident target task', async () => {
+  it('rejects a missing reconnect target before adapter-specific binding validation', async () => {
     const initial = createRequest();
     const validateBinding = vi.fn(async () => {
       throw new SubAgentRuntimeError({
@@ -1305,9 +1312,9 @@ describe('Subagent transport controller/target bridge', () => {
     });
 
     await expect(loopback.controller.execute(reconnect, fixtures.control)).rejects.toMatchObject({
-      code: 'BINDING_INVALID',
+      code: 'RESOURCE_NOT_FOUND',
     });
-    expect(validateBinding).toHaveBeenCalledTimes(1);
+    expect(validateBinding).not.toHaveBeenCalled();
     expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
     expect(loopback.factory).not.toHaveBeenCalled();
     expect(run).not.toHaveBeenCalled();
@@ -1688,15 +1695,33 @@ describe('Subagent transport controller/target bridge', () => {
 
   it('cancels by exact binding and does not expose a raw target handle on the wire', async () => {
     const request = createRequest();
+    let postCancelCheckpointError: unknown;
     const loopback = createLoopback({
-      run: async (childRequest) => {
+      run: async (childRequest, control) => {
         await new Promise<void>((resolve) => {
-          childRequest.signal.addEventListener('abort', () => resolve(), { once: true });
+          childRequest.signal.addEventListener(
+            'abort',
+            () => {
+              void (async () => {
+                await control.reportProgress('cancel-observed', {
+                  message: 'cancel-observed',
+                });
+                try {
+                  await control.commitCheckpoint('checkpoint-after-cancel', childCheckpoint());
+                } catch (error) {
+                  postCancelCheckpointError = error;
+                }
+                resolve();
+              })();
+            },
+            { once: true },
+          );
         });
         return terminalOutcome(request, 'cancelled');
       },
     });
-    const handle = await loopback.controller.spawn(request, createControl().control);
+    const hostControl = createControl();
+    const handle = await loopback.controller.spawn(request, hostControl.control);
     if (!('taskId' in handle)) throw new Error('Expected a task handle.');
     expect(JSON.parse(JSON.stringify(handle))).toEqual({
       taskId: request.taskId,
@@ -1708,6 +1733,11 @@ describe('Subagent transport controller/target bridge', () => {
       type: 'terminal',
       result: { status: 'cancelled' },
     });
+    expect(hostControl.reportProgress).toHaveBeenCalledWith('cancel-observed', {
+      message: 'cancel-observed',
+    });
+    expect(postCancelCheckpointError).toMatchObject({ code: 'RESOURCE_NOT_FOUND' });
+    expect(hostControl.commitCheckpoint).not.toHaveBeenCalled();
   });
 
   acceptanceIt('C7-GATEWAY-14.l1.target-session-scope', 'target-session-scope', async () => {
@@ -2031,6 +2061,7 @@ describe('Subagent transport controller/target bridge', () => {
     });
 
     await loopback.target.handler({
+      channelId: envelope.channelId,
       envelope: envelope as Extract<typeof envelope, { readonly kind: 'executor.request' }>,
       sidecars: [],
       receivedAt: NOW,
@@ -2242,7 +2273,13 @@ describe('Subagent transport controller/target bridge', () => {
           payload: stalePayload,
           timeoutMs: 1_000,
         }),
-      ).rejects.toMatchObject({ code: 'RESOURCE_NOT_FOUND' });
+      ).rejects.toMatchObject({
+        code: 'EXECUTOR_FAILED',
+        descriptor: {
+          causeCode: 'PROVIDER_REQUEST_OUTCOME_UNKNOWN',
+          outcomeUnknown: true,
+        },
+      });
       expect(model).toHaveBeenCalledTimes(2);
       expect(contextTwo?.signal.aborted).toBe(false);
 
@@ -2281,7 +2318,7 @@ describe('Subagent transport controller/target bridge', () => {
         run: async (request, control) => {
           if (request.attempt === 1) {
             staleControl = control;
-            return terminalOutcome(created);
+            throw new Error('simulated recoverable target failure');
           }
           markRecoveredStarted();
           await recoveredRelease;
@@ -2289,9 +2326,9 @@ describe('Subagent transport controller/target bridge', () => {
         },
       });
 
-      await expect(loopback.controller.execute(created, createControl().control)).resolves.toEqual(
-        terminalOutcome(created),
-      );
+      await expect(
+        loopback.controller.execute(created, createControl().control),
+      ).rejects.toMatchObject({ code: 'INTERNAL_ERROR' });
       const recoveredFixtures = createControl();
       const recoveredExecution = loopback.controller.execute(recovered, recoveredFixtures.control);
       await recoveredStarted;

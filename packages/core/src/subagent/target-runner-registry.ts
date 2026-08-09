@@ -312,41 +312,42 @@ export class SubAgentTargetRunnerRegistry {
 
     const input = parseInput(registration.definition, request.input);
     const childRequest = createOwnedChildRequest(request, input);
-    let factoryInvoked = false;
-    const preparation: PreparedSubAgentTargetRunner<I> = {
-      request: childRequest as SubAgentChildRunRequest<I>,
-      definition: registration.definition as unknown as SubAgentDefinition<I, JsonValue>,
-      runner: registration.runner,
-      ...(registration.modelBinding === undefined
-        ? {}
-        : { modelBinding: registration.modelBinding }),
-      create: async () => {
-        if (factoryInvoked) {
-          throw runtimeError(
-            'INVALID_STATE_TRANSITION',
-            'A prepared target runner factory may be invoked only once.',
-          );
-        }
-        factoryInvoked = true;
-        const context = Object.freeze({
-          request: childRequest,
-          definition: registration.definition,
-          executorName,
-          ...(registration.modelBinding === undefined
-            ? {}
-            : { modelBinding: registration.modelBinding }),
-        });
-        const runner = await registration.create(context);
-        if (typeof runner !== 'object' || runner === null || typeof runner.run !== 'function') {
-          throw runtimeError(
-            'INTERNAL_ERROR',
-            'A target runner factory returned an invalid runner.',
-          );
-        }
-        return runner;
-      },
-    };
-    return Object.freeze(preparation);
+    return createPreparedRunner<I>(registration, childRequest, executorName);
+  }
+
+  /**
+   * Compatibility-only preparation primitive for a trusted external-placement adapter. Ordinary
+   * reconnect requests remain non-creatable through `prepareExecution()`; the caller must first
+   * authorize the exact external binding and establish a controller-acknowledged checkpoint.
+   */
+  prepareExternalReconnect<I extends JsonValue = JsonValue>(
+    request: SubAgentExecutionRequest<I>,
+    checkpoint: SubAgentChildCheckpoint,
+    executorName: string,
+  ): PreparedSubAgentTargetRunner<I> {
+    if (!this.#sealed) {
+      throw new Error('Seal the Subagent target runner registry before preparing execution.');
+    }
+    assertIdentifier('executorName', executorName, IDENTIFIER_PATTERN);
+    assertCanonicalFencingToken(request.executionFencingToken, 'executionFencingToken');
+    if (request.operation.type !== 'reconnect') {
+      throw runtimeError(
+        'RECOVERY_UNSUPPORTED',
+        'External reconnect preparation requires a reconnect operation.',
+      );
+    }
+    const registration = this.#resolve(request.definition);
+    assertBinding(
+      request.operation.binding,
+      request,
+      executorName,
+      registration.runner,
+      registration.modelBinding,
+    );
+    assertCheckpoint(checkpoint, registration.runner);
+    const input = parseInput(registration.definition, request.input);
+    const childRequest = createOwnedChildRequest(request, input, checkpoint);
+    return createPreparedRunner<I>(registration, childRequest, executorName);
   }
 
   #resolve(definition: SubAgentDefinitionRef): StoredRegistration {
@@ -393,6 +394,7 @@ function parseInput(definition: SubAgentDefinition, input: unknown): JsonValue {
 function createOwnedChildRequest(
   request: SubAgentExecutionRequest,
   input: JsonValue,
+  checkpointOverride?: SubAgentChildCheckpoint,
 ): SubAgentChildRunRequest {
   let snapshot: JsonValue;
   try {
@@ -411,7 +413,11 @@ function createOwnedChildRequest(
       projectedContext: request.projectedContext,
       delegation: request.delegation,
       limits: resolveSubAgentLimits(request.limits),
-      ...(request.operation.type === 'resume' ? { checkpoint: request.operation.checkpoint } : {}),
+      ...(checkpointOverride === undefined
+        ? request.operation.type === 'resume'
+          ? { checkpoint: request.operation.checkpoint }
+          : {}
+        : { checkpoint: checkpointOverride }),
       deadlineAt: request.deadlineAt,
     };
     assertJsonValue(serializable);
@@ -426,6 +432,43 @@ function createOwnedChildRequest(
 
   const owned = snapshot as unknown as Omit<SubAgentChildRunRequest, 'signal'>;
   return Object.freeze({ ...owned, signal: request.signal });
+}
+
+function createPreparedRunner<I extends JsonValue>(
+  registration: StoredRegistration,
+  childRequest: SubAgentChildRunRequest,
+  executorName: string,
+): PreparedSubAgentTargetRunner<I> {
+  let factoryInvoked = false;
+  const preparation: PreparedSubAgentTargetRunner<I> = {
+    request: childRequest as SubAgentChildRunRequest<I>,
+    definition: registration.definition as unknown as SubAgentDefinition<I, JsonValue>,
+    runner: registration.runner,
+    ...(registration.modelBinding === undefined ? {} : { modelBinding: registration.modelBinding }),
+    create: async () => {
+      if (factoryInvoked) {
+        throw runtimeError(
+          'INVALID_STATE_TRANSITION',
+          'A prepared target runner factory may be invoked only once.',
+        );
+      }
+      factoryInvoked = true;
+      const context = Object.freeze({
+        request: childRequest,
+        definition: registration.definition,
+        executorName,
+        ...(registration.modelBinding === undefined
+          ? {}
+          : { modelBinding: registration.modelBinding }),
+      });
+      const runner = await registration.create(context);
+      if (typeof runner !== 'object' || runner === null || typeof runner.run !== 'function') {
+        throw runtimeError('INTERNAL_ERROR', 'A target runner factory returned an invalid runner.');
+      }
+      return runner;
+    },
+  };
+  return Object.freeze(preparation);
 }
 
 function assertBinding(

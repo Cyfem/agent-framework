@@ -13,7 +13,7 @@
   - HTTP signed multipart、HMAC/replay/authz 与当前非 Executor 边界：[packages/executor-http/README.md](./packages/executor-http/README.md)
   - 可运行示例、真实模型配置和费用边界：[demo/README.md](./demo/README.md)
   - 分批实施中的 Subagent v2 生产运行时设计与验收：[PLAN.md](./plans/subagent-v2-production-runtime/PLAN.md)、[TECHNICAL_CHANGES.md](./plans/subagent-v2-production-runtime/TECHNICAL_CHANGES.md) 与 [TEST_ACCEPTANCE_PLAN.md](./plans/subagent-v2-production-runtime/TEST_ACCEPTANCE_PLAN.md)
-  - 当前 checkout 已完成 C6，并交付 C7a/C7b/C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、recoverable Executor settle、target registry、controller/target bridge 与 controller-owned Model gateway、C7c-2/C7c-3 的离线 Worker/Process placement，以及 C7c-4 的 HTTP wire-security 基础；HTTP Executor/job/reconnect 尚未交付、Phase 2 未通过，C8–C9 分布式能力仍以源码、测试和 README 状态为准。
+  - 当前 checkout 已完成 C6，并交付 C7a/C7b/C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、recoverable Executor settle、target registry、controller/target bridge 与 controller-owned Model gateway、C7c-2/C7c-3 的离线 Worker/Process placement、C7c-4 的 HTTP wire-security 基础，以及显式 opt-in、仅同进程 resident task 生效的 Core external reconnect 前置地基；HTTP Executor/job/durable reconnect 尚未交付、Phase 2 未通过，C8–C9 分布式能力仍以源码、测试和 README 状态为准。
   - Core/Local/Worker/Process/HTTP package manifest 已固定为待发布 `2.0.0`，但 npm Core `latest` 仍是 `1.0.0`、四个配套包尚未发布；不得把 manifest、pack 成功或计划状态写成 npm 已发布。
 
 ## Working Rules
