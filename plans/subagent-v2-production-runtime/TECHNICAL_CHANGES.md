@@ -2,14 +2,14 @@
 
 ## 1. 文档状态
 
-- 设计状态：总体方向与 Phase 1 Oracle 已冻结；当前 checkout 已完成 C0～C6、C7a/C7b、C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway，以及 C7c-2 的离线 Worker placement；Process/HTTP placement 仍待实施。
+- 设计状态：总体方向与 Phase 1 Oracle 已冻结；当前 checkout 已完成 C0～C6、C7a/C7b、C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway，以及 C7c-2/C7c-3 的离线 Worker/Process placement；HTTP placement 仍待实施。
 - 目标版本：Core 与所有公开 Executor/State/Artifact/Observability 包统一首发 `2.0.0`。
 - 实施范围：Phase 1 Core/Local、Phase 2 Worker/Process/HTTP Remote、Phase 3 PostgreSQL/BullMQ/Docker/S3/OTel、Compose、测试、demo 与文档迁移。
 - 明确排除：conversation handoff、active-agent 所有权转移、Core 内置云 transport 或认证系统。
 
 本文件细化 [PLAN.md](./PLAN.md) 中已经确认的设计。接口名称是实施基线；文件名可以在不改变职责边界和公共语义的前提下微调。分层测试、故障注入与真实方舟 Agent Plan 的逐项发布门禁见 [TEST_ACCEPTANCE_PLAN.md](./TEST_ACCEPTANCE_PLAN.md)。
 
-当前实现边界以源码与包 README 为准：Core v2、官方 Local、Memory/Atomic File StateStore、公开 Agent durable loop、跨协议/跨进程 Phase 1 恢复和离线验收，以及 C7 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge、controller-owned Model gateway 和 C7c-2 离线 Worker placement 已经落地；`C7-WORKER` requirement 因缺少 L5/L6/Ark 仍为 `planned`，Process、HTTP 与 Phase 3 适配器仍按后续章节实施，Phase 2 尚未通过。真实方舟与 Docker/Linux live gate 未执行时不得标记为通过。
+当前实现边界以源码与包 README 为准：Core v2、官方 Local、Memory/Atomic File StateStore、公开 Agent durable loop、跨协议/跨进程 Phase 1 恢复和离线验收，以及 C7 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge、controller-owned Model gateway 和 C7c-2/C7c-3 离线 Worker/Process placement已经落地；`C7-WORKER` 与 `C7-PROCESS` requirement 因缺少 L5/L6/Ark 仍为 `planned`，HTTP 与 Phase 3 适配器仍按后续章节实施，Phase 2 尚未通过。真实方舟与 Docker/Linux live gate 未执行时不得标记为通过。
 
 ## 2. 设计目标与硬性不变量
 
@@ -1207,7 +1207,7 @@ Local factory 接收 SubAgentExecutionControl.delegation 并把它作为 child �
 
 C7 的三个 placement 共用 Core 导出的协议无关 transport v1 contract，不允许各包复制或扩展不兼容 wire：
 
-当前 Core 实现已经冻结并公开该公共层：C7b 基线与 C7c-1 扩展后的 14-kind strict RPC、16-method control dispatcher/proxy、双向 `SubAgentTransportPeer`、canonical replay/reply cache、同步 writer admission receipt、带 settlement headroom 的 drain/rollover、spawn 的 `accepted → settled` 或 direct `unbound_create` recovery settlement、有界 abort/timeout tombstone、默认 32 MiB artifact sidecar、controller/target bridge 与 `model.request`/`model.reply` gateway。writer 的可选 `settled` 只报告 I/O 完成，不参与下一帧准入排序；非法同步 receipt 在调用返回前失败，准入前 abort 不发送 packet。Peer 对 accepted/settled/events/model reply 与原 request 做语义关联，超长 timeout 分段调度；soft drain 仍允许所有 reply/replay 和 active executor task 的 control/cancel/snapshot/events continuation，hard sequence bound 才 fail-close。它们通过 closed schema、scope/receipt/outcome 重验、owner partition 和 safe-error 白名单把远端 runner 接回 Core control plane。C7c-2 已在这套公共层上交付离线 Worker transport 与 `worker_threads` 生命周期；Process、HTTP transport、鉴权和各自的 OS/network 生命周期仍未实现。Worker 的 L5/L6/Ark 证据同样未完成，因此不能把本节状态写成 Phase 2 通过。
+当前 Core 实现已经冻结并公开该公共层：C7b 基线与 C7c-1 扩展后的 14-kind strict RPC、16-method control dispatcher/proxy、双向 `SubAgentTransportPeer`、canonical replay/reply cache、同步 writer admission receipt、带 settlement headroom 的 drain/rollover、spawn 的 `accepted → settled` 或 direct `unbound_create` recovery settlement、有界 abort/timeout tombstone、默认 32 MiB artifact sidecar、controller/target bridge 与 `model.request`/`model.reply` gateway。writer 的可选 `settled` 只报告 I/O 完成，不参与下一帧准入排序；非法同步 receipt 在调用返回前失败，准入前 abort 不发送 packet。Peer 对 accepted/settled/events/model reply 与原 request 做语义关联，超长 timeout 分段调度；soft drain 仍允许所有 reply/replay 和 active executor task 的 control/cancel/snapshot/events continuation，hard sequence bound 才 fail-close。它们通过 closed schema、scope/receipt/outcome 重验、owner partition 和 safe-error 白名单把远端 runner 接回 Core control plane。C7c-2/C7c-3 已在这套公共层上交付离线 Worker/Process transport，以及各自的 `worker_threads`/`child_process` 生命周期；HTTP transport、鉴权和网络生命周期仍未实现。Worker/Process 的 L5/L6/Ark 证据同样未完成，因此不能把本节状态写成 Phase 2 通过。
 
 - JSON envelope 固定为 `{ version: '1', channelId, sequence, messageId, correlationId?, taskId?, operationId?, kind, payload }`，所有 object 都是 closed shape；默认单个 JSON frame 上限 16 MiB。
 - 每个方向的 `sequence` 从 1 连续递增。相同 `messageId + canonical decoded envelope` 是协议重放并返回原 reply，sidecar 以 `sidecarId` 无序比较；相同 ID 不同语义或 bytes 为冲突；sequence gap、未知字段、错版本、超限或非 JSON-safe payload 都在调用 Executor/Core 前失败。
@@ -1278,7 +1278,7 @@ Executor 可以返回内部 `recovery_required` settle marker，但它不是公�
 - 两者 `reconnect=none`，只允许同一幂等 operation 重放或 checkpoint resume；不把进程重建伪装成 external reconnect。
 - 首版每个 task 使用一个 Worker/Process，不做池化。两者只执行宿主信任的 registry entry，不宣称为不受信代码沙箱。
 - Worker 必须显式传入最小 `env` 且 `execArgv: []`，不得使用 `SHARE_ENV` 或展开 `process.env`。
-- Process 固定 `execPath=process.execPath`、`serialization='advanced'`、`shell=false`、`detached=false`；stdio 默认不转发正文并设置 64 KiB 上限。环境只保留 Windows/Node 启动所需白名单与宿主逐项显式提供的值，禁止透传 `NODE_OPTIONS`、`ARK_*`、`TOKEN`、`SECRET`、`KEY`。
+- Process 固定 `execPath=process.execPath`、`serialization='advanced'`、`detached=false`；`fork()` 本身不通过 shell，不伪造它不支持的 `shell` option。stdio 不转发正文并设置 64 KiB 上限；环境固定为内部最小白名单，不提供宿主扩展入口，并禁止透传 `NODE_*`、`ARK_*`、`TOKEN`、`SECRET`、`KEY`、`PASSWORD`、`CREDENTIAL`、`AUTH`、`COOKIE`、`LD_*` 与 `DYLD_*`。
 - cancel 先发送协议控制消息，5 秒内未确认才终止 Worker/Process，并等待 exit/close 完成资源清理。binding 只保存 logical job ID，不保存 threadId、PID、路径或 secret。
 
 当前 C7c-2 的 Worker 离线实现已登记 `C7-WORKER-01`～`C7-WORKER-29`。这些 case 覆盖静态 target/manifest、最小环境和 secret 边界、binding 与 session/task scope、Chat/Responses fake SDK、transferable sidecar、真实 Worker handshake/cancel/crash/checkpoint、容量与资源清理，以及以下恢复窗口：
@@ -1288,7 +1288,9 @@ Executor 可以返回内部 `recovery_required` settle marker，但它不是公�
 - F09：terminal CAS 已成功、completion 回复尚未到达调用方时 Worker 崩溃，原 `succeeded` 必须保留；completion receipt 只读重放，不创建 replacement job，也不再调用 Model。
 - terminal/cancel receipt 作为 compact tombstone 保留，用于 create/cancel 幂等重放；终态立即释放 Worker/Peer/Port/timer 等重资源，但 `maxRetainedTasks` 不得通过 LRU 删除这些证据。容量耗尽时新 task fail closed，直到整个 Executor `dispose()`；当前不提供逐 task retention 删除 API。
 
-这些离线证据不包含真实方舟 L5、分布式/部署级 L6 或 Docker/Linux live gate；因此 manifest 中 `C7-WORKER` requirement 继续保持 `planned`，Process/HTTP 仍待交付，Phase 2 未通过。Worker 仍只执行宿主信任的 target，不是网络或操作系统安全沙箱。
+C7c-3 的 Process 离线实现登记 `C7-PROCESS-01`～`C7-PROCESS-32`。01～11 覆盖 conformance、closed binding、静态 target/manifest、最小环境、Chat/Responses fake SDK 与 advanced-serialization owned sidecar；12～29 在真实 OS 子进程中复用 Worker 的 handshake、scope/capacity、checkpoint、cancel receipt 与 F08/F09/F19 Oracle；30～32 额外锁定固定 `execPath`/空 argv 与 `execArgv`/单 IPC parent、`send() === false` 只表示 backpressure 且 callback 才是 I/O settle，以及 controller 永久断开后的 ref'ed orphan watchdog。`exit` 只记录退出状态，stdio/IPC/capacity 必须等 `close` 后释放；IPC 双向拒绝 `sendHandle`，frame/sidecar 在 owned copy 前执行数量与字节上限检查。Process 使用内部固定最小环境，不提供宿主扩展入口；它只承诺有界回收受控直属 child，不承诺清理 target 自行创建的任意进程树。
+
+这些离线证据不包含真实方舟 L5、分布式/部署级 L6 或 Docker/Linux live gate；因此 manifest 中 `C7-WORKER` requirement 继续保持 `planned`。C7c-3 的 Process 离线实现也复用了相同 F08/F09/F19 Oracle，并增加 advanced IPC、环境/stdio、send callback/backpressure、sendHandle、cancel/kill、exit/close 与 controller 断连孤儿 watchdog；`C7-PROCESS` 同样因缺少 L5/L6/Ark 保持 `planned`。Worker 与 Process 都只执行宿主信任的 target，不是网络、文件系统或操作系统安全沙箱；Process 只承诺回收受控直属 child，不承诺任意进程树。HTTP 仍待交付，Phase 2 未通过。
 
 ### 17.2 HTTP Remote Executor
 
@@ -1440,7 +1442,7 @@ Phase 1 的持久 event log 是唯一权威；live subscriber 默认缓冲 256 �
 ### 19.3 Phase 2/3 workspace
 
 - `packages/executor-worker`（C7c-2 离线实现已交付；待发布 `2.0.0`，L5/L6/Ark 未完成）
-- `packages/executor-process`（待交付）
+- `packages/executor-process`（C7c-3 离线实现已交付；待发布 `2.0.0`，L5/L6/Ark 未完成）
 - `packages/executor-http`（待交付）
 - `packages/state-postgres`
 - `packages/executor-bullmq`
@@ -1531,7 +1533,7 @@ Core 建议按主题拆分：
 
 ### Step 8：Phase 2/3 placement 与 Compose
 
-- Worker 的 C7c-2 离线实现已经交付；下一步依次实现 Process、HTTP Remote，再实现 PostgreSQL、BullMQ、Docker、S3 与 OTel bridge。每个包先通过同一 conformance/L6，再进入真实 placement profile；Worker 也必须补齐自己的 L5/L6/Ark 证据。
+- Worker/Process 的 C7c-2/C7c-3 离线实现已经交付；下一步实现 HTTP Remote，再实现 PostgreSQL、BullMQ、Docker、S3 与 OTel bridge。每个包先通过同一 conformance/L6，再进入真实 placement profile；Worker 与 Process 也必须补齐各自的 L5/L6/Ark 证据。
 - 固定 Node.js 22 发布证据：Windows bootstrap 下载便携 Node 并验证官方 SHA-256，Linux 使用固定 digest 的 Node 22 acceptance 镜像；两端都使用 `pnpm@11.1.3`。
 - Compose live gate 在 Docker Desktop 可用后运行；没有 Docker 时只能标记外部前置未满足，不能把 Phase 3 声称为 passed。
 

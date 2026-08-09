@@ -89,6 +89,11 @@ const RELEASE_PACKAGE_CONTRACTS = Object.freeze({
       '@ruixutong.manee/maneeagent-framework': '^2.0.0',
     }),
   }),
+  '@ruixutong.manee/maneeagent-executor-process': Object.freeze({
+    peerDependencies: Object.freeze({
+      '@ruixutong.manee/maneeagent-framework': '^2.0.0',
+    }),
+  }),
 });
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDirectory, '..', '..', '..');
@@ -585,6 +590,65 @@ workerExecutorNamespace.WORKER_SUBAGENT_CHANNEL_VERSION;
 workerExecutorNamespace.workerFailpointForTest;
 `;
   }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-process') {
+    return `import * as processExecutorNamespace from '${packageName}';
+import {
+  PROCESS_SUBAGENT_ADAPTER_STATE_VERSION,
+  PROCESS_SUBAGENT_BINDING_KIND,
+  ProcessSubAgentExecutor,
+  decodeProcessBinding,
+  processSubAgentBindingCodec,
+  serveProcessSubAgentTarget,
+  type ProcessSubAgentBindingState,
+  type ProcessSubAgentExecutorDiagnostics,
+  type ProcessSubAgentExecutorOptions,
+  type ProcessSubAgentTargetRegistryContext,
+  type ServeProcessSubAgentTargetOptions,
+} from '${packageName}';
+
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type AssertFalse<T extends false> = T;
+type AssertTrue<T extends true> = T;
+type Equal<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+  (<Value>() => Value extends Right ? 1 : 2) ? true : false;
+type ProcessContractAssertions = [
+  AssertFalse<IsAny<typeof ProcessSubAgentExecutor>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof ProcessSubAgentExecutor>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof ProcessSubAgentExecutor>[0]>>,
+  AssertFalse<IsAny<ProcessSubAgentExecutorOptions>>,
+  AssertFalse<IsAny<ProcessSubAgentExecutorDiagnostics>>,
+  AssertFalse<IsAny<ServeProcessSubAgentTargetOptions>>,
+  AssertFalse<IsAny<ProcessSubAgentTargetRegistryContext>>,
+  AssertFalse<IsAny<ProcessSubAgentBindingState>>,
+  AssertFalse<IsAny<typeof decodeProcessBinding>>,
+  AssertFalse<IsAny<typeof serveProcessSubAgentTarget>>,
+  AssertFalse<IsAny<typeof processSubAgentBindingCodec>>,
+  AssertTrue<Equal<typeof PROCESS_SUBAGENT_ADAPTER_STATE_VERSION, '1'>>,
+  AssertTrue<Equal<typeof PROCESS_SUBAGENT_BINDING_KIND, 'maneeagent-process/v1'>>,
+];
+
+const publicValues = [
+  PROCESS_SUBAGENT_ADAPTER_STATE_VERSION,
+  PROCESS_SUBAGENT_BINDING_KIND,
+  ProcessSubAgentExecutor,
+  decodeProcessBinding,
+  processSubAgentBindingCodec,
+  serveProcessSubAgentTarget,
+] as const;
+declare const processContractAssertions: ProcessContractAssertions;
+void publicValues;
+void processContractAssertions;
+// @ts-expect-error The packed declaration surface must not degrade to any.
+processExecutorNamespace.__maneeMissingExport;
+// @ts-expect-error The child_process channel wire is internal to the adapter.
+processExecutorNamespace.decodeProcessMessage;
+// @ts-expect-error The child_process channel version is not a package-root contract.
+processExecutorNamespace.PROCESS_SUBAGENT_CHANNEL_VERSION;
+// @ts-expect-error Process test failpoints must never become public API.
+processExecutorNamespace.processFailpointForTest;
+`;
+  }
   return `import * as packageApi from '${packageName}';
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type AssertFalse<T extends false> = T;
@@ -785,6 +849,52 @@ workerExecutor.WORKER_SUBAGENT_CHANNEL_VERSION;
 workerExecutor.workerFailpointForTest;
 `;
   }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-process') {
+    return `import processExecutor = require('${packageName}');
+
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type AssertFalse<T extends false> = T;
+type AssertTrue<T extends true> = T;
+type Equal<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+  (<Value>() => Value extends Right ? 1 : 2) ? true : false;
+type ProcessContractAssertions = [
+  AssertFalse<IsAny<typeof processExecutor.ProcessSubAgentExecutor>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof processExecutor.ProcessSubAgentExecutor>>>,
+  AssertFalse<IsAny<ConstructorParameters<typeof processExecutor.ProcessSubAgentExecutor>[0]>>,
+  AssertFalse<IsAny<processExecutor.ProcessSubAgentExecutorOptions>>,
+  AssertFalse<IsAny<processExecutor.ProcessSubAgentExecutorDiagnostics>>,
+  AssertFalse<IsAny<processExecutor.ServeProcessSubAgentTargetOptions>>,
+  AssertFalse<IsAny<processExecutor.ProcessSubAgentTargetRegistryContext>>,
+  AssertFalse<IsAny<processExecutor.ProcessSubAgentBindingState>>,
+  AssertFalse<IsAny<typeof processExecutor.decodeProcessBinding>>,
+  AssertFalse<IsAny<typeof processExecutor.serveProcessSubAgentTarget>>,
+  AssertFalse<IsAny<typeof processExecutor.processSubAgentBindingCodec>>,
+  AssertTrue<Equal<typeof processExecutor.PROCESS_SUBAGENT_ADAPTER_STATE_VERSION, '1'>>,
+  AssertTrue<Equal<typeof processExecutor.PROCESS_SUBAGENT_BINDING_KIND, 'maneeagent-process/v1'>>,
+];
+
+const publicValues = [
+  processExecutor.PROCESS_SUBAGENT_ADAPTER_STATE_VERSION,
+  processExecutor.PROCESS_SUBAGENT_BINDING_KIND,
+  processExecutor.ProcessSubAgentExecutor,
+  processExecutor.decodeProcessBinding,
+  processExecutor.processSubAgentBindingCodec,
+  processExecutor.serveProcessSubAgentTarget,
+] as const;
+declare const processContractAssertions: ProcessContractAssertions;
+void publicValues;
+void processContractAssertions;
+// @ts-expect-error The packed declaration surface must not degrade to any.
+processExecutor.__maneeMissingExport;
+// @ts-expect-error The child_process channel wire is internal to the adapter.
+processExecutor.decodeProcessMessage;
+// @ts-expect-error The child_process channel version is not a package-root contract.
+processExecutor.PROCESS_SUBAGENT_CHANNEL_VERSION;
+// @ts-expect-error Process test failpoints must never become public API.
+processExecutor.processFailpointForTest;
+`;
+  }
   return `import packageApi = require('${packageName}');
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type AssertFalse<T extends false> = T;
@@ -893,6 +1003,50 @@ if (packageApi.WORKER_SUBAGENT_BINDING_KIND !== 'maneeagent-worker/v1') {
   throw new Error('${packageName} binding kind is invalid');
 }
 for (const name of ['decodeWorkerMessage', 'WORKER_SUBAGENT_CHANNEL_VERSION', 'workerFailpointForTest']) {
+  if (Object.prototype.hasOwnProperty.call(packageApi, name)) {
+    throw new Error(\`${packageName} must not expose internal root export \${name}\`);
+  }
+}
+`;
+  }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-process') {
+    checks.push(
+      `[packageApi.ProcessSubAgentExecutor, 'ProcessSubAgentExecutor', 'function']`,
+      `[packageApi.decodeProcessBinding, 'decodeProcessBinding', 'function']`,
+      `[packageApi.processSubAgentBindingCodec, 'processSubAgentBindingCodec', 'object']`,
+      `[packageApi.serveProcessSubAgentTarget, 'serveProcessSubAgentTarget', 'function']`,
+    );
+    return `${load}
+function expectType([value, name, expected]) {
+  if (typeof value !== expected) throw new Error(\`${packageName} \${name} must be \${expected}\`);
+}
+for (const check of [${checks.join(', ')}]) expectType(check);
+if (packageApi.PROCESS_SUBAGENT_ADAPTER_STATE_VERSION !== '1') {
+  throw new Error('${packageName} adapter state version must equal "1"');
+}
+if (packageApi.PROCESS_SUBAGENT_BINDING_KIND !== 'maneeagent-process/v1') {
+  throw new Error('${packageName} binding kind is invalid');
+}
+const processRuntimeExports = Object.keys(packageApi).sort();
+const expectedProcessRuntimeExports = [
+  'PROCESS_SUBAGENT_ADAPTER_STATE_VERSION',
+  'PROCESS_SUBAGENT_BINDING_KIND',
+  'ProcessSubAgentExecutor',
+  'decodeProcessBinding',
+  'processSubAgentBindingCodec',
+  'serveProcessSubAgentTarget',
+].sort();
+if (JSON.stringify(processRuntimeExports) !== JSON.stringify(expectedProcessRuntimeExports)) {
+  throw new Error(
+    '${packageName} must expose exactly the six documented child_process runtime exports',
+  );
+}
+for (const name of [
+  'createProcessSubAgentIpcWriter',
+  'decodeProcessMessage',
+  'PROCESS_SUBAGENT_CHANNEL_VERSION',
+  'processFailpointForTest',
+]) {
   if (Object.prototype.hasOwnProperty.call(packageApi, name)) {
     throw new Error(\`${packageName} must not expose internal root export \${name}\`);
   }
@@ -1114,6 +1268,12 @@ function assertSafePackageFiles(fileList, packageName) {
     assert(
       !fileList.some((file) => /(?:^|\/)(?:worker-executor-internals|.*failpoint)/iu.test(file)),
       `${packageName} npm pack output must not publish test-only Worker hooks`,
+    );
+  }
+  if (packageName === '@ruixutong.manee/maneeagent-executor-process') {
+    assert(
+      !fileList.some((file) => /(?:^|\/)(?:process-executor-internals|.*failpoint)/iu.test(file)),
+      `${packageName} npm pack output must not publish test-only child_process hooks`,
     );
   }
   return files;

@@ -6,7 +6,7 @@
 
 本次是明确的 2.0 breaking change：删除旧 `AgentOptions.subAgents`、`AgentConstructor`、动态 `RuntimeSubAgent` 和旧 `agentName/input/outputDescription` Tool 协议，不提供兼容适配层。官方本地 Executor 作为独立 workspace 包交付，核心包只保留协议无关的语义、路由和状态控制面。
 
-实施状态：当前 checkout 已完成 C0～C6（Core v2、官方 Local、公开 Agent durable loop、v1 原子切换与 Phase 1 离线/进程恢复门禁），并交付 C7a/C7b、C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway，以及 C7c-2 的离线 Worker placement。`C7-WORKER` requirement 仍保持 `planned`：当前只有 L1～L4 的离线 acceptance，L5 真实方舟 placement 与 L6/Docker/Linux live gate 尚未完成；Process/HTTP placement 也尚未交付，因此 Phase 2 仍未通过。C8/C9 与完整真实方舟验收仍未完成。下文“背景与现状”保留立项时的 v1 问题陈述，不代表当前源码仍存在这些旧接口。
+实施状态：当前 checkout 已完成 C0～C6（Core v2、官方 Local、公开 Agent durable loop、v1 原子切换与 Phase 1 离线/进程恢复门禁），并交付 C7a/C7b、C7c-1 的 Core transport/RPC/control/Peer/artifact-sidecar、target registry、controller/target bridge 与 controller-owned Model gateway，以及 C7c-2/C7c-3 的离线 Worker/Process placement。`C7-WORKER` 与 `C7-PROCESS` requirement 仍保持 `planned`：当前只有 L1～L4 的离线 acceptance，L5 真实方舟 placement 与 L6/Docker/Linux live gate 尚未完成；HTTP placement 也尚未交付，因此 Phase 2 仍未通过。C8/C9 与完整真实方舟验收仍未完成。下文“背景与现状”保留立项时的 v1 问题陈述，不代表当前源码仍存在这些旧接口。
 
 ## 背景与现状
 
@@ -198,11 +198,11 @@ Phase 1 退出标准：
 
 ### Phase 2：进程隔离与远程 Executor 模板
 
-当前增量状态：Core 已公开 closed transport v1、14-kind strict RPC、16-method control dispatcher/proxy、双向 Peer、canonical replay、同步 writer admission、带 settlement headroom 的 channel rollover、spawn 的 accepted-or-direct-unbound 生命周期、有界 abort tombstone、默认 32 MiB artifact sidecar、target registry、controller/target bridge 与 controller-owned Model gateway。`reconstructSubAgentExecutionRequest()` 返回 `{ request, dispose }`，placement adapter 必须在 settle 后清理接收端 timer/listener。Remote proxy 暂不提供 artifact `put`。在这套地基上，C7c-2 已交付真实 `worker_threads`、静态受信 target、transferable sidecar、controller-owned Model gateway、cancel/terminate、checkpoint 恢复和资源清理的离线 Worker placement；`C7-WORKER-01`～`C7-WORKER-29` 已登记确定性 acceptance，其中 F19 锁定 provider reply-loss/in-flight Oracle，F08 锁定 result receipt CAS/回复丢失后的 `failed + partialOutput`，F09 锁定 terminal CAS/完成回复丢失后的原 `succeeded` 只读保留。`C7-WORKER` requirement 因缺少 L5/L6/Ark 仍为 `planned`；Process、HTTP 及其认证、进程/网络生命周期和 conformance 仍是 Phase 2 待交付内容。
+当前增量状态：Core 已公开 closed transport v1、14-kind strict RPC、16-method control dispatcher/proxy、双向 Peer、canonical replay、同步 writer admission、带 settlement headroom 的 channel rollover、spawn 的 accepted-or-direct-unbound 生命周期、有界 abort tombstone、默认 32 MiB artifact sidecar、target registry、controller/target bridge 与 controller-owned Model gateway。`reconstructSubAgentExecutionRequest()` 返回 `{ request, dispose }`，placement adapter 必须在 settle 后清理接收端 timer/listener。Remote proxy 暂不提供 artifact `put`。在这套地基上，C7c-2/C7c-3 已分别交付真实 `worker_threads` 和真实 Node.js `child_process` placement：两者都使用静态受信 target、controller-owned Model gateway、cancel/强制终止、checkpoint 恢复、F08/F09/F19 故障窗和有界资源清理；Worker 使用 transferable sidecar，Process 使用 advanced-serialization owned `Uint8Array`、最小环境、受控 stdio 及 exit/close/orphan 分类。`C7-WORKER` 与 `C7-PROCESS` requirement 因缺少 L5/L6/Ark 仍为 `planned`；HTTP、认证与网络生命周期仍是 Phase 2 待交付内容。
 
-#### C7c 实施前冻结决策（C7c-1 与 C7c-2 离线部分已实现，其余待交付）
+#### C7c 实施前冻结决策（C7c-1～C7c-3 离线部分已实现，其余待交付）
 
-以下决策是 Worker、Process 与 HTTP placement 开工前的固定 Oracle。当前 checkout 已具备 C7c-1 的 Core bridge/Model gateway 地基和 C7c-2 的离线 Worker placement，不表示 Worker 的 L5/L6/Ark requirement 已通过，也不表示已经具备 Process 或 HTTP placement；在 C7c 全部门禁通过前，Phase 2 状态仍为未完成：
+以下决策是 Worker、Process 与 HTTP placement 开工前的固定 Oracle。当前 checkout 已具备 C7c-1 的 Core bridge/Model gateway 地基，以及 C7c-2/C7c-3 的离线 Worker/Process placement；这不表示两种 placement 的 L5/L6/Ark requirement 已通过，也不表示已经具备 HTTP placement。在 C7c 全部门禁通过前，Phase 2 状态仍为未完成：
 
 - Core 新增受信任的 target registry，按精确的 `definition name + definition version + runner identity` 解析 target-local child runner factory、schema/codec 与模型绑定。registry 在 `init()` 时拒绝重复或不完整条目，并生成不可变 snapshot；factory、Zod object、模块路径、环境变量与凭证都不能来自 wire，也不能在目标侧做动态加载或版本 fallback。
 - Core 提供一对 placement-neutral controller/target bridge。controller bridge 把 `SubAgentExecutor` 的 execute/spawn/control 操作接入现有 Peer/RPC，并托管反向 control 与 Model gateway；target bridge 只在完整解码、scope 校验和 registry 命中后重建 execution request、创建独立 child runner，并在唯一 settle 路径的 `finally` 中调用 `dispose()`。Worker、Process、HTTP 包只负责各自的 I/O、生命周期与认证，不复制 Core 状态机、RPC union 或 control dispatcher。
@@ -222,7 +222,7 @@ C7c 只按以下可独立回滚、可通过对应门禁的提交推进；任何�
 
 1. **C7c-1 Core bridge 与 Model gateway**：target registry、controller/target bridge、session-scoped task handle registry、12→14 kind RPC、可执行的 controller Model gateway，以及 authoritative provider-operation ledger 必须在同一稳定批次交付；ledger 锁定 reservation/`in_flight`/settled/`outcomeUnknown` 状态、canonical request 幂等、reply cache 与 target checkpoint ACK。codec/golden/type/pack、checkpoint ACK、幂等重放和 `in_flight` 在 SDK create 前后崩溃的故障测试全部通过后，Worker placement 才可以依赖该地基；既有 12 kind 与 16 control method 保持兼容。
 2. **C7c-2 Worker placement（离线实现已交付）**：新增 Worker 包、target bootstrap、transferable sidecar、cancel/terminate/cleanup、crash/checkpoint oracle 与无网络 conformance；包内 `reconnect=none`。当前 `C7-WORKER-01`～`C7-WORKER-29` 只关闭离线子集，完整 requirement 继续等待 L5/L6/Ark 证据。
-3. **C7c-3 Process placement**：新增 Process 包、advanced serialization、env/argv/stdio 边界、cancel/kill/exit/close 与孤儿清理测试；包内 `reconnect=none`。
+3. **C7c-3 Process placement（离线实现已交付）**：新增 Process 包、advanced serialization、env/argv/stdio 边界、cancel/kill/exit/close、孤儿 watchdog、F08/F09/F19 与资源清理测试；包内 `reconnect=none`。完整 requirement 继续等待 L5/L6/Ark 证据。
 4. **C7c-4 HTTP wire security**：先独立交付 signed multipart codec、完整包全验后准入、HMAC 六 header、path/time/nonce/replay/authz 正反例；该提交不宣称 remote job 生命周期完成。
 5. **C7c-5 HTTP placement**：新增 HTTP client/server、target registry、authoritative handle resolution、幂等 create、heartbeat、cursor、approval/resume/external reconnect 与 provider in-flight fail-closed 故障注入。
 6. **C7c-6 Phase 2 release gate**：补齐三个公开包的 README/manifest/pack、根文档、离线 Phase 2 acceptance 和独立 Ark placement profiles；只有固定 clean SHA 的全部离线门禁通过且真实 profile 有合规 evidence 时，才分别记录对应通过状态。缺少 Docker 或 `ARK_API_KEY` 时继续如实记录未执行，不能用 Core unit test 替代。

@@ -32,7 +32,7 @@ npm install @ruixutong.manee/maneeagent-framework zod
 - 事件系统：可观察模型响应、工具调用、工具错误、Agent 状态和 Agent 错误。
 - Context compact：active-only 工具 payload 压缩、外部摘要策略与 context-length 恢复，raw history 保留原文。
 - Skills：通过内置 `skill` 工具按名称渐进加载 instructions、文本资源和显式启用的脚本。
-- Subagent v2：typed definition、显式 Executor placement、跨协议 child Agent、审批/嵌套审批、持久 resume、typed result、树级取消、官方 Local/Worker placement，以及 C7 transport/RPC/control/Peer/recovery contract。
+- Subagent v2：typed definition、显式 Executor placement、跨协议 child Agent、审批/嵌套审批、持久 resume、typed result、树级取消、官方 Local/Worker/Process placement，以及 C7 transport/RPC/control/Peer/recovery contract。
 
 ## 公开入口
 
@@ -536,7 +536,7 @@ Inline script 每次运行都会在独立临时目录物化完整 Skill（`SKILL
 2. `SubAgentRuntime` 绑定 owner session、definitions、Executors、StateStore、limits 与 telemetry，并生成当前可用 Catalog。
 3. 具体 Executor 在受信任 registry 中解析 definition version，创建一个全新的 child Agent；Core 不从模型输入动态加载类或模块。
 
-官方本地实现位于 [`@ruixutong.manee/maneeagent-executor-local`](../executor-local/README.md)，真实 `worker_threads` placement 位于 [`@ruixutong.manee/maneeagent-executor-worker`](../executor-worker/README.md)。两者当前都是 workspace 中的待发布 `2.0.0`，尚未出现在 npm registry；下面的安装命令只安装本示例使用的 Local 包。示例故意让 Responses 父 Agent 调度 Chat child，说明协议不是继承关系。
+官方本地实现位于 [`@ruixutong.manee/maneeagent-executor-local`](../executor-local/README.md)，真实 `worker_threads` placement 位于 [`@ruixutong.manee/maneeagent-executor-worker`](../executor-worker/README.md)，真实 Node.js 子进程 placement 位于 [`@ruixutong.manee/maneeagent-executor-process`](../executor-process/README.md)。三者当前都是 workspace 中的待发布 `2.0.0`，尚未出现在 npm registry；下面的安装命令只安装本示例使用的 Local 包。示例故意让 Responses 父 Agent 调度 Chat child，说明协议不是继承关系。
 
 ```bash
 npm install @ruixutong.manee/maneeagent-framework @ruixutong.manee/maneeagent-executor-local zod
@@ -696,9 +696,11 @@ control 面固定为 16 个 method：execution 7 个、completion 3 个、delega
 
 spawn 只接受 `executor.accepted` 后同一 exchange 的 `executor.settled(mode: 'spawn')`，或在尚未绑定时直接返回 `unbound_create` recovery settlement；accepted 之后不能再伪装成 unbound create。Peer 会把 accepted binding、terminal/paused task identity 和已知 executor 与原 execution request 交叉校验；events page 必须遵守请求的 cursor/limit，`nextSequence` 精确等于最后返回事件或空页的原 cursor，不能跳过事件。入站 replay 按解码后的 canonical envelope 判断，sidecar 按 `sidecarId` 无序比较；语义相同的 replay 复用缓存 reply 而不重复运行 handler，sequence gap、同 ID 冲突、错 reply 或超限会 fail closed。sequence 默认预留 256 个 settlement headroom（最多为 window - 1）；soft drain 后只允许所有 reply/replay 以及 active executor task 的 control/cancel/snapshot/events continuation，达到 hard bound 则关闭 channel。`maxTrackedSequences` 最大为 1,000,000，pending、cache 或 sequence window 到达边界时必须 drain/rollover，不能淘汰 receipt 后继续复用。
 
-artifact sidecar 使用 closed v1 descriptor；Peer 默认单件上限 32 MiB、每个 packet 最多 8 件且合计 128 MiB。`maxSidecarItemBytes` 独立限制单件，既有 `maxSidecarBytes` 始终表示 packet 合计，不能用放宽合计上限的方式绕过单件边界；默认 replay cache 为 160 MiB，足以容纳一个默认最大 frame 与默认最大 sidecar packet 后再 fail closed。descriptor 会把已有 `ArtifactReference` 的 size/SHA-256 与独立 `byteLength`/`sha256` 交叉校验；入站 `Uint8Array`/`ArrayBuffer` 会拒绝 Proxy，通过原生 internal-slot getter 固定长度并复制到普通 `Uint8Array`，不调用可覆写的 getter、iterator、`slice()` 或 `Symbol.species`，再校验实际长度和明文 SHA-256。因此源 buffer 后续变更不能修改已验收 bytes，数据也不会以 base64 塞进 JSON frame 或在校验前交给 handler。Core transport/RPC/control/Peer/sidecar、target registry、controller/target bridge 与 Model gateway 已公开；官方 Worker 包已使用这套地基完成真实线程 placement，但 Process/HTTP 尚未交付，Phase 2 仍未通过。
+artifact sidecar 使用 closed v1 descriptor；Peer 默认单件上限 32 MiB、每个 packet 最多 8 件且合计 128 MiB。`maxSidecarItemBytes` 独立限制单件，既有 `maxSidecarBytes` 始终表示 packet 合计，不能用放宽合计上限的方式绕过单件边界；默认 replay cache 为 160 MiB，足以容纳一个默认最大 frame 与默认最大 sidecar packet 后再 fail closed。descriptor 会把已有 `ArtifactReference` 的 size/SHA-256 与独立 `byteLength`/`sha256` 交叉校验；入站 `Uint8Array`/`ArrayBuffer` 会拒绝 Proxy，通过原生 internal-slot getter 固定长度并复制到普通 `Uint8Array`，不调用可覆写的 getter、iterator、`slice()` 或 `Symbol.species`，再校验实际长度和明文 SHA-256。因此源 buffer 后续变更不能修改已验收 bytes，数据也不会以 base64 塞进 JSON frame 或在校验前交给 handler。Core transport/RPC/control/Peer/sidecar、target registry、controller/target bridge 与 Model gateway 已公开；官方 Worker 与 Process 包已经分别使用这套地基完成真实线程和真实子进程 placement，但 HTTP 尚未交付，Phase 2 仍未通过。
 
 官方 Worker Executor 每个 live task 使用一个静态受信 target、一个 `worker_threads.Worker` 和一个 `MessageChannel`。启动 manifest 在任何 execution RPC 前做 closed decode、canonical digest 和完整内容匹配；Worker 只收到闭合 job/session/channel bootstrap，默认 `env: {}`、`argv: []`、`execArgv: []`，stdout/stderr 有界消费且不回显。binding 仅保存 opaque logical job ID，resume 使用完整 checkpoint，`reconnect=none`；`model_result_ready` 回复丢失时在仍有效 scope 内最多进行一次精确 checkpoint replay，不新建 provider operation。它不是文件系统、网络或不受信代码沙箱，也不改变根 Agent/run/session 的 controller 归属；完整用法与安全边界见 [Worker Executor README](../executor-worker/README.md)。
+
+官方 Process Executor 每个 live task 使用一个静态受信 target、一个由当前 `process.execPath` 启动的 Node.js 子进程和 advanced-serialization IPC。controller 在 `spawn` 成功后发送闭合 bootstrap，双方使用有界 FIFO，并以 send callback 而不是 `send()` 的 backpressure 布尔值判定 I/O settle；IPC `sendHandle` 被拒绝，frame/sidecar 在复制前执行数量和字节上限检查。子进程只收到最小启动环境，stdout/stderr 有界丢弃；cancel 先走协议，再在最多五秒的窗口内强制终止直属 child，并以 `close` 而非 `exit` 或 `child.killed` 作为 stdio/IPC 已释放的证据。Process 同样只执行受信 target，不是文件系统、网络或进程树沙箱；完整用法、恢复窗口与安全边界见 [Process Executor README](../executor-process/README.md)。
 
 Executor 的 `execute()`、`spawn()` 或 raw handle `wait()` 可以返回 `SubAgentExecutorRecoveryRequired`。该 marker 不是 task state、host handle outcome 或 Agent outcome；Core 会校验 live operation identity、attempt/epoch/fencing、binding、checkpoint、runner/codec compatibility 和持久 result/provider 状态。合法 marker 会先原子 settle 当前 operation、释放 active slot，再至多自动恢复一次：`unbound_create` 保持原 `operationId` 与 idempotency key，只推进 attempt/epoch/fencing；`checkpoint` 使用原 task/binding 和完整 checkpoint，不伪装成 reconnect。第二个 marker 保留 `running + recoveryRequired`，等待 host 显式 `recover()`。provider 已 `in_flight` 时固定为 `failed + outcomeUnknown`，result receipt 已提交时固定为带 `partialOutput` 的 `failed`，authoritative terminal 永远只读。
 
