@@ -1647,6 +1647,20 @@ describe('WorkerSubAgentExecutor real worker_threads lifecycle', () => {
         const spawned = await live.executor.spawn(liveRequest, liveControl.control);
         if ('type' in spawned) throw new Error('Expected a live Worker task handle.');
         await vi.waitFor(() => expect(live.executor.diagnostics().activeWorkers).toBe(1));
+        const liveDiagnostics = live.executor.diagnostics();
+        const liveControlSnapshot = liveControl.snapshot();
+        for (const hostile of hostileFullBindings(spawned.binding)) {
+          await expect(
+            live.executor.cancel(hostile.binding, {
+              operationId: `worker-hostile-cancel-${hostile.label}`,
+              signal: new AbortController().signal,
+              deadlineAt: Date.now() + 1_000,
+            }),
+          ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+          expect(hostile.getterCalls(), hostile.label).toBe(0);
+          expect(live.executor.diagnostics(), hostile.label).toEqual(liveDiagnostics);
+          expect(liveControl.snapshot(), hostile.label).toEqual(liveControlSnapshot);
+        }
         for (const [index, binding] of tamperedBindings(spawned.binding).entries()) {
           await expect(
             live.executor.cancel(binding, {
@@ -1675,6 +1689,46 @@ describe('WorkerSubAgentExecutor real worker_threads lifecycle', () => {
         const binding = onlyBinding(snapshot.bindings);
         const checkpoint = snapshot.checkpoints[0]!;
         expect(checkpoint).toBeDefined();
+        const recoveryDiagnostics = recovering.executor.diagnostics();
+        for (const hostile of hostileFullBindings(binding)) {
+          for (const mode of ['execute', 'spawn'] as const) {
+            const baseResume = createExecutorConformanceRequest({
+              executorName: 'worker',
+              taskId: initial.taskId,
+              definition: DEFINITION_REF,
+              input: initial.input,
+              operation: {
+                type: 'resume',
+                operationId: `worker-hostile-${mode}-resume-${hostile.label}`,
+                reason: 'checkpoint',
+                binding,
+                checkpoint,
+              },
+            });
+            const resume = Object.freeze({
+              ...baseResume,
+              operation: Object.freeze({ ...baseResume.operation, binding: hostile.binding }),
+            }) as SubAgentExecutionRequest;
+            const recorder = createControl(resume);
+            await expect(recovering.executor[mode](resume, recorder.control)).rejects.toMatchObject(
+              {
+                code: 'BINDING_INVALID',
+              },
+            );
+            expect(hostile.getterCalls(), `${mode}:${hostile.label}`).toBe(0);
+            expect(recorder.snapshot(), `${mode}:${hostile.label}`).toMatchObject({
+              bindings: [],
+              checkpoints: [],
+              approvalInputs: [],
+              progress: [],
+              usage: [],
+              events: [],
+            });
+            expect(recovering.executor.diagnostics(), `${mode}:${hostile.label}`).toEqual(
+              recoveryDiagnostics,
+            );
+          }
+        }
         for (const [index, tampered] of tamperedBindings(binding).entries()) {
           const resume = createExecutorConformanceRequest({
             executorName: 'worker',
@@ -1855,6 +1909,65 @@ function tamperedBindings(binding: SubAgentExecutorBinding): readonly SubAgentEx
         kind: 'maneeagent-worker/v1',
         jobId: 'another-worker-job',
       }),
+    }),
+  ]);
+}
+
+function hostileFullBindings(binding: SubAgentExecutorBinding): readonly {
+  readonly label: string;
+  readonly binding: SubAgentExecutorBinding;
+  readonly getterCalls: () => number;
+}[] {
+  let proxyGetterCalls = 0;
+  const proxy = new Proxy(binding, {
+    get(target, property, receiver) {
+      proxyGetterCalls += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+
+  const accessorCases = (['ownerSessionId', 'taskId', 'recoveryData'] as const).map((field) => {
+    let getterCalls = 0;
+    const descriptors: Record<PropertyKey, PropertyDescriptor> =
+      Object.getOwnPropertyDescriptors(binding);
+    descriptors[field] = {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        throw new Error(`The Worker binding ${field} getter must never execute.`);
+      },
+    };
+    return Object.freeze({
+      label: `accessor-${field}`,
+      binding: Object.defineProperties({}, descriptors) as SubAgentExecutorBinding,
+      getterCalls: () => getterCalls,
+    });
+  });
+
+  const symbolBinding = { ...binding } as Record<PropertyKey, unknown>;
+  symbolBinding[Symbol('hostile-worker-binding')] = 'hidden';
+  const oversizedBinding = {
+    ...binding,
+    oversizedPadding: 'x'.repeat(70 * 1024),
+  } as unknown as SubAgentExecutorBinding;
+
+  return Object.freeze([
+    Object.freeze({
+      label: 'proxy',
+      binding: proxy,
+      getterCalls: () => proxyGetterCalls,
+    }),
+    ...accessorCases,
+    Object.freeze({
+      label: 'symbol',
+      binding: symbolBinding as unknown as SubAgentExecutorBinding,
+      getterCalls: () => 0,
+    }),
+    Object.freeze({
+      label: 'oversized',
+      binding: oversizedBinding,
+      getterCalls: () => 0,
     }),
   ]);
 }

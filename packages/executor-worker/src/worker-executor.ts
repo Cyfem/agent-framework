@@ -335,21 +335,26 @@ export class WorkerSubAgentExecutor implements SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<SubAgentExecutorOperationResult> {
-    assertWorkerOperationSupported(request);
-    const identity = executionRequestIdentity(request);
-    const active = this.#admitOperation(request, control, 'execute', identity);
+    const ownedRequest = normalizeExecutionRequestBinding(
+      request,
+      this.descriptor.name,
+      this.descriptor.maxBindingBytes,
+    );
+    assertWorkerOperationSupported(ownedRequest);
+    const identity = executionRequestIdentity(ownedRequest);
+    const active = this.#admitOperation(ownedRequest, control, 'execute', identity);
     if (active !== undefined) {
       if (active.mode !== 'execute') throw invalidActiveOperation();
       return active.promise;
     }
-    const promise = this.#executeOnce(request, control);
+    const promise = this.#executeOnce(ownedRequest, control);
     const owned: ActiveWorkerOperation = { mode: 'execute', identity, control, promise };
-    this.#activeOperations.set(request.taskId, owned);
+    this.#activeOperations.set(ownedRequest.taskId, owned);
     try {
       return await promise;
     } finally {
-      if (this.#activeOperations.get(request.taskId) === owned) {
-        this.#activeOperations.delete(request.taskId);
+      if (this.#activeOperations.get(ownedRequest.taskId) === owned) {
+        this.#activeOperations.delete(ownedRequest.taskId);
       }
     }
   }
@@ -391,21 +396,26 @@ export class WorkerSubAgentExecutor implements SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<ExecutorTaskHandle | SubAgentExecutorRecoveryRequired> {
-    assertWorkerOperationSupported(request);
-    const identity = executionRequestIdentity(request);
-    const active = this.#admitOperation(request, control, 'spawn', identity);
+    const ownedRequest = normalizeExecutionRequestBinding(
+      request,
+      this.descriptor.name,
+      this.descriptor.maxBindingBytes,
+    );
+    assertWorkerOperationSupported(ownedRequest);
+    const identity = executionRequestIdentity(ownedRequest);
+    const active = this.#admitOperation(ownedRequest, control, 'spawn', identity);
     if (active !== undefined) {
       if (active.mode !== 'spawn') throw invalidActiveOperation();
       return active.promise;
     }
-    const promise = this.#spawnOnce(request, control);
+    const promise = this.#spawnOnce(ownedRequest, control);
     const owned: ActiveWorkerOperation = { mode: 'spawn', identity, control, promise };
-    this.#activeOperations.set(request.taskId, owned);
+    this.#activeOperations.set(ownedRequest.taskId, owned);
     try {
       return await promise;
     } finally {
-      if (this.#activeOperations.get(request.taskId) === owned) {
-        this.#activeOperations.delete(request.taskId);
+      if (this.#activeOperations.get(ownedRequest.taskId) === owned) {
+        this.#activeOperations.delete(ownedRequest.taskId);
       }
     }
   }
@@ -506,17 +516,22 @@ export class WorkerSubAgentExecutor implements SubAgentExecutor {
       readonly deadlineAt: number;
     },
   ): Promise<void> {
+    const ownedBinding = normalizeWorkerBinding(
+      binding,
+      this.descriptor.name,
+      this.descriptor.maxBindingBytes,
+    );
     assertTransportIdentifier(options.operationId, 'Worker cancel operationId');
-    const task = this.#tasks.get(binding.taskId);
-    if (task === undefined || task.ownerSessionId !== binding.ownerSessionId) {
+    const task = this.#tasks.get(ownedBinding.taskId);
+    if (task === undefined || task.ownerSessionId !== ownedBinding.ownerSessionId) {
       throw createResourceNotFoundError();
     }
-    const state = decodeWorkerBinding(binding.recoveryData);
+    const state = decodeWorkerBinding(ownedBinding.recoveryData);
     if (
       state.jobId !== task.jobId ||
-      binding.executorName !== this.descriptor.name ||
+      ownedBinding.executorName !== this.descriptor.name ||
       task.binding === undefined ||
-      !bindingsEqual(task.binding, binding)
+      !bindingsEqual(task.binding, ownedBinding)
     ) {
       throw new SubAgentRuntimeError({
         code: 'BINDING_INVALID',
@@ -525,7 +540,7 @@ export class WorkerSubAgentExecutor implements SubAgentExecutor {
       });
     }
     const identity = canonicalJsonSha256({
-      binding: binding as unknown as JsonValue,
+      binding: ownedBinding as unknown as JsonValue,
       ...(options.reason === undefined ? {} : { reason: options.reason }),
     });
     const existing = task.cancelOperations.get(options.operationId);
@@ -541,7 +556,7 @@ export class WorkerSubAgentExecutor implements SubAgentExecutor {
     }
     options.signal.throwIfAborted();
     this.#reserveCancelReceipt(task);
-    const promise = this.#cancelOwned(task, binding, options);
+    const promise = this.#cancelOwned(task, ownedBinding, options);
     const receipt: WorkerCancelReceipt = { identity, promise };
     task.cancelOperations.set(options.operationId, receipt);
     return promise;
@@ -1056,16 +1071,14 @@ export class WorkerSubAgentExecutor implements SubAgentExecutor {
     request: SubAgentExecutionRequest,
     input: SubAgentExecutorBinding,
   ): SubAgentExecutorBinding {
-    if (input.ownerSessionId !== request.ownerSessionId || input.taskId !== request.taskId) {
+    const binding = normalizeWorkerBinding(
+      input,
+      this.descriptor.name,
+      this.descriptor.maxBindingBytes,
+    );
+    if (binding.ownerSessionId !== request.ownerSessionId || binding.taskId !== request.taskId) {
       throw createResourceNotFoundError();
     }
-    assertJsonValue(input, {
-      maxBytes: DEFAULT_EXECUTOR_MAX_BINDING_BYTES,
-      label: 'Worker resume binding',
-    });
-    const owned = parseJsonValue(canonicalizeJson(input as unknown as JsonValue));
-    deepFreezeJson(owned);
-    const binding = owned as unknown as SubAgentExecutorBinding;
     const expectedKeys = [
       'adapterStateVersion',
       'definitionName',
@@ -2294,6 +2307,108 @@ function bindingIntegrityFailure(
   return retained?.code === 'BINDING_INVALID' ? retained : undefined;
 }
 
+function normalizeExecutionRequestBinding(
+  request: SubAgentExecutionRequest,
+  executorName: string,
+  maxBindingBytes: number,
+): SubAgentExecutionRequest {
+  const operation = request.operation;
+  if (operation.type === 'create') return request;
+  const bindingDescriptor = Object.getOwnPropertyDescriptor(operation, 'binding');
+  if (
+    bindingDescriptor === undefined ||
+    !Object.prototype.hasOwnProperty.call(bindingDescriptor, 'value')
+  ) {
+    throw new SubAgentRuntimeError({
+      code: 'BINDING_INVALID',
+      message: 'The Worker Executor binding is invalid.',
+      retryable: false,
+    });
+  }
+  const binding = normalizeWorkerBinding(bindingDescriptor.value, executorName, maxBindingBytes);
+  return Object.freeze({
+    ...request,
+    operation: Object.freeze({ ...operation, binding }),
+  }) as SubAgentExecutionRequest;
+}
+
+function normalizeWorkerBinding(
+  value: unknown,
+  executorName: string,
+  maxBindingBytes: number,
+): SubAgentExecutorBinding {
+  try {
+    assertJsonValue(value, {
+      label: 'Worker Executor binding',
+      maxBytes: maxBindingBytes,
+      maxDepth: 64,
+      maxNodes: 10_000,
+    });
+    const owned = parseJsonValue(canonicalizeJson(value));
+    if (typeof owned !== 'object' || owned === null || Array.isArray(owned)) {
+      throw new TypeError('Worker Executor binding must be an object.');
+    }
+    const record = owned as Record<string, JsonValue>;
+    const expectedKeys = [
+      'adapterStateVersion',
+      'definitionName',
+      'definitionVersion',
+      'executorName',
+      'modelBinding',
+      'ownerSessionId',
+      'recoveryData',
+      'runnerId',
+      'runnerVersion',
+      'subagentSessionId',
+      'taskId',
+      'version',
+    ];
+    if (Object.keys(record).sort().join(',') !== expectedKeys.sort().join(',')) {
+      throw new TypeError('Worker Executor binding contains unknown or missing fields.');
+    }
+    if (record.version !== '1' || record.executorName !== executorName) {
+      throw new TypeError('Worker Executor binding identity is invalid.');
+    }
+    assertIdentifier(record.executorName, 'Worker binding executorName');
+    assertTransportIdentifier(record.ownerSessionId as string, 'Worker binding ownerSessionId');
+    assertTransportIdentifier(record.taskId as string, 'Worker binding taskId');
+    assertTransportIdentifier(
+      record.subagentSessionId as string,
+      'Worker binding subagentSessionId',
+    );
+    assertIdentifier(record.definitionName as string, 'Worker binding definitionName');
+    assertVersionIdentifier(record.definitionVersion as string, 'Worker binding definitionVersion');
+    assertIdentifier(record.runnerId as string, 'Worker binding runnerId');
+    assertVersionIdentifier(record.runnerVersion as string, 'Worker binding runnerVersion');
+    if (record.adapterStateVersion !== WORKER_SUBAGENT_ADAPTER_STATE_VERSION) {
+      throw new TypeError('Worker binding adapterStateVersion is invalid.');
+    }
+    const modelBinding = record.modelBinding;
+    if (typeof modelBinding !== 'object' || modelBinding === null || Array.isArray(modelBinding)) {
+      throw new TypeError('Worker binding modelBinding is invalid.');
+    }
+    const modelBindingRecord = modelBinding as Record<string, JsonValue>;
+    if (Object.keys(modelBindingRecord).sort().join(',') !== 'codecVersion,gatewayId,protocol') {
+      throw new TypeError('Worker binding modelBinding contains unknown or missing fields.');
+    }
+    assertIdentifier(modelBindingRecord.gatewayId as string, 'Worker binding gatewayId');
+    assertIdentifier(modelBindingRecord.protocol as string, 'Worker binding protocol');
+    assertVersionIdentifier(
+      modelBindingRecord.codecVersion as string,
+      'Worker binding codecVersion',
+    );
+    decodeWorkerBinding(record.recoveryData);
+    deepFreezeJson(owned);
+    return owned as unknown as SubAgentExecutorBinding;
+  } catch {
+    throw new SubAgentRuntimeError({
+      code: 'BINDING_INVALID',
+      message: 'The Worker Executor binding is invalid.',
+      retryable: false,
+    });
+  }
+}
+
 function assertWorkerOperationSupported(request: SubAgentExecutionRequest): void {
   if (request.operation.type !== 'reconnect') return;
   throw new SubAgentRuntimeError({
@@ -2475,6 +2590,12 @@ function nonNegativeIntegerAtMost(
 
 function assertIdentifier(value: string, label: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value)) {
+    throw new TypeError(`${label} is invalid.`);
+  }
+}
+
+function assertVersionIdentifier(value: string, label: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u.test(value)) {
     throw new TypeError(`${label} is invalid.`);
   }
 }

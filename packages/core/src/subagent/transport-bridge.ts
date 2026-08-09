@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { types as nodeTypes } from 'node:util';
 
 import type {
   ExecutorAvailabilityProbe,
@@ -43,6 +44,7 @@ import {
 } from './transport-control';
 import {
   createSubAgentExecutionRequestWire,
+  decodeSubAgentExecutionRequestWire,
   reconstructSubAgentExecutionRequest,
 } from './transport-codec';
 import {
@@ -264,7 +266,7 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<SubAgentExecutorOperationResult> {
-    const bound = this.#bindControl(request, control);
+    const bound = this.#bindControl(this.#ownRequestBinding(request), control);
     try {
       const exchange = this.#openExecutorRequest(bound.request, 'execute');
       const response = await requireNext(exchange);
@@ -281,7 +283,7 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<ExecutorTaskHandle | SubAgentExecutorRecoveryRequired> {
-    const bound = this.#bindControl(request, control);
+    const bound = this.#bindControl(this.#ownRequestBinding(request), control);
     let exchange: SubAgentTransportPeerExchange | undefined;
     try {
       exchange = this.#openExecutorRequest(bound.request, 'spawn');
@@ -305,8 +307,7 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
         throw bridgeInternalError('The remote spawn did not return an acceptance binding.');
       }
 
-      const binding = first.envelope.payload.binding;
-      this.#assertBinding(binding, bound.request);
+      const binding = this.#assertBinding(first.envelope.payload.binding, bound.request);
       const scope = Object.freeze({
         ownerSessionId: bound.request.ownerSessionId,
         taskId: bound.request.taskId,
@@ -356,13 +357,13 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
       readonly deadlineAt: number;
     },
   ): Promise<void> {
-    this.#assertBindingForExecutor(binding);
+    const owned = this.#assertBindingForExecutor(binding);
     const response = await requestOne(this.#resolvePeer(), {
       kind: 'cancel.request',
-      taskId: binding.taskId,
+      taskId: owned.taskId,
       operationId: options.operationId,
       payload: {
-        binding,
+        binding: owned,
         ...(options.reason === undefined ? {} : { reason: options.reason }),
       },
       signal: options.signal,
@@ -722,8 +723,8 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
     return operationId;
   }
 
-  #assertBinding(binding: SubAgentExecutorBinding, request: SubAgentExecutionRequest): void {
-    this.#assertBindingForExecutor(binding);
+  #assertBinding(candidate: unknown, request: SubAgentExecutionRequest): SubAgentExecutorBinding {
+    const binding = this.#assertBindingForExecutor(candidate);
     if (
       binding.ownerSessionId !== request.ownerSessionId ||
       binding.taskId !== request.taskId ||
@@ -737,9 +738,28 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
         retryable: false,
       });
     }
+    return binding;
   }
 
-  #assertBindingForExecutor(binding: SubAgentExecutorBinding): void {
+  #ownRequestBinding(request: SubAgentExecutionRequest): SubAgentExecutionRequest {
+    const operation = readExecutionOperation(request);
+    const operationType = readExecutionOperationType(operation);
+    if (
+      operationType === 'create' ||
+      (operationType !== 'resume' && operationType !== 'reconnect')
+    ) {
+      return request;
+    }
+
+    const binding = this.#assertBinding(readExecutionOperationBinding(operation), request);
+    return Object.freeze({
+      ...request,
+      operation: Object.freeze({ ...operation, binding }),
+    });
+  }
+
+  #assertBindingForExecutor(candidate: unknown): SubAgentExecutorBinding {
+    const binding = ownedBinding(candidate, this.descriptor.maxBindingBytes);
     if (
       binding.executorName !== this.descriptor.name ||
       binding.adapterStateVersion !== this.bindingCodec.adapterStateVersion
@@ -759,6 +779,7 @@ export class SubAgentTransportExecutorBridge implements SubAgentExecutor {
         retryable: false,
       });
     }
+    return binding;
   }
 }
 
@@ -1016,7 +1037,20 @@ export class SubAgentTransportTargetBridge {
   async #handleExecutorRequest(request: SubAgentTransportPeerHandlerRequest): Promise<void> {
     const envelope = request.envelope;
     if (envelope.kind !== 'executor.request') return;
-    if (!this.#ownsExecutionWire(envelope.taskId, envelope.payload.request)) {
+    let wire: SubAgentTransportRpcPayloadMap['executor.request']['request'];
+    try {
+      wire = decodeSubAgentExecutionRequestWire(envelope.payload.request, {
+        expectedExecutorName: this.#executorName,
+        maxBindingBytes: DEFAULT_EXECUTOR_MAX_BINDING_BYTES,
+      });
+    } catch {
+      await request.reply({
+        kind: 'protocol.error',
+        payload: { error: safeError(bindingInvalidError()) },
+      });
+      return;
+    }
+    if (!this.#ownsExecutionWire(envelope.taskId, wire)) {
       await request.reply({
         kind: 'protocol.error',
         payload: { error: SAFE_RESOURCE_NOT_FOUND_ERROR },
@@ -1024,7 +1058,7 @@ export class SubAgentTransportTargetBridge {
       return;
     }
     const mode = envelope.payload.mode;
-    const candidate = targetOperationRequestIdentity(envelope.payload.request);
+    const candidate = targetOperationRequestIdentity(wire);
     const key = `${this.#ownerSessionId}\0${envelope.taskId}\0${envelope.operationId}`;
     const existing = this.#operations.get(key);
     if (
@@ -1055,7 +1089,7 @@ export class SubAgentTransportTargetBridge {
         });
         return;
       }
-      const started = this.#start(envelope.payload.request);
+      const started = this.#start(wire);
       void started.catch(() => undefined);
       operation = Object.freeze({
         requestIdentity: candidate.requestIdentity,
@@ -1250,11 +1284,12 @@ export class SubAgentTransportTargetBridge {
     const envelope = request.envelope;
     if (envelope.kind !== 'cancel.request') return;
     try {
-      if (envelope.payload.binding.ownerSessionId !== this.#ownerSessionId) {
+      const binding = ownedBinding(envelope.payload.binding);
+      if (binding.ownerSessionId !== this.#ownerSessionId) {
         throw createResourceNotFoundError();
       }
       const task = this.#requireTask(envelope.taskId);
-      this.#assertTaskBinding(task, envelope.payload.binding);
+      this.#assertTaskBinding(task, binding);
       if (!task.controller.signal.aborted && task.running) {
         task.controller.abort(
           new SubAgentRuntimeError({
@@ -1654,13 +1689,75 @@ function bindingsEqual(left: SubAgentExecutorBinding, right: SubAgentExecutorBin
   );
 }
 
-function ownedBinding(binding: SubAgentExecutorBinding): SubAgentExecutorBinding {
+function readExecutionOperation(
+  request: SubAgentExecutionRequest,
+): SubAgentExecutionRequest['operation'] {
+  if (request === null || typeof request !== 'object' || nodeTypes.isProxy(request as object)) {
+    throw bindingInvalidError();
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(request, 'operation');
+  if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+    throw bindingInvalidError();
+  }
+  return descriptor.value as SubAgentExecutionRequest['operation'];
+}
+
+function readExecutionOperationType(operation: SubAgentExecutionRequest['operation']): unknown {
+  if (
+    operation === null ||
+    typeof operation !== 'object' ||
+    nodeTypes.isProxy(operation as object)
+  ) {
+    throw bindingInvalidError();
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(operation, 'type');
+  if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+    throw bindingInvalidError();
+  }
+  return descriptor.value;
+}
+
+function readExecutionOperationBinding(operation: SubAgentExecutionRequest['operation']): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(operation, 'binding');
+  if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+    throw bindingInvalidError();
+  }
+  return descriptor.value;
+}
+
+function ownedBinding(
+  candidate: unknown,
+  maxBytes = DEFAULT_EXECUTOR_MAX_BINDING_BYTES,
+): SubAgentExecutorBinding {
+  try {
+    // JSON validation rejects Proxy, accessor, symbol-keyed and non-plain values by inspecting
+    // descriptors. It must run before any binding field or key is read.
+    assertJsonValue(candidate, {
+      maxBytes,
+      maxDepth: 64,
+      maxNodes: 10_000,
+      label: 'Subagent transport binding',
+    });
+    const cloned = parseJsonValue(canonicalizeJson(candidate as JsonValue));
+    assertOwnedBindingShape(cloned);
+    deepFreezeJson(cloned);
+    return cloned as unknown as SubAgentExecutorBinding;
+  } catch {
+    throw bindingInvalidError();
+  }
+}
+
+function assertOwnedBindingShape(value: JsonValue): void {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw bindingInvalidError();
+  }
+  const record = value as { readonly [key: string]: JsonValue };
   const expectedKeys = [
     'adapterStateVersion',
     'definitionName',
     'definitionVersion',
     'executorName',
-    ...(binding.modelBinding === undefined ? [] : ['modelBinding']),
+    'modelBinding',
     'ownerSessionId',
     'recoveryData',
     'runnerId',
@@ -1669,33 +1766,51 @@ function ownedBinding(binding: SubAgentExecutorBinding): SubAgentExecutorBinding
     'taskId',
     'version',
   ];
-  const actualKeys = Object.keys(binding).sort();
+  const actualKeys = Object.keys(record).sort();
   if (
     actualKeys.length !== expectedKeys.length ||
-    actualKeys.some((key, index) => key !== expectedKeys[index])
+    actualKeys.some((key, index) => key !== expectedKeys[index]) ||
+    record.version !== '1'
   ) {
-    throw new SubAgentRuntimeError({
-      code: 'BINDING_INVALID',
-      message: 'The target binding factory returned a non-closed binding.',
-      retryable: false,
-    });
+    throw bindingInvalidError();
   }
-  try {
-    assertJsonValue(binding, {
-      maxBytes: DEFAULT_EXECUTOR_MAX_BINDING_BYTES,
-      label: 'Target transport binding',
-    });
-    const cloned = parseJsonValue(canonicalizeJson(binding as unknown as JsonValue));
-    deepFreezeJson(cloned);
-    return cloned as unknown as SubAgentExecutorBinding;
-  } catch (error) {
-    if (error instanceof SubAgentRuntimeError) throw error;
-    throw new SubAgentRuntimeError({
-      code: 'BINDING_INVALID',
-      message: 'The target binding factory returned an invalid binding.',
-      retryable: false,
-    });
+  for (const key of [
+    'executorName',
+    'ownerSessionId',
+    'taskId',
+    'subagentSessionId',
+    'definitionName',
+    'definitionVersion',
+    'runnerId',
+    'runnerVersion',
+    'adapterStateVersion',
+  ] as const) {
+    assertIdentifier(record[key] as string, `transport binding ${key}`);
   }
+  const modelBinding = record.modelBinding;
+  if (modelBinding === null || typeof modelBinding !== 'object' || Array.isArray(modelBinding)) {
+    throw bindingInvalidError();
+  }
+  const modelRecord = modelBinding as { readonly [key: string]: JsonValue };
+  const modelKeys = Object.keys(modelRecord).sort();
+  const expectedModelKeys = ['codecVersion', 'gatewayId', 'protocol'];
+  if (
+    modelKeys.length !== expectedModelKeys.length ||
+    modelKeys.some((key, index) => key !== expectedModelKeys[index])
+  ) {
+    throw bindingInvalidError();
+  }
+  for (const key of expectedModelKeys) {
+    assertIdentifier(modelRecord[key] as string, `transport binding modelBinding.${key}`);
+  }
+}
+
+function bindingInvalidError(): SubAgentRuntimeError {
+  return new SubAgentRuntimeError({
+    code: 'BINDING_INVALID',
+    message: 'The Subagent transport binding is invalid.',
+    retryable: false,
+  });
 }
 
 function modelBindingsEqual(

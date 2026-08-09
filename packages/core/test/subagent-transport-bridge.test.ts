@@ -25,9 +25,11 @@ import { DEFAULT_SUBAGENT_LIMITS } from '../src/subagent/limits';
 import {
   SubAgentTransportPeer,
   createSubAgentTransportPeerWriterAdmission,
+  type SubAgentTransportPeerExchange,
   type SubAgentTransportPeerHandlerRequest,
   type SubAgentTransportPeerPacket,
   type SubAgentTransportPeerReply,
+  type SubAgentTransportPeerResponse,
 } from '../src/subagent/transport-peer';
 import { createSubAgentTransportRpcEnvelope } from '../src/subagent/transport-rpc-codec';
 import type { SubAgentTransportRpcPayloadMap } from '../src/subagent/transport-rpc';
@@ -143,6 +145,57 @@ function createBinding(request: SubAgentExecutionRequest): SubAgentExecutorBindi
     },
     recoveryData: { jobId: `job-${request.taskId}` },
   });
+}
+
+function createBindingWithoutModel(request: SubAgentExecutionRequest): SubAgentExecutorBinding {
+  const candidate = { ...createBinding(request) } as Partial<SubAgentExecutorBinding>;
+  Reflect.deleteProperty(candidate, 'modelBinding');
+  return candidate as SubAgentExecutorBinding;
+}
+
+function createAccessorBinding(request: SubAgentExecutionRequest): {
+  readonly binding: SubAgentExecutorBinding;
+  readonly reads: () => number;
+} {
+  const candidate = { ...createBinding(request) } as Record<PropertyKey, unknown>;
+  let reads = 0;
+  Object.defineProperty(candidate, 'ownerSessionId', {
+    enumerable: true,
+    configurable: true,
+    get: () => {
+      reads += 1;
+      return request.ownerSessionId;
+    },
+  });
+  return {
+    binding: candidate as unknown as SubAgentExecutorBinding,
+    reads: () => reads,
+  };
+}
+
+function createProxyBinding(request: SubAgentExecutionRequest): {
+  readonly binding: SubAgentExecutorBinding;
+  readonly traps: () => number;
+} {
+  let traps = 0;
+  const binding = new Proxy(
+    { ...createBinding(request) },
+    {
+      get(target, key, receiver) {
+        traps += 1;
+        return Reflect.get(target, key, receiver);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        traps += 1;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+      ownKeys(target) {
+        traps += 1;
+        return Reflect.ownKeys(target);
+      },
+    },
+  );
+  return { binding, traps: () => traps };
 }
 
 function terminalOutcome(
@@ -610,6 +663,43 @@ function messageIds(prefix: string): () => string {
   return () => `${prefix}-${sequence++}`;
 }
 
+function singleResponseExchange(
+  response: SubAgentTransportPeerResponse,
+): SubAgentTransportPeerExchange {
+  const taskId = response.envelope.taskId;
+  const operationId = response.envelope.operationId;
+  if (taskId === undefined || operationId === undefined) {
+    throw new TypeError('A scripted Executor response requires task and operation identity.');
+  }
+  let yielded = false;
+  let closed = false;
+  const exchange: SubAgentTransportPeerExchange = {
+    messageId: response.envelope.correlationId,
+    taskId,
+    operationId,
+    requestKind: 'executor.request',
+    openedAt: NOW,
+    abort: () => {
+      closed = true;
+    },
+    next: async () => {
+      if (closed || yielded) {
+        return { done: true, value: undefined } as IteratorReturnResult<undefined>;
+      }
+      yielded = true;
+      return { done: false, value: response } as IteratorYieldResult<SubAgentTransportPeerResponse>;
+    },
+    return: async () => {
+      closed = true;
+      return { done: true, value: undefined } as IteratorReturnResult<undefined>;
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+  return exchange;
+}
+
 async function* emptyEvents(): AsyncIterable<SubAgentTaskEvent> {}
 
 async function invokeTarget(
@@ -700,6 +790,416 @@ describe('Subagent transport controller/target bridge', () => {
     expect(fixtures.complete).not.toHaveBeenCalled();
     expect(model).not.toHaveBeenCalled();
   });
+
+  it('rejects an accessor binding from createBinding without invoking the getter or child effects', async () => {
+    const request = createRequest();
+    const hostile = createAccessorBinding(request);
+    const run = vi.fn(async (childRequest: SubAgentChildRunRequest) =>
+      terminalOutcome(childRequest),
+    );
+    const model = vi.fn<SubAgentTransportModelRequestHandler>();
+    const validateBinding = vi.fn(async () => undefined);
+    const loopback = createLoopback({
+      run,
+      model,
+      validateBinding,
+      createBinding: () => hostile.binding,
+    });
+    const fixtures = createControl();
+
+    await expect(loopback.controller.execute(request, fixtures.control)).rejects.toMatchObject({
+      code: 'BINDING_INVALID',
+    });
+    expect(hostile.reads()).toBe(0);
+    expect(validateBinding).not.toHaveBeenCalled();
+    expect(loopback.factory).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(fixtures.commitBinding).not.toHaveBeenCalled();
+    expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+    expect(fixtures.reportProgress).not.toHaveBeenCalled();
+    expect(fixtures.consumeBudget).not.toHaveBeenCalled();
+    expect(fixtures.submitResult).not.toHaveBeenCalled();
+    expect(fixtures.complete).not.toHaveBeenCalled();
+    expect(model).not.toHaveBeenCalled();
+  });
+
+  it('rejects a createBinding result without modelBinding before validator or child effects', async () => {
+    const request = createRequest();
+    const run = vi.fn(async (childRequest: SubAgentChildRunRequest) =>
+      terminalOutcome(childRequest),
+    );
+    const model = vi.fn<SubAgentTransportModelRequestHandler>();
+    const validateBinding = vi.fn(async () => undefined);
+    const loopback = createLoopback({
+      run,
+      model,
+      validateBinding,
+      createBinding: (candidate) => createBindingWithoutModel(candidate),
+    });
+    const fixtures = createControl();
+
+    await expect(loopback.controller.execute(request, fixtures.control)).rejects.toMatchObject({
+      code: 'BINDING_INVALID',
+    });
+    expect(loopback.targetCreateBinding).toHaveBeenCalledTimes(1);
+    expect(validateBinding).not.toHaveBeenCalled();
+    expect(loopback.factory).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(fixtures.commitBinding).not.toHaveBeenCalled();
+    expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+    expect(fixtures.authorizeTool).not.toHaveBeenCalled();
+    expect(fixtures.pauseDelegation).not.toHaveBeenCalled();
+    expect(fixtures.reportProgress).not.toHaveBeenCalled();
+    expect(fixtures.consumeBudget).not.toHaveBeenCalled();
+    expect(fixtures.emit).not.toHaveBeenCalled();
+    expect(fixtures.submitResult).not.toHaveBeenCalled();
+    expect(fixtures.complete).not.toHaveBeenCalled();
+    expect(fixtures.fail).not.toHaveBeenCalled();
+    expect(model).not.toHaveBeenCalled();
+  });
+
+  it('rejects an accepted transport binding without modelBinding before retaining a task handle', async () => {
+    const request = createRequest();
+    const accepted = createSubAgentTransportRpcEnvelope({
+      channelId: 'missing-model-accepted',
+      sequence: 1,
+      messageId: 'missing-model-accepted-1',
+      correlationId: 'missing-model-request-1',
+      taskId: request.taskId,
+      operationId: request.operation.operationId,
+      kind: 'executor.accepted',
+      payload: {
+        mode: 'spawn',
+        binding: createBindingWithoutModel(request),
+      },
+    });
+    const peerRequest = vi.fn(() =>
+      singleResponseExchange({
+        envelope: accepted as SubAgentTransportPeerResponse['envelope'],
+        sidecars: [],
+      }),
+    );
+    const controller = createSubAgentTransportExecutorBridge({
+      descriptor,
+      bindingCodec,
+      peer: { request: peerRequest } as unknown as SubAgentTransportPeer,
+      getAvailability: () => ({ status: 'available', supportedDefinitions: [] }),
+      supports: () => true,
+      now: () => NOW,
+    });
+    const fixtures = createControl();
+
+    await expect(controller.spawn(request, fixtures.control)).rejects.toMatchObject({
+      code: 'BINDING_INVALID',
+    });
+    expect(peerRequest).toHaveBeenCalledTimes(1);
+    expect(controller.diagnostics()).toEqual({
+      activeExecutions: 0,
+      taskHandles: 0,
+      handleBindings: 0,
+      nestedTaskHandles: 0,
+    });
+    expect(fixtures.commitBinding).not.toHaveBeenCalled();
+    expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+    expect(fixtures.authorizeTool).not.toHaveBeenCalled();
+    expect(fixtures.pauseDelegation).not.toHaveBeenCalled();
+    expect(fixtures.reportProgress).not.toHaveBeenCalled();
+    expect(fixtures.consumeBudget).not.toHaveBeenCalled();
+    expect(fixtures.emit).not.toHaveBeenCalled();
+    expect(fixtures.submitResult).not.toHaveBeenCalled();
+    expect(fixtures.complete).not.toHaveBeenCalled();
+    expect(fixtures.fail).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['execute', 'resume'],
+    ['spawn', 'reconnect'],
+  ] as const)(
+    'rejects a missing-modelBinding host %s/%s before Peer or control effects',
+    async (method, operationType) => {
+      const initial = createRequest();
+      const run = vi.fn(async (childRequest: SubAgentChildRunRequest) =>
+        terminalOutcome(childRequest),
+      );
+      const model = vi.fn<SubAgentTransportModelRequestHandler>();
+      const loopback = createLoopback({ run, model });
+      const peerRequest = vi.spyOn(loopback.controllerPeer, 'request');
+      const fixtures = createControl();
+      const request = createRequest({
+        operation:
+          operationType === 'resume'
+            ? {
+                type: 'resume',
+                operationId: 'missing-model-resume-1',
+                reason: 'checkpoint',
+                binding: createBindingWithoutModel(initial),
+                checkpoint: childCheckpoint(),
+              }
+            : {
+                type: 'reconnect',
+                operationId: 'missing-model-reconnect-1',
+                binding: createBindingWithoutModel(initial),
+              },
+        attempt: 2,
+        executionEpoch: 'epoch-2',
+        executionFencingToken: '2',
+      });
+
+      const operation =
+        method === 'execute'
+          ? loopback.controller.execute(request, fixtures.control)
+          : loopback.controller.spawn(request, fixtures.control);
+      await expect(operation).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+      expect(peerRequest).not.toHaveBeenCalled();
+      expect(loopback.controller.diagnostics()).toEqual({
+        activeExecutions: 0,
+        taskHandles: 0,
+        handleBindings: 0,
+        nestedTaskHandles: 0,
+      });
+      expect(loopback.target.diagnostics()).toMatchObject({ tasks: 0, operations: 0, starting: 0 });
+      expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
+      expect(loopback.factory).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+      expect(fixtures.commitBinding).not.toHaveBeenCalled();
+      expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+      expect(fixtures.authorizeTool).not.toHaveBeenCalled();
+      expect(fixtures.pauseDelegation).not.toHaveBeenCalled();
+      expect(fixtures.reportProgress).not.toHaveBeenCalled();
+      expect(fixtures.consumeBudget).not.toHaveBeenCalled();
+      expect(fixtures.emit).not.toHaveBeenCalled();
+      expect(fixtures.submitResult).not.toHaveBeenCalled();
+      expect(fixtures.complete).not.toHaveBeenCalled();
+      expect(fixtures.fail).not.toHaveBeenCalled();
+      expect(model).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects a missing-modelBinding host cancel before Peer or task-handle effects', async () => {
+    const request = createRequest();
+    const run = vi.fn(async (childRequest: SubAgentChildRunRequest) =>
+      terminalOutcome(childRequest),
+    );
+    const model = vi.fn<SubAgentTransportModelRequestHandler>();
+    const loopback = createLoopback({ run, model });
+    const peerRequest = vi.spyOn(loopback.controllerPeer, 'request');
+
+    await expect(
+      loopback.controller.cancel(createBindingWithoutModel(request), {
+        operationId: 'missing-model-cancel-1',
+        signal: new AbortController().signal,
+        deadlineAt: NOW + 120_000,
+      }),
+    ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+    expect(peerRequest).not.toHaveBeenCalled();
+    expect(loopback.controller.diagnostics()).toEqual({
+      activeExecutions: 0,
+      taskHandles: 0,
+      handleBindings: 0,
+      nestedTaskHandles: 0,
+    });
+    expect(loopback.target.diagnostics()).toMatchObject({ tasks: 0, operations: 0, starting: 0 });
+    expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
+    expect(loopback.factory).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(model).not.toHaveBeenCalled();
+  });
+
+  it('rejects an accessor resume binding before execute registers control or reaches the target', async () => {
+    const initial = createRequest();
+    const hostile = createAccessorBinding(initial);
+    const run = vi.fn(async (childRequest: SubAgentChildRunRequest) =>
+      terminalOutcome(childRequest),
+    );
+    const model = vi.fn<SubAgentTransportModelRequestHandler>();
+    const loopback = createLoopback({ run, model });
+    const fixtures = createControl();
+    const resume = createRequest({
+      operation: {
+        type: 'resume',
+        operationId: 'resume-hostile-binding-1',
+        reason: 'checkpoint',
+        binding: hostile.binding,
+        checkpoint: childCheckpoint(),
+      },
+      attempt: 2,
+      executionEpoch: 'epoch-2',
+      executionFencingToken: '2',
+    });
+
+    await expect(loopback.controller.execute(resume, fixtures.control)).rejects.toMatchObject({
+      code: 'BINDING_INVALID',
+    });
+    expect(hostile.reads()).toBe(0);
+    expect(loopback.controller.diagnostics()).toEqual({
+      activeExecutions: 0,
+      taskHandles: 0,
+      handleBindings: 0,
+      nestedTaskHandles: 0,
+    });
+    expect(loopback.target.diagnostics()).toMatchObject({ tasks: 0, operations: 0, starting: 0 });
+    expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
+    expect(loopback.factory).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(fixtures.commitBinding).not.toHaveBeenCalled();
+    expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+    expect(fixtures.reportProgress).not.toHaveBeenCalled();
+    expect(fixtures.consumeBudget).not.toHaveBeenCalled();
+    expect(fixtures.submitResult).not.toHaveBeenCalled();
+    expect(fixtures.complete).not.toHaveBeenCalled();
+    expect(model).not.toHaveBeenCalled();
+  });
+
+  it('rejects a Proxy reconnect binding before spawn invokes a Proxy trap or target handler', async () => {
+    const initial = createRequest();
+    const hostile = createProxyBinding(initial);
+    const run = vi.fn(async (childRequest: SubAgentChildRunRequest) =>
+      terminalOutcome(childRequest),
+    );
+    const model = vi.fn<SubAgentTransportModelRequestHandler>();
+    const loopback = createLoopback({ run, model });
+    const fixtures = createControl();
+    const reconnect = createRequest({
+      operation: {
+        type: 'reconnect',
+        operationId: 'reconnect-hostile-binding-1',
+        binding: hostile.binding,
+      },
+      attempt: 2,
+      executionEpoch: 'epoch-2',
+      executionFencingToken: '2',
+    });
+
+    await expect(loopback.controller.spawn(reconnect, fixtures.control)).rejects.toMatchObject({
+      code: 'BINDING_INVALID',
+    });
+    expect(hostile.traps()).toBe(0);
+    expect(loopback.controller.diagnostics()).toEqual({
+      activeExecutions: 0,
+      taskHandles: 0,
+      handleBindings: 0,
+      nestedTaskHandles: 0,
+    });
+    expect(loopback.target.diagnostics()).toMatchObject({ tasks: 0, operations: 0, starting: 0 });
+    expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
+    expect(loopback.factory).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(fixtures.commitBinding).not.toHaveBeenCalled();
+    expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+    expect(model).not.toHaveBeenCalled();
+  });
+
+  it.each(['resume', 'reconnect'] as const)(
+    'canonical-clones a target %s binding before owner scope or registry lookup',
+    async (operationType) => {
+      const initial = createRequest();
+      const hostile = createAccessorBinding(initial);
+      const run = vi.fn(async (childRequest: SubAgentChildRunRequest) =>
+        terminalOutcome(childRequest),
+      );
+      const loopback = createLoopback({ run });
+      const request = createRequest({
+        operation:
+          operationType === 'resume'
+            ? {
+                type: 'resume',
+                operationId: 'target-hostile-resume-1',
+                reason: 'checkpoint',
+                binding: createBinding(initial),
+                checkpoint: childCheckpoint(),
+              }
+            : {
+                type: 'reconnect',
+                operationId: 'target-hostile-reconnect-1',
+                binding: createBinding(initial),
+              },
+        attempt: 2,
+        executionEpoch: 'epoch-2',
+        executionFencingToken: '2',
+      });
+      const wire = createSubAgentExecutionRequestWire(request, {
+        now: () => NOW,
+        expectedExecutorName: descriptor.name,
+      });
+      const validEnvelope = createSubAgentTransportRpcEnvelope({
+        channelId: 'target-hostile-binding',
+        sequence: 1,
+        messageId: `target-hostile-${operationType}`,
+        taskId: request.taskId,
+        operationId: request.operation.operationId,
+        kind: 'executor.request',
+        payload: { mode: 'execute', request: wire },
+      });
+      const envelope = {
+        ...validEnvelope,
+        payload: {
+          ...validEnvelope.payload,
+          request: {
+            ...wire,
+            operation: { ...wire.operation, binding: hostile.binding },
+          },
+        },
+      } as unknown as SubAgentTransportPeerHandlerRequest['envelope'];
+
+      await expect(invokeTarget(loopback.target, envelope)).resolves.toEqual([
+        {
+          kind: 'protocol.error',
+          payload: {
+            error: expect.objectContaining({ code: 'BINDING_INVALID', retryable: false }),
+          },
+        },
+      ]);
+      expect(hostile.reads()).toBe(0);
+      expect(loopback.target.diagnostics()).toMatchObject({ tasks: 0, operations: 0, starting: 0 });
+      expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
+      expect(loopback.factory).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [
+      'symbol-keyed',
+      (request: SubAgentExecutionRequest) => {
+        const candidate = { ...createBinding(request) } as Record<PropertyKey, unknown>;
+        candidate[Symbol('hostile')] = true;
+        return candidate as unknown as SubAgentExecutorBinding;
+      },
+    ],
+    [
+      'oversized',
+      (request: SubAgentExecutionRequest) => ({
+        ...createBinding(request),
+        recoveryData: { padding: 'x'.repeat(descriptor.maxBindingBytes) },
+      }),
+    ],
+  ] as const)(
+    'rejects a %s cancel binding before sending a cancellation request',
+    async (_variant, makeBinding) => {
+      const request = createRequest();
+      const run = vi.fn(async (childRequest: SubAgentChildRunRequest) =>
+        terminalOutcome(childRequest),
+      );
+      const model = vi.fn<SubAgentTransportModelRequestHandler>();
+      const loopback = createLoopback({ run, model });
+      const fixtures = createControl();
+
+      await expect(
+        loopback.controller.cancel(makeBinding(request), {
+          operationId: 'cancel-hostile-binding-1',
+          signal: new AbortController().signal,
+          deadlineAt: NOW + 120_000,
+        }),
+      ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+      expect(loopback.target.diagnostics()).toMatchObject({ tasks: 0, operations: 0, starting: 0 });
+      expect(loopback.targetCreateBinding).not.toHaveBeenCalled();
+      expect(loopback.factory).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+      expect(fixtures.commitBinding).not.toHaveBeenCalled();
+      expect(fixtures.commitCheckpoint).not.toHaveBeenCalled();
+      expect(model).not.toHaveBeenCalled();
+    },
+  );
 
   it('validates delegated catalog and control scope before binding or runner factories', async () => {
     const run = vi.fn(async (request: SubAgentChildRunRequest) => terminalOutcome(request));

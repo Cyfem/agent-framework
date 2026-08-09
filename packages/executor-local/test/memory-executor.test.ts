@@ -18,6 +18,7 @@ import {
   defineSubAgent,
   type JsonValue,
   type SubAgentChildRunner,
+  type SubAgentExecutorBinding,
   type SubAgentExecutionOutcome,
   type SubAgentDefinitionRegistration,
   type SubAgentExecutionRequest,
@@ -283,6 +284,91 @@ function createDirectCreateHarness(blockFactory = false) {
 
 type CreateMutation = (request: SubAgentExecutionRequest) => SubAgentExecutionRequest;
 
+interface HostileBindingCase {
+  readonly label: string;
+  readonly binding: SubAgentExecutorBinding;
+  readonly getterCalls: () => number;
+}
+
+function hostileFullBindings(binding: SubAgentExecutorBinding): readonly HostileBindingCase[] {
+  let proxyGetterCalls = 0;
+  const proxy = new Proxy(binding, {
+    get(target, property, receiver) {
+      proxyGetterCalls += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+
+  const accessorCases = (['ownerSessionId', 'taskId', 'recoveryData'] as const).map((field) => {
+    let getterCalls = 0;
+    const descriptors: Record<PropertyKey, PropertyDescriptor> =
+      Object.getOwnPropertyDescriptors(binding);
+    descriptors[field] = {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        throw new Error(`The Memory Local binding ${field} getter must never execute.`);
+      },
+    };
+    return Object.freeze({
+      label: `accessor-${field}`,
+      binding: Object.defineProperties({}, descriptors) as SubAgentExecutorBinding,
+      getterCalls: () => getterCalls,
+    });
+  });
+
+  let nestedGetterCalls = 0;
+  const nestedRecoveryData = Object.defineProperties(
+    {},
+    {
+      kind: {
+        configurable: true,
+        enumerable: true,
+        value: 'maneeagent-memory-local/v1',
+      },
+      handleId: {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+          nestedGetterCalls += 1;
+          throw new Error('The Memory Local handleId getter must never execute.');
+        },
+      },
+    },
+  );
+  const symbolBinding = { ...binding } as Record<PropertyKey, unknown>;
+  symbolBinding[Symbol('hostile-memory-binding')] = 'hidden';
+  const oversizedBinding = {
+    ...binding,
+    oversizedPadding: 'x'.repeat(70 * 1024),
+  } as unknown as SubAgentExecutorBinding;
+
+  return Object.freeze([
+    Object.freeze({
+      label: 'proxy',
+      binding: proxy,
+      getterCalls: () => proxyGetterCalls,
+    }),
+    ...accessorCases,
+    Object.freeze({
+      label: 'nested-accessor',
+      binding: { ...binding, recoveryData: nestedRecoveryData } as SubAgentExecutorBinding,
+      getterCalls: () => nestedGetterCalls,
+    }),
+    Object.freeze({
+      label: 'symbol',
+      binding: symbolBinding as unknown as SubAgentExecutorBinding,
+      getterCalls: () => 0,
+    }),
+    Object.freeze({
+      label: 'oversized',
+      binding: oversizedBinding,
+      getterCalls: () => 0,
+    }),
+  ]);
+}
+
 const conflictingCreateMutations: readonly [string, CreateMutation][] = [
   [
     'operation ID',
@@ -452,6 +538,196 @@ describe('MemorySubAgentExecutor', () => {
     await expect(
       harness.registry.create({ ...prepared.request, checkpoint: childCheckpoint() }, 'local'),
     ).rejects.toMatchObject({ code: 'RECOVERY_UNSUPPORTED', retryable: false });
+    expect(harness.factories()).toBe(0);
+    expect(harness.runs()).toBe(0);
+  });
+
+  it('rejects a hostile create operation before target preparation or runner creation', async () => {
+    const harness = createDirectCreateHarness();
+    let getterCalls = 0;
+    const operation = Object.defineProperties(
+      {},
+      {
+        type: { configurable: true, enumerable: true, value: 'create' },
+        operationId: {
+          configurable: true,
+          enumerable: true,
+          value: 'hostile-local-create',
+        },
+        idempotencyKey: {
+          configurable: true,
+          enumerable: true,
+          value: 'hostile-local-create-key',
+        },
+        binding: {
+          configurable: true,
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            throw new Error('The Local create binding getter must never execute.');
+          },
+        },
+      },
+    );
+    const hostileRequest = Object.freeze({
+      ...harness.baseRequest,
+      operation,
+    }) as SubAgentExecutionRequest;
+    const before = harness.control;
+
+    await expect(harness.executor.spawn(hostileRequest, before)).rejects.toMatchObject({
+      code: 'BINDING_INVALID',
+      retryable: false,
+    });
+    expect(getterCalls).toBe(0);
+    expect(harness.prepare).not.toHaveBeenCalled();
+    expect(harness.factories()).toBe(0);
+    expect(harness.runs()).toBe(0);
+  });
+
+  it('normalizes a full public binding before cancel lookup and preserves owner secrecy', async () => {
+    const harness = createDirectCreateHarness();
+    const handle = await harness.executor.spawn(harness.baseRequest, harness.control);
+    await handle.wait();
+    expect(Object.isFrozen(handle.binding)).toBe(true);
+    expect(Object.isFrozen(handle.binding.recoveryData)).toBe(true);
+    const baselinePrepareCalls = harness.prepare.mock.calls.length;
+    const baselineFactories = harness.factories();
+    const baselineRuns = harness.runs();
+
+    for (const hostile of hostileFullBindings(handle.binding)) {
+      await expect(
+        harness.executor.cancel(hostile.binding, {
+          operationId: `hostile-local-cancel-${hostile.label}`,
+          signal: new AbortController().signal,
+          deadlineAt: Date.now() + 1_000,
+        }),
+        hostile.label,
+      ).rejects.toMatchObject({ code: 'BINDING_INVALID', retryable: false });
+      expect(hostile.getterCalls(), hostile.label).toBe(0);
+      expect(harness.prepare.mock.calls.length, hostile.label).toBe(baselinePrepareCalls);
+      expect(harness.factories(), hostile.label).toBe(baselineFactories);
+      expect(harness.runs(), hostile.label).toBe(baselineRuns);
+    }
+
+    await expect(
+      harness.executor.cancel(
+        { ...handle.binding, ownerSessionId: 'another-owner-session' },
+        {
+          operationId: 'cross-owner-local-cancel',
+          signal: new AbortController().signal,
+          deadlineAt: Date.now() + 1_000,
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'RESOURCE_NOT_FOUND', retryable: false });
+    expect(harness.prepare).toHaveBeenCalledTimes(baselinePrepareCalls);
+    expect(harness.factories()).toBe(baselineFactories);
+    expect(harness.runs()).toBe(baselineRuns);
+  });
+
+  it('normalizes a full public binding before resume preparation or recovery side effects', async () => {
+    const harness = createDirectCreateHarness();
+    const handle = await harness.executor.spawn(harness.baseRequest, harness.control);
+    await handle.wait();
+    const baselinePrepareCalls = harness.prepare.mock.calls.length;
+    const baselineFactories = harness.factories();
+    const baselineRuns = harness.runs();
+    const checkpoint = createExecutorConformanceChildCheckpoint({
+      runnerId: 'researcher-runner',
+      runnerVersion: '1',
+    });
+
+    for (const hostile of hostileFullBindings(handle.binding)) {
+      const resumeRequest = createExecutorConformanceRequest({
+        executorName: 'local',
+        taskId: harness.baseRequest.taskId,
+        definition: { name: definition.name, version: definition.version },
+        input: harness.baseRequest.input,
+        operation: {
+          type: 'resume',
+          operationId: `hostile-local-resume-${hostile.label}`,
+          reason: 'checkpoint',
+          binding: hostile.binding,
+          checkpoint,
+        },
+      });
+      const recorder = createExecutorConformanceControl({
+        ownerSessionId: resumeRequest.ownerSessionId,
+        taskId: resumeRequest.taskId,
+        signal: resumeRequest.signal,
+        deadlineAt: resumeRequest.deadlineAt,
+        approval: 'approved',
+      });
+
+      await expect(
+        harness.executor.execute(resumeRequest, recorder.control),
+        hostile.label,
+      ).rejects.toMatchObject({ code: 'BINDING_INVALID', retryable: false });
+      expect(hostile.getterCalls(), hostile.label).toBe(0);
+      expect(harness.prepare.mock.calls.length, hostile.label).toBe(baselinePrepareCalls);
+      expect(harness.factories(), hostile.label).toBe(baselineFactories);
+      expect(harness.runs(), hostile.label).toBe(baselineRuns);
+      expect(recorder.snapshot(), hostile.label).toMatchObject({
+        bindings: [],
+        checkpoints: [],
+        approvalInputs: [],
+        progress: [],
+        usage: [],
+        events: [],
+      });
+    }
+  });
+
+  it('keeps the public binding codec closed without invoking hostile accessors', () => {
+    const harness = createDirectCreateHarness();
+    const valid = {
+      kind: 'maneeagent-memory-local/v1' as const,
+      handleId: 'codec-handle',
+    };
+    let getterCalls = 0;
+    const accessor = Object.defineProperties(
+      {},
+      {
+        kind: {
+          configurable: true,
+          enumerable: true,
+          value: 'maneeagent-memory-local/v1',
+        },
+        handleId: {
+          configurable: true,
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            throw new Error('The Memory Local codec handleId getter must never execute.');
+          },
+        },
+      },
+    );
+    const withSymbol = { ...valid } as Record<PropertyKey, unknown>;
+    withSymbol[Symbol('hostile-memory-state')] = 'hidden';
+
+    expect(harness.executor.bindingCodec.decode(valid)).toEqual(valid);
+    expect(harness.executor.bindingCodec.encode(valid)).toEqual(valid);
+    for (const value of [
+      new Proxy(valid, {
+        get() {
+          getterCalls += 1;
+          throw new Error('The Memory Local codec Proxy getter must never execute.');
+        },
+      }),
+      accessor,
+      withSymbol,
+      { ...valid, handleId: 'x'.repeat(70 * 1024) },
+    ]) {
+      expect(() => harness.executor.bindingCodec.decode(value as JsonValue)).toThrow(
+        expect.objectContaining({ code: 'BINDING_INVALID', retryable: false }),
+      );
+      expect(() => harness.executor.bindingCodec.encode(value as never)).toThrow(
+        expect.objectContaining({ code: 'BINDING_INVALID', retryable: false }),
+      );
+    }
+    expect(getterCalls).toBe(0);
+    expect(harness.prepare).not.toHaveBeenCalled();
     expect(harness.factories()).toBe(0);
     expect(harness.runs()).toBe(0);
   });

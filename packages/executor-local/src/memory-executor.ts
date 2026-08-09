@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { types as nodeTypes } from 'node:util';
 
 import {
+  assertJsonValue,
   canonicalJsonSha256,
+  canonicalizeJson,
+  parseJsonValue,
   SubAgentRuntimeError,
   type ExecutorAvailabilityProbe,
   type ExecutorTaskHandle,
@@ -21,6 +25,10 @@ import {
 } from '@ruixutong.manee/maneeagent-framework';
 
 import { LocalSubAgentRunnerRegistry } from './local-runner-registry';
+
+const MEMORY_EXECUTOR_MAX_BINDING_BYTES = 64 * 1024;
+const MEMORY_EXECUTOR_MAX_BINDING_DEPTH = 64;
+const MEMORY_EXECUTOR_MAX_BINDING_NODES = 10_000;
 
 interface MemoryBindingState {
   readonly kind: 'maneeagent-memory-local/v1';
@@ -61,7 +69,8 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
   readonly descriptor: SubAgentExecutorDescriptor;
   readonly bindingCodec = Object.freeze({
     adapterStateVersion: '1',
-    encode: (state: MemoryBindingState): JsonValue => ({ ...state }),
+    encode: (state: MemoryBindingState): JsonValue =>
+      Object.freeze({ ...decodeBindingState(state) }),
     decode: (value: JsonValue): MemoryBindingState => decodeBindingState(value),
   });
   readonly #registry: LocalSubAgentRunnerRegistry;
@@ -99,7 +108,7 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
         }),
       }),
       adapterStateVersion: '1',
-      maxBindingBytes: 64 * 1024,
+      maxBindingBytes: MEMORY_EXECUTOR_MAX_BINDING_BYTES,
       maxEventPageSize: 256,
     });
   }
@@ -140,13 +149,21 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
       readonly deadlineAt: number;
     },
   ): Promise<void> {
+    const ownedBinding = normalizeMemoryBinding(
+      binding,
+      this.descriptor.name,
+      this.descriptor.maxBindingBytes,
+    );
     options.signal.throwIfAborted();
-    const execution = this.#executions.get(binding.taskId);
-    if (execution === undefined || !sameBinding(execution.binding, binding)) {
-      throw runtimeError(
-        'RECOVERY_TARGET_LOST',
-        'The original in-process child runner is no longer available.',
-      );
+    const execution = this.#executions.get(ownedBinding.taskId);
+    if (
+      execution === undefined ||
+      execution.binding.ownerSessionId !== ownedBinding.ownerSessionId
+    ) {
+      throw runtimeError('RESOURCE_NOT_FOUND', 'The requested Subagent resource was not found.');
+    }
+    if (!sameBinding(execution.binding, ownedBinding)) {
+      throw invalidBinding('The Memory Local binding does not match its logical task.');
     }
     if (!execution.running) return;
     execution.controller.abort(
@@ -170,36 +187,43 @@ export class MemorySubAgentExecutor implements SubAgentExecutor {
     request: SubAgentExecutionRequest,
     control: SubAgentExecutionControl,
   ): Promise<MemoryExecution> {
-    const prepared = this.#registry.prepareExecution(request, this.descriptor.name);
-    if (request.operation.type === 'reconnect') {
+    const ownedRequest = normalizeExecutionRequestOperation(
+      request,
+      this.descriptor.name,
+      this.descriptor.maxBindingBytes,
+    );
+    const prepared = this.#registry.prepareExecution(ownedRequest, this.descriptor.name);
+    if (ownedRequest.operation.type === 'reconnect') {
       throw runtimeError('RECOVERY_UNSUPPORTED', 'Local execution does not support reconnect.');
     }
     const createIdentity =
-      request.operation.type === 'create'
+      ownedRequest.operation.type === 'create'
         ? createMemoryCreateIdentity(
-            request.operation.operationId,
-            request.operation.idempotencyKey,
-            request,
+            ownedRequest.operation.operationId,
+            ownedRequest.operation.idempotencyKey,
+            ownedRequest,
             prepared.request,
           )
         : undefined;
 
-    const pending = this.#pendingStarts.get(request.taskId);
+    const pending = this.#pendingStarts.get(ownedRequest.taskId);
     if (pending !== undefined) {
       const execution = await pending;
-      if (request.operation.type === 'create') {
+      if (ownedRequest.operation.type === 'create') {
         assertCreateReplay(execution, createIdentity as MemoryCreateIdentity);
         return execution;
       }
-      return this.#start(request, control);
+      return this.#start(ownedRequest, control);
     }
 
-    const start = this.#startPrepared(request, control, prepared, createIdentity).finally(() => {
-      if (this.#pendingStarts.get(request.taskId) === start) {
-        this.#pendingStarts.delete(request.taskId);
-      }
-    });
-    this.#pendingStarts.set(request.taskId, start);
+    const start = this.#startPrepared(ownedRequest, control, prepared, createIdentity).finally(
+      () => {
+        if (this.#pendingStarts.get(ownedRequest.taskId) === start) {
+          this.#pendingStarts.delete(ownedRequest.taskId);
+        }
+      },
+    );
+    this.#pendingStarts.set(ownedRequest.taskId, start);
     return start;
   }
 
@@ -378,23 +402,201 @@ function createBinding(
     runnerId: runner.runnerId,
     runnerVersion: runner.runnerVersion,
     adapterStateVersion: '1',
-    recoveryData: { ...state },
+    recoveryData: Object.freeze({ ...state }),
   });
 }
 
-function decodeBindingState(value: JsonValue): MemoryBindingState {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new TypeError('Invalid Memory Local Executor binding.');
+function decodeBindingState(value: unknown): MemoryBindingState {
+  try {
+    const owned = cloneBindingJson(value, MEMORY_EXECUTOR_MAX_BINDING_BYTES);
+    if (
+      typeof owned !== 'object' ||
+      owned === null ||
+      Array.isArray(owned) ||
+      Object.keys(owned).sort().join(',') !== 'handleId,kind'
+    ) {
+      throw new TypeError('Memory Local binding state must be a closed object.');
+    }
+    const record = owned as { readonly handleId?: unknown; readonly kind?: unknown };
+    if (
+      record.kind !== 'maneeagent-memory-local/v1' ||
+      typeof record.handleId !== 'string' ||
+      record.handleId.length === 0
+    ) {
+      throw new TypeError('Memory Local binding state identity is invalid.');
+    }
+    return Object.freeze({ kind: record.kind, handleId: record.handleId });
+  } catch {
+    throw invalidBinding('The Memory Local Executor binding state is invalid.');
   }
-  const record = value as { readonly [key: string]: JsonValue };
-  if (
-    record.kind !== 'maneeagent-memory-local/v1' ||
-    typeof record.handleId !== 'string' ||
-    record.handleId.length === 0
-  ) {
-    throw new TypeError('Invalid Memory Local Executor binding.');
+}
+
+function normalizeExecutionRequestOperation(
+  request: SubAgentExecutionRequest,
+  executorName: string,
+  maxBindingBytes: number,
+): SubAgentExecutionRequest {
+  try {
+    if (nodeTypes.isProxy(request)) {
+      throw new TypeError('Memory Local execution request must not be a Proxy.');
+    }
+    const operationDescriptor = Object.getOwnPropertyDescriptor(request, 'operation');
+    if (
+      operationDescriptor === undefined ||
+      !Object.prototype.hasOwnProperty.call(operationDescriptor, 'value')
+    ) {
+      throw new TypeError('Memory Local execution operation must be an own data property.');
+    }
+    assertJsonValue(operationDescriptor.value);
+    if (
+      typeof operationDescriptor.value !== 'object' ||
+      operationDescriptor.value === null ||
+      Array.isArray(operationDescriptor.value)
+    ) {
+      throw new TypeError('Memory Local execution operation must be an object.');
+    }
+    const operation = operationDescriptor.value as Record<string, JsonValue>;
+    let ownedOperation: JsonValue;
+    if (operation.type === 'create') {
+      assertClosedKeys(operation, ['idempotencyKey', 'operationId', 'type']);
+      ownedOperation = Object.freeze({
+        type: 'create',
+        operationId: requireOperationString(operation, 'operationId'),
+        idempotencyKey: requireOperationString(operation, 'idempotencyKey'),
+      });
+    } else if (operation.type === 'resume') {
+      if (operation.reason !== 'approval' && operation.reason !== 'checkpoint') {
+        throw new TypeError('Memory Local resume reason is invalid.');
+      }
+      assertClosedKeys(
+        operation,
+        operation.reason === 'approval'
+          ? ['approvals', 'binding', 'checkpoint', 'operationId', 'reason', 'type']
+          : ['binding', 'checkpoint', 'operationId', 'reason', 'type'],
+      );
+      const binding = normalizeMemoryBinding(operation.binding, executorName, maxBindingBytes);
+      requireOperationString(operation, 'operationId');
+      ownedOperation = Object.freeze({
+        ...operation,
+        binding: binding as unknown as JsonValue,
+      });
+    } else if (operation.type === 'reconnect') {
+      assertClosedKeys(operation, ['binding', 'operationId', 'type']);
+      const binding = normalizeMemoryBinding(operation.binding, executorName, maxBindingBytes);
+      ownedOperation = Object.freeze({
+        type: 'reconnect',
+        operationId: requireOperationString(operation, 'operationId'),
+        binding: binding as unknown as JsonValue,
+      });
+    } else {
+      throw new TypeError('Memory Local execution operation type is invalid.');
+    }
+    const descriptors: Record<PropertyKey, PropertyDescriptor> =
+      Object.getOwnPropertyDescriptors(request);
+    descriptors.operation = {
+      configurable: false,
+      enumerable: true,
+      value: ownedOperation,
+      writable: false,
+    };
+    return Object.freeze(Object.defineProperties({}, descriptors)) as SubAgentExecutionRequest;
+  } catch (error) {
+    if (error instanceof SubAgentRuntimeError && error.code === 'BINDING_INVALID') throw error;
+    throw invalidBinding('The Memory Local Executor operation is invalid.');
   }
-  return Object.freeze({ kind: record.kind, handleId: record.handleId });
+}
+
+function normalizeMemoryBinding(
+  value: unknown,
+  executorName: string,
+  maxBindingBytes: number,
+): SubAgentExecutorBinding {
+  try {
+    const owned = cloneBindingJson(value, maxBindingBytes);
+    if (typeof owned !== 'object' || owned === null || Array.isArray(owned)) {
+      throw new TypeError('Memory Local Executor binding must be an object.');
+    }
+    const record = owned as Record<string, JsonValue>;
+    assertClosedKeys(record, [
+      'adapterStateVersion',
+      'definitionName',
+      'definitionVersion',
+      'executorName',
+      'ownerSessionId',
+      'recoveryData',
+      'runnerId',
+      'runnerVersion',
+      'subagentSessionId',
+      'taskId',
+      'version',
+    ]);
+    if (
+      record.version !== '1' ||
+      record.executorName !== executorName ||
+      record.adapterStateVersion !== '1'
+    ) {
+      throw new TypeError('Memory Local Executor binding identity is invalid.');
+    }
+    const ownerSessionId = requireBindingString(record, 'ownerSessionId');
+    const taskId = requireBindingString(record, 'taskId');
+    const subagentSessionId = requireBindingString(record, 'subagentSessionId');
+    const definitionName = requireBindingString(record, 'definitionName');
+    const definitionVersion = requireBindingString(record, 'definitionVersion');
+    const runnerId = requireBindingString(record, 'runnerId');
+    const runnerVersion = requireBindingString(record, 'runnerVersion');
+    const state = decodeBindingState(record.recoveryData);
+    const recoveryData: JsonValue = Object.freeze({
+      kind: state.kind,
+      handleId: state.handleId,
+    });
+    return Object.freeze({
+      version: '1',
+      executorName,
+      ownerSessionId,
+      taskId,
+      subagentSessionId,
+      definitionName,
+      definitionVersion,
+      runnerId,
+      runnerVersion,
+      adapterStateVersion: '1',
+      recoveryData,
+    });
+  } catch {
+    throw invalidBinding('The Memory Local Executor binding is invalid.');
+  }
+}
+
+function cloneBindingJson(value: unknown, maxBytes?: number): JsonValue {
+  assertJsonValue(value, {
+    label: 'Memory Local Executor binding',
+    ...(maxBytes === undefined ? {} : { maxBytes }),
+    maxDepth: MEMORY_EXECUTOR_MAX_BINDING_DEPTH,
+    maxNodes: MEMORY_EXECUTOR_MAX_BINDING_NODES,
+  });
+  return parseJsonValue(canonicalizeJson(value));
+}
+
+function assertClosedKeys(record: Record<string, JsonValue>, expected: readonly string[]): void {
+  if (Object.keys(record).sort().join(',') !== [...expected].sort().join(',')) {
+    throw new TypeError('Memory Local Executor value contains unknown or missing fields.');
+  }
+}
+
+function requireBindingString(record: Record<string, JsonValue>, key: string): string {
+  const value = record[key];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`Memory Local Executor binding ${key} is invalid.`);
+  }
+  return value;
+}
+
+function requireOperationString(record: Record<string, JsonValue>, key: string): string {
+  const value = record[key];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`Memory Local Executor operation ${key} is invalid.`);
+  }
+  return value;
 }
 
 function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -488,16 +690,22 @@ function sameBinding(left: SubAgentExecutorBinding, right: SubAgentExecutorBindi
 
 function runtimeError(
   code:
+    | 'BINDING_INVALID'
     | 'CANCELLED'
     | 'CHECKPOINT_VERSION_MISMATCH'
     | 'IDEMPOTENCY_CONFLICT'
     | 'INTERNAL_ERROR'
     | 'INVALID_STATE_TRANSITION'
     | 'RECOVERY_TARGET_LOST'
-    | 'RECOVERY_UNSUPPORTED',
+    | 'RECOVERY_UNSUPPORTED'
+    | 'RESOURCE_NOT_FOUND',
   message: string,
 ): SubAgentRuntimeError {
   return new SubAgentRuntimeError({ code, message, retryable: false });
+}
+
+function invalidBinding(message: string): SubAgentRuntimeError {
+  return runtimeError('BINDING_INVALID', message);
 }
 
 function stateFromOutcome(outcome: SubAgentExecutionOutcome | undefined): SubAgentTaskState {
