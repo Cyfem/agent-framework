@@ -1,6 +1,7 @@
 export * from './http-constants';
 export * from './http-route';
 export * from './http-poll';
+export * from './http-delivery-response';
 export * from './http-route-policy';
 export * from './http-semantic-receipt';
 export * from './http-job-store';

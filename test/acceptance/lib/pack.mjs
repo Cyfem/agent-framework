@@ -664,6 +664,9 @@ import {
   DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES,
   DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_WAITER_CAPACITY,
   HTTP_SUBAGENT_AUTH_VERSION,
+  HTTP_SUBAGENT_DELIVERY_RESPONSE_CACHE_CONTROL,
+  HTTP_SUBAGENT_DELIVERY_RESPONSE_MEDIA_TYPE,
+  HTTP_SUBAGENT_DELIVERY_RESPONSE_VERSION,
   HTTP_SUBAGENT_HMAC_SCHEME,
   HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION,
   HTTP_SUBAGENT_JOB_DELIVERY_VERSION,
@@ -684,17 +687,26 @@ import {
   createStaticHttpSubAgentHmacKeyResolver,
   createHttpSubAgentJobCreateIdentity,
   createHttpSubAgentPacketSemanticReceipt,
+  createHttpSubAgentPollRequestReceipt,
+  decodeHttpSubAgentDeliveryResponse,
   decodeHttpSubAgentMultipartPacket,
   decodeHttpSubAgentPollCommand,
   decodeHttpSubAgentRoutedPacket,
   encodeHttpSubAgentMultipartPacket,
   encodeHttpSubAgentPollCommand,
+  encodeHttpSubAgentDeliveryResponse,
   normalizeHttpSubAgentJobDeliveryState,
   normalizeHttpSubAgentJobRecord,
   parseHttpSubAgentRoute,
   type AdmitHttpSubAgentPacketOptions,
   type HttpSubAgentAuthContext,
   type HttpSubAgentHmacVerifier,
+  type HttpSubAgentDeliveryResponseEncodeInput,
+  type HttpSubAgentDeliveryResponseEncodeOptions,
+  type HttpSubAgentDeliveryResponseInput,
+  type HttpSubAgentDeliveryResponseLimits,
+  type HttpSubAgentDeliveryResponseV1,
+  type HttpSubAgentEncodedDeliveryResponse,
   type HttpSubAgentJobAuthorizationLookup,
   type HttpSubAgentJobAuthorizationResolution,
   type HttpSubAgentJobCreateIdentity,
@@ -721,6 +733,8 @@ import {
   type HttpSubAgentPacketSemanticReceiptInput,
   type HttpSubAgentPollCommand,
   type HttpSubAgentPollInput,
+  type HttpSubAgentPollRequestReceiptInput,
+  type HttpSubAgentPollRoute,
   type HttpSubAgentRawRequest,
   type HttpSubAgentReplayCache,
   type HttpSubAgentRoute,
@@ -744,17 +758,26 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<typeof createStaticHttpSubAgentHmacKeyResolver>>,
   AssertFalse<IsAny<typeof createHttpSubAgentJobCreateIdentity>>,
   AssertFalse<IsAny<typeof createHttpSubAgentPacketSemanticReceipt>>,
+  AssertFalse<IsAny<typeof createHttpSubAgentPollRequestReceipt>>,
+  AssertFalse<IsAny<typeof decodeHttpSubAgentDeliveryResponse>>,
   AssertFalse<IsAny<typeof decodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof decodeHttpSubAgentPollCommand>>,
   AssertFalse<IsAny<typeof decodeHttpSubAgentRoutedPacket>>,
   AssertFalse<IsAny<typeof encodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof encodeHttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<typeof encodeHttpSubAgentDeliveryResponse>>,
   AssertFalse<IsAny<typeof normalizeHttpSubAgentJobDeliveryState>>,
   AssertFalse<IsAny<typeof normalizeHttpSubAgentJobRecord>>,
   AssertFalse<IsAny<typeof parseHttpSubAgentRoute>>,
   AssertFalse<IsAny<AdmitHttpSubAgentPacketOptions>>,
   AssertFalse<IsAny<HttpSubAgentAuthContext>>,
   AssertFalse<IsAny<HttpSubAgentHmacVerifier>>,
+  AssertFalse<IsAny<HttpSubAgentDeliveryResponseEncodeInput>>,
+  AssertFalse<IsAny<HttpSubAgentDeliveryResponseEncodeOptions>>,
+  AssertFalse<IsAny<HttpSubAgentDeliveryResponseInput>>,
+  AssertFalse<IsAny<HttpSubAgentDeliveryResponseLimits>>,
+  AssertFalse<IsAny<HttpSubAgentDeliveryResponseV1>>,
+  AssertFalse<IsAny<HttpSubAgentEncodedDeliveryResponse>>,
   AssertFalse<IsAny<HttpSubAgentJobAuthorizationLookup>>,
   AssertFalse<IsAny<HttpSubAgentJobAuthorizationResolution>>,
   AssertFalse<IsAny<HttpSubAgentJobCreateIdentity>>,
@@ -781,6 +804,8 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<HttpSubAgentPacketSemanticReceiptInput>>,
   AssertFalse<IsAny<HttpSubAgentPollCommand>>,
   AssertFalse<IsAny<HttpSubAgentPollInput>>,
+  AssertFalse<IsAny<HttpSubAgentPollRequestReceiptInput>>,
+  AssertFalse<IsAny<HttpSubAgentPollRoute>>,
   AssertFalse<IsAny<HttpSubAgentRawRequest>>,
   AssertFalse<IsAny<HttpSubAgentReplayCache>>,
   AssertFalse<IsAny<HttpSubAgentRoute>>,
@@ -789,6 +814,9 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<MemoryHttpSubAgentJobStoreOptions>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_PACKET_VERSION, '1'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_AUTH_VERSION, '1'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_DELIVERY_RESPONSE_VERSION, '1'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_DELIVERY_RESPONSE_MEDIA_TYPE, 'application/vnd.maneeagent.delivery+json'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_DELIVERY_RESPONSE_CACHE_CONTROL, 'no-store'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_HMAC_SCHEME, 'MANEE-HMAC-SHA256-V1'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_PACKET_MEDIA_TYPE, 'application/vnd.maneeagent.packet+json'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_POLL_VERSION, '1'>>,
@@ -817,11 +845,14 @@ const publicValues = [
   createStaticHttpSubAgentHmacKeyResolver,
   createHttpSubAgentJobCreateIdentity,
   createHttpSubAgentPacketSemanticReceipt,
+  createHttpSubAgentPollRequestReceipt,
+  decodeHttpSubAgentDeliveryResponse,
   decodeHttpSubAgentMultipartPacket,
   decodeHttpSubAgentPollCommand,
   decodeHttpSubAgentRoutedPacket,
   encodeHttpSubAgentMultipartPacket,
   encodeHttpSubAgentPollCommand,
+  encodeHttpSubAgentDeliveryResponse,
   normalizeHttpSubAgentJobDeliveryState,
   normalizeHttpSubAgentJobRecord,
   parseHttpSubAgentRoute,
@@ -841,6 +872,16 @@ httpExecutorNamespace.httpSecurityFailpointForTest;
 httpExecutorNamespace.createHttpSubAgentRoutedPacketSemanticReceipt;
 // @ts-expect-error Sidecar descriptor sorting is package-internal.
 httpExecutorNamespace.sortedHttpSubAgentSidecarDescriptors;
+// @ts-expect-error Shared multipart resolved limits are package-internal.
+type InternalHttpMultipartLimits = httpExecutorNamespace.ResolvedHttpSubAgentMultipartLimits;
+// @ts-expect-error Shared multipart document plans are package-internal.
+type InternalHttpMultipartDocument = httpExecutorNamespace.HttpSubAgentMultipartDocument<unknown, unknown>;
+// @ts-expect-error Outbound packet ownership limits are package-internal.
+type InternalHttpOutboundPacketLimits = httpExecutorNamespace.HttpSubAgentOutboundPacketLimits;
+// @ts-expect-error Shared multipart document encoders are package-internal.
+httpExecutorNamespace.encodeHttpSubAgentMultipartDocument;
+// @ts-expect-error Outbound packet ownership helpers are package-internal.
+httpExecutorNamespace.ownHttpSubAgentOutboundPacket;
 `;
   }
   return `import * as packageApi from '${packageName}';
@@ -1107,17 +1148,26 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<typeof httpExecutor.createStaticHttpSubAgentHmacKeyResolver>>,
   AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentJobCreateIdentity>>,
   AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentPacketSemanticReceipt>>,
+  AssertFalse<IsAny<typeof httpExecutor.createHttpSubAgentPollRequestReceipt>>,
+  AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentDeliveryResponse>>,
   AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentPollCommand>>,
   AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentRoutedPacket>>,
   AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentDeliveryResponse>>,
   AssertFalse<IsAny<typeof httpExecutor.normalizeHttpSubAgentJobDeliveryState>>,
   AssertFalse<IsAny<typeof httpExecutor.normalizeHttpSubAgentJobRecord>>,
   AssertFalse<IsAny<typeof httpExecutor.parseHttpSubAgentRoute>>,
   AssertFalse<IsAny<httpExecutor.AdmitHttpSubAgentPacketOptions>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentAuthContext>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentHmacVerifier>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentDeliveryResponseEncodeInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentDeliveryResponseEncodeOptions>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentDeliveryResponseInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentDeliveryResponseLimits>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentDeliveryResponseV1>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentEncodedDeliveryResponse>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobAuthorizationLookup>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobAuthorizationResolution>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobCreateIdentity>>,
@@ -1144,6 +1194,8 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<httpExecutor.HttpSubAgentPacketSemanticReceiptInput>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentPollCommand>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentPollInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentPollRequestReceiptInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentPollRoute>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentRawRequest>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentReplayCache>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentRoute>>,
@@ -1152,6 +1204,9 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<httpExecutor.MemoryHttpSubAgentJobStoreOptions>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_PACKET_VERSION, '1'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_AUTH_VERSION, '1'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_DELIVERY_RESPONSE_VERSION, '1'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_DELIVERY_RESPONSE_MEDIA_TYPE, 'application/vnd.maneeagent.delivery+json'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_DELIVERY_RESPONSE_CACHE_CONTROL, 'no-store'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_HMAC_SCHEME, 'MANEE-HMAC-SHA256-V1'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_PACKET_MEDIA_TYPE, 'application/vnd.maneeagent.packet+json'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_POLL_VERSION, '1'>>,
@@ -1180,11 +1235,14 @@ const publicValues = [
   httpExecutor.createStaticHttpSubAgentHmacKeyResolver,
   httpExecutor.createHttpSubAgentJobCreateIdentity,
   httpExecutor.createHttpSubAgentPacketSemanticReceipt,
+  httpExecutor.createHttpSubAgentPollRequestReceipt,
+  httpExecutor.decodeHttpSubAgentDeliveryResponse,
   httpExecutor.decodeHttpSubAgentMultipartPacket,
   httpExecutor.decodeHttpSubAgentPollCommand,
   httpExecutor.decodeHttpSubAgentRoutedPacket,
   httpExecutor.encodeHttpSubAgentMultipartPacket,
   httpExecutor.encodeHttpSubAgentPollCommand,
+  httpExecutor.encodeHttpSubAgentDeliveryResponse,
   httpExecutor.normalizeHttpSubAgentJobDeliveryState,
   httpExecutor.normalizeHttpSubAgentJobRecord,
   httpExecutor.parseHttpSubAgentRoute,
@@ -1204,6 +1262,16 @@ httpExecutor.httpSecurityFailpointForTest;
 httpExecutor.createHttpSubAgentRoutedPacketSemanticReceipt;
 // @ts-expect-error Sidecar descriptor sorting is package-internal.
 httpExecutor.sortedHttpSubAgentSidecarDescriptors;
+// @ts-expect-error Shared multipart resolved limits are package-internal.
+type InternalHttpMultipartLimits = httpExecutor.ResolvedHttpSubAgentMultipartLimits;
+// @ts-expect-error Shared multipart document plans are package-internal.
+type InternalHttpMultipartDocument = httpExecutor.HttpSubAgentMultipartDocument<unknown, unknown>;
+// @ts-expect-error Outbound packet ownership limits are package-internal.
+type InternalHttpOutboundPacketLimits = httpExecutor.HttpSubAgentOutboundPacketLimits;
+// @ts-expect-error Shared multipart document encoders are package-internal.
+httpExecutor.encodeHttpSubAgentMultipartDocument;
+// @ts-expect-error Outbound packet ownership helpers are package-internal.
+httpExecutor.ownHttpSubAgentOutboundPacket;
 `;
   }
   return `import packageApi = require('${packageName}');
@@ -1376,11 +1444,14 @@ for (const name of [
       `[packageApi.createStaticHttpSubAgentHmacKeyResolver, 'createStaticHttpSubAgentHmacKeyResolver', 'function']`,
       `[packageApi.createHttpSubAgentJobCreateIdentity, 'createHttpSubAgentJobCreateIdentity', 'function']`,
       `[packageApi.createHttpSubAgentPacketSemanticReceipt, 'createHttpSubAgentPacketSemanticReceipt', 'function']`,
+      `[packageApi.createHttpSubAgentPollRequestReceipt, 'createHttpSubAgentPollRequestReceipt', 'function']`,
+      `[packageApi.decodeHttpSubAgentDeliveryResponse, 'decodeHttpSubAgentDeliveryResponse', 'function']`,
       `[packageApi.decodeHttpSubAgentMultipartPacket, 'decodeHttpSubAgentMultipartPacket', 'function']`,
       `[packageApi.decodeHttpSubAgentPollCommand, 'decodeHttpSubAgentPollCommand', 'function']`,
       `[packageApi.decodeHttpSubAgentRoutedPacket, 'decodeHttpSubAgentRoutedPacket', 'function']`,
       `[packageApi.encodeHttpSubAgentMultipartPacket, 'encodeHttpSubAgentMultipartPacket', 'function']`,
       `[packageApi.encodeHttpSubAgentPollCommand, 'encodeHttpSubAgentPollCommand', 'function']`,
+      `[packageApi.encodeHttpSubAgentDeliveryResponse, 'encodeHttpSubAgentDeliveryResponse', 'function']`,
       `[packageApi.normalizeHttpSubAgentJobDeliveryState, 'normalizeHttpSubAgentJobDeliveryState', 'function']`,
       `[packageApi.normalizeHttpSubAgentJobRecord, 'normalizeHttpSubAgentJobRecord', 'function']`,
       `[packageApi.parseHttpSubAgentRoute, 'parseHttpSubAgentRoute', 'function']`,
@@ -1400,6 +1471,9 @@ const expectedHttpRuntimeExports = ${JSON.stringify(
         'DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_WAITER_CAPACITY',
         'HTTP_SUBAGENT_AUTH_HEADER_NAMES',
         'HTTP_SUBAGENT_AUTH_VERSION',
+        'HTTP_SUBAGENT_DELIVERY_RESPONSE_CACHE_CONTROL',
+        'HTTP_SUBAGENT_DELIVERY_RESPONSE_MEDIA_TYPE',
+        'HTTP_SUBAGENT_DELIVERY_RESPONSE_VERSION',
         'HTTP_SUBAGENT_DEFAULT_CLOCK_SKEW_MS',
         'HTTP_SUBAGENT_HMAC_SCHEME',
         'HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION',
@@ -1425,11 +1499,14 @@ const expectedHttpRuntimeExports = ${JSON.stringify(
         'createStaticHttpSubAgentHmacKeyResolver',
         'createHttpSubAgentJobCreateIdentity',
         'createHttpSubAgentPacketSemanticReceipt',
+        'createHttpSubAgentPollRequestReceipt',
+        'decodeHttpSubAgentDeliveryResponse',
         'decodeHttpSubAgentMultipartPacket',
         'decodeHttpSubAgentPollCommand',
         'decodeHttpSubAgentRoutedPacket',
         'encodeHttpSubAgentMultipartPacket',
         'encodeHttpSubAgentPollCommand',
+        'encodeHttpSubAgentDeliveryResponse',
         'normalizeHttpSubAgentJobDeliveryState',
         'normalizeHttpSubAgentJobRecord',
         'parseHttpSubAgentRoute',
@@ -1441,6 +1518,9 @@ if (JSON.stringify(Object.keys(packageApi).sort()) !== JSON.stringify(expectedHt
 if (
   packageApi.HTTP_SUBAGENT_PACKET_VERSION !== '1' ||
   packageApi.HTTP_SUBAGENT_AUTH_VERSION !== '1' ||
+  packageApi.HTTP_SUBAGENT_DELIVERY_RESPONSE_VERSION !== '1' ||
+  packageApi.HTTP_SUBAGENT_DELIVERY_RESPONSE_MEDIA_TYPE !== 'application/vnd.maneeagent.delivery+json' ||
+  packageApi.HTTP_SUBAGENT_DELIVERY_RESPONSE_CACHE_CONTROL !== 'no-store' ||
   packageApi.HTTP_SUBAGENT_POLL_VERSION !== '1' ||
   packageApi.HTTP_SUBAGENT_JOB_DELIVERY_VERSION !== '1' ||
   packageApi.HTTP_SUBAGENT_JOB_RECORD_VERSION !== '1' ||

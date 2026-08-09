@@ -1,8 +1,8 @@
 # `@ruixutong.manee/maneeagent-executor-http`
 
-Manee Agent Framework 的 HTTP Subagent wire 基础包。当前 `2.0.0` checkout 提供严格的单包 `multipart/mixed` 编解码、HMAC-SHA256 v1 验签、原子 replay cache SPI、owner scope 授权顺序、脱敏 admission 结果，C7c-5b 的 closed poll command、route↔RPC policy 和 semantic packet receipt，C7c-5c 的 create/replay Job Store 地基，以及 C7c-5d-a 的 current-attachment delivery/ACK/wait Store 地基。
+Manee Agent Framework 的 HTTP Subagent wire 基础包。当前 `2.0.0` checkout 提供严格的单包 `multipart/mixed` 编解码、HMAC-SHA256 v1 验签、原子 replay cache SPI、owner scope 授权顺序、脱敏 admission 结果，C7c-5b 的 closed poll command、route↔RPC policy 和 semantic packet receipt，C7c-5c 的 create/replay Job Store 地基，C7c-5d-a 的 current-attachment delivery/ACK/wait Store 地基，以及 C7c-5d-b 的 closed poll delivery response codec。
 
-> **当前范围与发布状态**：该包尚未发布到 npm，也还不是可运行的 HTTP Executor。C7c-5d-a 只在 C7c-5c create/replay Store 上增加 Store IO context、当前初始 attachment 的 outbound delivery ledger、单包 offer/精确 ACK 和有界 wait；它不包含 production durable Store adapter、HTTP listener/client、heartbeat handler、delivery response codec、attachment/generation rotate、Peer pending/resequence import、approval resume、external reconnect 或 Remote `SubAgentExecutor`。这些能力仍属于后续 C7c-5；因此当前 Phase 2 仍未通过。`npm pack` 成功不等于已经发布。
+> **当前范围与发布状态**：该包尚未发布到 npm，也还不是可运行的 HTTP Executor。C7c-5d-a 只在 C7c-5c create/replay Store 上增加 Store IO context、当前初始 attachment 的 outbound delivery ledger、单包 offer/精确 ACK 和有界 wait；C7c-5d-b 只增加把一次已提交 poll 结果编码/解码为 closed `multipart/mixed` 200 response 的纯 wire codec。它们都不包含 production durable Store adapter、HTTP listener/client、heartbeat handler、attachment/generation rotate、Peer pending/resequence import、approval resume、external reconnect 或 Remote `SubAgentExecutor`。这些能力仍属于后续 C7c-5；因此当前 Phase 2 仍未通过。`npm pack` 成功不等于已经发布。
 
 要求 Node.js >= 22。包同时输出 ESM、CJS、TypeScript 声明和 source map，peer dependency 为 `@ruixutong.manee/maneeagent-framework@^2.0.0`。
 
@@ -28,6 +28,7 @@ npm install @ruixutong.manee/maneeagent-framework@^2.0.0 \
 - 从一次严格 owned `jobs.create` decode 生成排除 transport-relative `remainingMs` 的 create identity，并通过三条唯一索引原子 create/replay 初始 job record。
 - 提供 full-scope load、只返回 owner 的 pre-authorization lookup，以及同时受 job 数和 protocol-retained bytes 限制的 loopback-test Memory Store。
 - 在同一初始 Core Peer channel/generation 内原子 enqueue target outbound packet，以独立 remote cursor 做单包 offer、精确 cumulative ACK、response-loss replay 和有界 change wait。
+- 将 `jobs.poll` command 与 Store poll result 编码为始终 `200`、`Cache-Control: no-store` 的 closed multipart response，并在 decode 时重算 request/packet receipt、重验 channel/generation/cursor 与完整 sidecar。
 
 当前包不打开端口、不访问网络、不读取环境变量或 API key，也不会发起真实模型请求。
 
@@ -132,7 +133,17 @@ target outbound packet 先经过 strict Core RPC canonical decode/re-encode 和 
 
 Memory delivery 默认上限分别为 10,000 个未 ACK packet、256 MiB delivery protocol-retained bytes、100,000 条 compact delivery receipt 与 1,000 个 waiter。四个上限独立计数；满时精确 replay、load、已有 offer/ACK 仍优先，新副作用固定 `capacity_exhausted`，不会 LRU/TTL/逐 job 删除。ACK 只释放未确认 packet count/bytes，不删除 compact replay evidence；所有计数通过 `diagnostics` 观察。
 
-本批仍没有 production durable Store adapter、delivery response envelope/codec、HTTP listener/client、heartbeat、attachment/generation rotate、Peer pending/resequence import、approval/resume 或 external reconnect。完整 HTTP job lifecycle 与带 authoritative checkpoint/terminal/provider proof 的 attachment recovery 留给后续 C7c-5；当前 delivery Store 只证明单进程 loopback ledger 语义。
+5d-a 仍没有 production durable Store adapter、delivery response envelope/codec、HTTP listener/client、heartbeat、attachment/generation rotate、Peer pending/resequence import、approval/resume 或 external reconnect。完整 HTTP job lifecycle 与带 authoritative checkpoint/terminal/provider proof 的 attachment recovery 留给后续 C7c-5；当前 delivery Store 只证明单进程 loopback ledger 语义。
+
+## C7c-5d-b closed poll delivery response wire
+
+`encodeHttpSubAgentDeliveryResponse()` 与 `decodeHttpSubAgentDeliveryResponse()` 只处理 `jobs.poll` 的 response wire，不读取 Store、不调用 Peer，也不打开网络。empty 与 nonempty response 都固定为 `status=200`、`Cache-Control: no-store` 和精确 `multipart/mixed; boundary=<token>`；第一 part 的唯一 header 为 `Content-Type: application/vnd.maneeagent.delivery+json`。closed JSON 固定包含 `version/requestReceipt/revision/channelId/channelGeneration/ackCursor/delivery`，其中 `delivery` 为 `null`，或 `{ cursor, packetReceipt, packet: { version, frame, sidecars } }`；nonempty 时 raw binary parts 按 descriptor 顺序紧随，empty 时直接 closing boundary。
+
+`createHttpSubAgentPollRequestReceipt()` 对 strict canonical `jobs.poll` route 与完整 closed poll command 计算 JCS SHA-256。receipt 绑定 `jobId`、channel、generation、ACK cursor 和 `waitMs`，但排除 HMAC nonce/timestamp/signature、raw JSON 格式与 request target 文本；它只用于已验证 TLS endpoint 上的 semantic response correlation，不是 response MAC，也不能替代真实 TLS server identity/redirect policy。codec 不接受调用方自报的 expected hash，而是从 expected route/command 内部重算。
+
+response encode/decode 会把 response channel/generation/ACK 与 expected command 精确比对；本批 generation 固定为初始 `0`。nonempty delivery cursor 必须恰为 `ackCursor + 1`，但绝不与 Peer sequence 比较。inner packet 继续使用 5d-a 的 target→controller allowlist、strict Core canonical frame、完整 transport-identity packet receipt和 sidecar length/digest ownership；`packetReceipt` 必须由 codec 重算，不能信任 wire 字段。只有完整 multipart、所有 binary part 与关联字段都通过后才返回 frozen metadata 与 fresh-owned bytes。
+
+该 codec 没有 response HMAC、HTTP status mapper、listener/client、Store mutation、`Peer.receive()`、long-poll 调度或 attachment recovery。真实 endpoint 仍须从已验证 socket/TLS 状态建立 response authenticity，并在完整 decode 后把 packet 交给同一 resident Peer；request HMAC 只认证请求，不能被描述为认证了响应。
 
 固定 hard cap：
 
@@ -218,17 +229,18 @@ pnpm acceptance:subagent:v2:http-security:offline
 pnpm validate:subagent:v2:pack:http
 ```
 
-其中 Vitest/acceptance 测试加载 network-deny guard；整组离线命令均不读取 API key、不访问真实 HTTP endpoint 或模型，也不产生费用。当前 acceptance 只证明 multipart/HMAC/replay/authz/admission、poll/route/receipt wire、create/replay Store，以及 current-attachment delivery/ACK/wait 的 L1/L2 基础；没有证明真实 listener、production durable Store、delivery response wire、attachment recovery、完整 job 生命周期、external reconnect、L5 方舟或 L6 Docker/Linux，因此 `C7-HTTP`、`C7-AUTH` 和 Phase 2 requirement 仍保持 `planned`。
+其中 Vitest/acceptance 测试加载 network-deny guard；整组离线命令均不读取 API key、不访问真实 HTTP endpoint 或模型，也不产生费用。当前 acceptance 只证明 multipart/HMAC/replay/authz/admission、poll/route/receipt wire、create/replay Store、current-attachment delivery/ACK/wait，以及 closed poll delivery response codec 的 L1/L2 基础；没有证明真实 listener、production durable Store、response authentication/网络交付、attachment recovery、完整 job 生命周期、external reconnect、L5 方舟或 L6 Docker/Linux，因此 `C7-HTTP`、`C7-AUTH` 和 Phase 2 requirement 仍保持 `planned`。
 
 ## 公共 API
 
 - route/常量：`parseHttpSubAgentRoute()`、`HTTP_SUBAGENT_*`
 - multipart：`encodeHttpSubAgentMultipartPacket()`、`decodeHttpSubAgentMultipartPacket()` 与相关 types/limits
 - poll：`encodeHttpSubAgentPollCommand()`、`decodeHttpSubAgentPollCommand()` 与相关 types/constants
+- poll delivery response：`createHttpSubAgentPollRequestReceipt()`、`encodeHttpSubAgentDeliveryResponse()`、`decodeHttpSubAgentDeliveryResponse()` 与相关 types/constants
 - route/receipt：`decodeHttpSubAgentRoutedPacket()`、`createHttpSubAgentPacketSemanticReceipt()` 与相关 types
 - job Store：`createHttpSubAgentJobCreateIdentity()`、`normalizeHttpSubAgentJobRecord()`、`normalizeHttpSubAgentJobDeliveryState()`、`HttpSubAgentJobStore`、`HttpSubAgentJobDeliveryStore`、`MemoryHttpSubAgentJobStore`、`HttpSubAgentJobStoreError` 与 create/delivery/IO context 相关 constants/types
 - HMAC：`createHttpSubAgentHmacHeaders()`、`createHttpSubAgentHmacVerifier()`、`createStaticHttpSubAgentHmacKeyResolver()`、`HttpSubAgentSecurityError` 与 auth/replay contracts
 - replay：`HttpSubAgentReplayCache`、`MemoryHttpSubAgentReplayCache`
 - admission：`admitHttpSubAgentPacket()` 与 owner resolver、authorization、diagnostic/result contracts
 
-内部 owned-body decoder、multipart config normalizer、MIME scanner、header parser、canonical string builder 和测试 failpoint 不属于包根公共 API。
+内部 owned-body decoder、multipart config normalizer/document serializer、outbound packet ownership/receipt helper、MIME scanner、header parser、canonical string builder 和测试 failpoint 不属于包根公共 API。

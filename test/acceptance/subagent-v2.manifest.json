@@ -2314,6 +2314,50 @@
           }
         },
         {
+          "caseId": "C7C-HTTP-DELIVERY01.l1.closed-response-envelope",
+          "variant": "empty-nonempty-owned-frozen-roundtrip",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-delivery-wire.test.ts",
+            "testName": "[acceptance:C7C-HTTP-DELIVERY01.l1.closed-response-envelope][variant:empty-nonempty-owned-frozen-roundtrip]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-DELIVERY02.l2.multipart-sidecar-integrity",
+          "variant": "exact-headers-order-digest-and-bounds",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-delivery-wire.test.ts",
+            "testName": "[acceptance:C7C-HTTP-DELIVERY02.l2.multipart-sidecar-integrity][variant:exact-headers-order-digest-and-bounds]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-DELIVERY03.l1.semantic-response-correlation",
+          "variant": "job-channel-generation-ack-cursor-receipt",
+          "phase": "phase-2",
+          "layer": "L1",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-delivery-wire.test.ts",
+            "testName": "[acceptance:C7C-HTTP-DELIVERY03.l1.semantic-response-correlation][variant:job-channel-generation-ack-cursor-receipt]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-DELIVERY04.l2.hostile-codec-input",
+          "variant": "proxy-accessor-prototype-cross-realm-zero-trap",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-delivery-wire.test.ts",
+            "testName": "[acceptance:C7C-HTTP-DELIVERY04.l2.hostile-codec-input][variant:proxy-accessor-prototype-cross-realm-zero-trap]"
+          }
+        },
+        {
           "caseId": "C7C-HTTP-STORE01.l1.atomic-create-replay",
           "variant": "first-write-deadline-ceiling-conflict",
           "phase": "phase-2",

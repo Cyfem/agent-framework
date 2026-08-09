@@ -85,7 +85,8 @@ export interface HttpSubAgentMultipartInput {
   readonly body: HttpBytes;
 }
 
-interface ResolvedMultipartLimits {
+/** @internal Fully owned limits shared by the package-internal multipart codecs. */
+export interface ResolvedHttpSubAgentMultipartLimits {
   readonly maxBodyBytes: number;
   readonly maxHeaderBytes: number;
   readonly maxPacketJsonBytes: number;
@@ -97,11 +98,55 @@ interface ResolvedMultipartLimits {
   readonly maxJsonNodes: number;
 }
 
+/** @internal One already-owned binary part in a closed JSON + sidecar document. */
+export interface HttpSubAgentMultipartDocumentPart {
+  readonly contentId: string;
+  readonly data: Uint8Array;
+}
+
+/** @internal One ordered binary-part declaration produced by the closed JSON decoder. */
+export interface HttpSubAgentMultipartDocumentPartPlan<TContext> {
+  readonly contentId: string;
+  readonly byteLength: number;
+  readonly context: TContext;
+}
+
+/** @internal The closed JSON value and its exact ordered binary-part declarations. */
+export interface HttpSubAgentMultipartDocumentPlan<TValue, TPartContext> {
+  readonly value: TValue;
+  readonly parts: readonly HttpSubAgentMultipartDocumentPartPlan<TPartContext>[];
+}
+
+/** @internal Result of decoding a complete closed JSON + sidecar document. */
+export interface HttpSubAgentMultipartDocument<TValue, TPart> {
+  readonly value: TValue;
+  readonly parts: readonly TPart[];
+}
+
+/** @internal Shared encoder input for a complete closed JSON + sidecar document. */
+export interface HttpSubAgentMultipartDocumentEncodeInput {
+  readonly boundary?: string;
+  readonly firstPartMediaType: string;
+  readonly firstPartJson: string;
+  readonly firstPartLabel: string;
+  readonly parts: readonly HttpSubAgentMultipartDocumentPart[];
+}
+
+/** @internal Shared decoder callbacks for a complete closed JSON + sidecar document. */
+export interface HttpSubAgentMultipartDocumentDecodeOptions<TValue, TPartContext, TPart> {
+  readonly firstPartMediaType: string;
+  readonly firstPartLabel: string;
+  readonly decodeFirstPart: (
+    json: string,
+  ) => HttpSubAgentMultipartDocumentPlan<TValue, TPartContext>;
+  readonly decodePart: (context: TPartContext, bytes: Uint8Array, index: number) => TPart;
+}
+
 /** @internal Validates and owns multipart limits before any request side effect. */
 export function normalizeHttpSubAgentMultipartLimits(
   options: HttpSubAgentMultipartLimits = {},
 ): HttpSubAgentMultipartLimits {
-  return resolveMultipartLimits(options);
+  return resolveHttpSubAgentMultipartLimits(options);
 }
 
 /** Encodes one complete Peer packet into a signed-body-ready multipart/mixed byte sequence. */
@@ -109,7 +154,7 @@ export function encodeHttpSubAgentMultipartPacket(
   packet: SubAgentTransportPeerPacket,
   options: HttpSubAgentMultipartEncodeOptions = {},
 ): HttpSubAgentEncodedMultipartPacket {
-  const limits = resolveMultipartLimits(options, true);
+  const limits = resolveHttpSubAgentMultipartLimits(options, true);
   const record = requireClosedDataRecord(packet, PEER_PACKET_KEYS, 'HTTP Peer packet');
   const frame = ownFrame(record.frame, limits);
   const sidecarValues = requireDenseDataArray(record.sidecars, 'HTTP Peer packet sidecars');
@@ -143,8 +188,7 @@ export function encodeHttpSubAgentMultipartPacket(
     sidecars.push(decoded);
   }
 
-  const boundary = options.boundary ?? `manee-${randomBytes(24).toString('base64url')}`;
-  assertBoundary(boundary);
+  const boundary = resolveHttpSubAgentMultipartBoundary(options.boundary);
   const descriptorRecords: SubAgentTransportArtifactSidecarDescriptor[] = [];
   for (const sidecar of sidecars) descriptorRecords.push(sidecar.descriptor);
   const packetJson = JSON.stringify({
@@ -163,7 +207,37 @@ export function encodeHttpSubAgentMultipartPacket(
     label: 'HTTP multipart packet JSON',
   });
 
-  const firstHeaders = ascii(`Content-Type: ${HTTP_SUBAGENT_PACKET_MEDIA_TYPE}`);
+  return encodeHttpSubAgentMultipartDocument(
+    {
+      boundary,
+      firstPartMediaType: HTTP_SUBAGENT_PACKET_MEDIA_TYPE,
+      firstPartJson: packetJson,
+      firstPartLabel: 'HTTP multipart packet JSON',
+      parts: sidecars.map((sidecar) => ({
+        contentId: sidecar.descriptor.sidecarId,
+        data: sidecar.data,
+      })),
+    },
+    limits,
+  );
+}
+
+/**
+ * @internal Encodes an exact closed JSON + ordered binary-sidecar multipart document.
+ * The calling codec must first own and validate the media type, JSON, content IDs, part bytes,
+ * and resolved limits; this shared serializer deliberately does not expose a second schema layer.
+ */
+export function encodeHttpSubAgentMultipartDocument(
+  input: HttpSubAgentMultipartDocumentEncodeInput,
+  limits: ResolvedHttpSubAgentMultipartLimits,
+): HttpSubAgentEncodedMultipartPacket {
+  const boundary = resolveHttpSubAgentMultipartBoundary(input.boundary);
+  const jsonBytes = UTF8_ENCODER.encode(input.firstPartJson);
+  if (jsonBytes.byteLength > limits.maxPacketJsonBytes) {
+    throw new RangeError(`${input.firstPartLabel} exceeds the configured byte limit.`);
+  }
+
+  const firstHeaders = ascii(`Content-Type: ${input.firstPartMediaType}`);
   assertHeaderBytes(firstHeaders, limits.maxHeaderBytes);
   const chunks: Uint8Array[] = [
     ascii(`--${boundary}\r\n`),
@@ -171,16 +245,19 @@ export function encodeHttpSubAgentMultipartPacket(
     ascii('\r\n\r\n'),
     jsonBytes,
   ];
-  for (const sidecar of sidecars) {
-    const sidecarHeaders = ascii(
-      `Content-Type: application/octet-stream\r\nContent-ID: ${sidecar.descriptor.sidecarId}`,
+  for (const part of input.parts) {
+    const partHeaders = ascii(
+      `Content-Type: application/octet-stream\r\nContent-ID: ${part.contentId}`,
     );
-    assertHeaderBytes(sidecarHeaders, limits.maxHeaderBytes);
-    chunks.push(ascii(`\r\n--${boundary}\r\n`), sidecarHeaders, ascii('\r\n\r\n'), sidecar.data);
+    assertHeaderBytes(partHeaders, limits.maxHeaderBytes);
+    chunks.push(ascii(`\r\n--${boundary}\r\n`), partHeaders, ascii('\r\n\r\n'), part.data);
   }
   chunks.push(ascii(`\r\n--${boundary}--\r\n`));
   const body = concatHttpBytes(chunks, limits.maxBodyBytes);
-  return Object.freeze({ contentType: `multipart/mixed; boundary=${boundary}`, body });
+  return Object.freeze({
+    contentType: `multipart/mixed; boundary=${boundary}`,
+    body,
+  });
 }
 
 /**
@@ -191,7 +268,7 @@ export function decodeHttpSubAgentMultipartPacket(
   input: HttpSubAgentMultipartInput,
   options: HttpSubAgentMultipartLimits = {},
 ): SubAgentTransportPeerPacket {
-  const limits = resolveMultipartLimits(options);
+  const limits = resolveHttpSubAgentMultipartLimits(options);
   const record = requireClosedDataRecord(input, ['contentType', 'body'], 'HTTP multipart input');
   if (typeof record.contentType !== 'string') {
     throw new TypeError('HTTP multipart contentType must be a string.');
@@ -205,7 +282,7 @@ export function decodeOwnedHttpSubAgentMultipartPacket(
   input: HttpSubAgentMultipartInput,
   options: HttpSubAgentMultipartLimits = {},
 ): SubAgentTransportPeerPacket {
-  const limits = resolveMultipartLimits(options);
+  const limits = resolveHttpSubAgentMultipartLimits(options);
   const record = requireClosedDataRecord(
     input,
     ['contentType', 'body'],
@@ -228,8 +305,94 @@ export function decodeOwnedHttpSubAgentMultipartPacket(
 function decodeOwnedMultipartBody(
   contentType: string,
   body: Uint8Array,
-  limits: ResolvedMultipartLimits,
+  limits: ResolvedHttpSubAgentMultipartLimits,
 ): SubAgentTransportPeerPacket {
+  const document = decodeOwnedHttpSubAgentMultipartDocument(contentType, body, limits, {
+    firstPartMediaType: HTTP_SUBAGENT_PACKET_MEDIA_TYPE,
+    firstPartLabel: 'HTTP multipart packet JSON',
+    decodeFirstPart: (packetJson) => {
+      const packetValue = parseJsonValue(packetJson, {
+        maxBytes: limits.maxPacketJsonBytes,
+        maxDepth: limits.maxJsonDepth,
+        maxNodes: limits.maxJsonNodes,
+        label: 'HTTP multipart packet JSON',
+      });
+      const packet = requireClosedDataRecord(
+        packetValue,
+        PACKET_KEYS,
+        'HTTP multipart packet JSON',
+      );
+      if (packet.version !== HTTP_SUBAGENT_PACKET_VERSION || typeof packet.frame !== 'string') {
+        throw new TypeError('HTTP multipart packet version or frame is invalid.');
+      }
+      const frameBytes = UTF8_ENCODER.encode(packet.frame);
+      if (frameBytes.byteLength > limits.maxFrameBytes) {
+        throw new RangeError('HTTP multipart frame exceeds the configured byte limit.');
+      }
+      decodeSubAgentTransportRpcFrame(packet.frame, {
+        maxFrameBytes: limits.maxFrameBytes,
+        maxJsonDepth: limits.maxJsonDepth,
+        maxJsonNodes: limits.maxJsonNodes,
+      });
+
+      const descriptorValues = requireDenseDataArray(
+        packet.sidecars,
+        'HTTP multipart sidecar descriptors',
+      );
+      if (descriptorValues.length > limits.maxSidecars) {
+        throw new RangeError('HTTP multipart exceeds the configured sidecar count.');
+      }
+      const descriptors: SubAgentTransportArtifactSidecarDescriptor[] = [];
+      const ids = new Set<string>();
+      let aggregateBytes = 0;
+      for (const value of descriptorValues) {
+        assertSubAgentTransportArtifactSidecarDescriptor(value, {
+          maxBytes: limits.maxSidecarItemBytes,
+        });
+        if (ids.has(value.sidecarId)) {
+          throw new TypeError('HTTP multipart contains duplicate sidecar IDs.');
+        }
+        ids.add(value.sidecarId);
+        aggregateBytes = addBounded(
+          aggregateBytes,
+          value.byteLength,
+          limits.maxSidecarBytes,
+          'HTTP multipart exceeds the configured aggregate sidecar bytes.',
+        );
+        descriptors.push(value);
+      }
+
+      return {
+        value: packet.frame,
+        parts: descriptors.map((descriptor) => ({
+          contentId: descriptor.sidecarId,
+          byteLength: descriptor.byteLength,
+          context: descriptor,
+        })),
+      };
+    },
+    decodePart: (descriptor, bytes) =>
+      decodeSubAgentTransportArtifactSidecar(descriptor, bytes, {
+        maxBytes: limits.maxSidecarItemBytes,
+      }),
+  });
+
+  return Object.freeze({ frame: document.value, sidecars: document.parts });
+}
+
+/**
+ * @internal Decodes one exact closed JSON + ordered binary-sidecar multipart document.
+ * Binary payloads are consumed by lengths returned from the validated first-part callback.
+ * The calling codec must supply an owned, bounded, non-Proxy body and synchronous internal
+ * callbacks. Its plan must already enforce count, content-ID, safe length, and aggregate limits;
+ * decodePart must return an owned value and neither callback may perform external side effects.
+ */
+export function decodeOwnedHttpSubAgentMultipartDocument<TValue, TPartContext, TPart>(
+  contentType: string,
+  body: Uint8Array,
+  limits: ResolvedHttpSubAgentMultipartLimits,
+  options: HttpSubAgentMultipartDocumentDecodeOptions<TValue, TPartContext, TPart>,
+): HttpSubAgentMultipartDocument<TValue, TPart> {
   const boundaryMatch = CONTENT_TYPE_PATTERN.exec(contentType);
   if (boundaryMatch === null) {
     throw new TypeError('HTTP multipart Content-Type is not the exact v1 media type.');
@@ -240,80 +403,34 @@ function decodeOwnedMultipartBody(
 
   cursor.expectOpeningBoundary();
   const firstHeaders = cursor.readHeaders();
-  assertExactHeaders(firstHeaders, [['Content-Type', HTTP_SUBAGENT_PACKET_MEDIA_TYPE]]);
-  const packetJsonBytes = cursor.readUntilBoundary(limits.maxPacketJsonBytes);
-  const packetJson = decodeUtf8(packetJsonBytes, 'HTTP multipart packet JSON');
-  const packetValue = parseJsonValue(packetJson, {
-    maxBytes: limits.maxPacketJsonBytes,
-    maxDepth: limits.maxJsonDepth,
-    maxNodes: limits.maxJsonNodes,
-    label: 'HTTP multipart packet JSON',
-  });
-  const packet = requireClosedDataRecord(packetValue, PACKET_KEYS, 'HTTP multipart packet JSON');
-  if (packet.version !== HTTP_SUBAGENT_PACKET_VERSION || typeof packet.frame !== 'string') {
-    throw new TypeError('HTTP multipart packet version or frame is invalid.');
-  }
-  const frameBytes = UTF8_ENCODER.encode(packet.frame);
-  if (frameBytes.byteLength > limits.maxFrameBytes) {
-    throw new RangeError('HTTP multipart frame exceeds the configured byte limit.');
-  }
-  decodeSubAgentTransportRpcFrame(packet.frame, {
-    maxFrameBytes: limits.maxFrameBytes,
-    maxJsonDepth: limits.maxJsonDepth,
-    maxJsonNodes: limits.maxJsonNodes,
-  });
-
-  const descriptorValues = requireDenseDataArray(
-    packet.sidecars,
-    'HTTP multipart sidecar descriptors',
+  assertExactHeaders(firstHeaders, [['Content-Type', options.firstPartMediaType]]);
+  const firstPartBytes = cursor.readUntilBoundary(
+    limits.maxPacketJsonBytes,
+    options.firstPartLabel,
   );
-  if (descriptorValues.length > limits.maxSidecars) {
-    throw new RangeError('HTTP multipart exceeds the configured sidecar count.');
-  }
-  const descriptors: SubAgentTransportArtifactSidecarDescriptor[] = [];
-  const ids = new Set<string>();
-  let aggregateBytes = 0;
-  for (const value of descriptorValues) {
-    assertSubAgentTransportArtifactSidecarDescriptor(value, {
-      maxBytes: limits.maxSidecarItemBytes,
-    });
-    if (ids.has(value.sidecarId)) {
-      throw new TypeError('HTTP multipart contains duplicate sidecar IDs.');
-    }
-    ids.add(value.sidecarId);
-    aggregateBytes = addBounded(
-      aggregateBytes,
-      value.byteLength,
-      limits.maxSidecarBytes,
-      'HTTP multipart exceeds the configured aggregate sidecar bytes.',
-    );
-    descriptors.push(value);
-  }
+  const firstPartJson = decodeUtf8(firstPartBytes, options.firstPartLabel);
+  const plan = options.decodeFirstPart(firstPartJson);
 
-  const sidecars: SubAgentTransportArtifactSidecar[] = [];
-  for (let index = 0; index < descriptors.length; index += 1) {
-    const descriptor = descriptors[index] as SubAgentTransportArtifactSidecarDescriptor;
+  const parts: TPart[] = [];
+  for (let index = 0; index < plan.parts.length; index += 1) {
+    const part = plan.parts[index] as HttpSubAgentMultipartDocumentPartPlan<TPartContext>;
     cursor.expectNextPart();
     const headers = cursor.readHeaders();
     assertExactHeaders(headers, [
       ['Content-Type', 'application/octet-stream'],
-      ['Content-ID', descriptor.sidecarId],
+      ['Content-ID', part.contentId],
     ]);
-    const bytes = cursor.readBytes(descriptor.byteLength);
-    sidecars.push(
-      decodeSubAgentTransportArtifactSidecar(descriptor, bytes, {
-        maxBytes: limits.maxSidecarItemBytes,
-      }),
-    );
-    cursor.expectBoundaryAfterBinary(index === descriptors.length - 1);
+    const bytes = cursor.readBytes(part.byteLength);
+    parts.push(options.decodePart(part.context, bytes, index));
+    cursor.expectBoundaryAfterBinary(index === plan.parts.length - 1);
   }
-  if (descriptors.length === 0) cursor.expectClosingBoundary();
+  if (plan.parts.length === 0) cursor.expectClosingBoundary();
   cursor.expectEnd();
 
-  return Object.freeze({ frame: packet.frame, sidecars: Object.freeze(sidecars) });
+  return Object.freeze({ value: plan.value, parts: Object.freeze(parts) });
 }
 
-function ownFrame(value: unknown, limits: ResolvedMultipartLimits): string {
+function ownFrame(value: unknown, limits: ResolvedHttpSubAgentMultipartLimits): string {
   let frame: string;
   if (typeof value === 'string') {
     frame = value;
@@ -332,10 +449,11 @@ function ownFrame(value: unknown, limits: ResolvedMultipartLimits): string {
   return frame;
 }
 
-function resolveMultipartLimits(
+/** @internal Resolves the shared multipart limits without widening package-root exports. */
+export function resolveHttpSubAgentMultipartLimits(
   options: HttpSubAgentMultipartLimits,
   allowBoundary = false,
-): ResolvedMultipartLimits {
+): ResolvedHttpSubAgentMultipartLimits {
   requireAllowedDataRecord(
     options,
     allowBoundary ? ENCODE_OPTION_KEYS : LIMIT_KEYS,
@@ -424,6 +542,16 @@ function resolveMultipartLimits(
     maxJsonDepth,
     maxJsonNodes,
   });
+}
+
+/** @internal Generates or validates the one canonical boundary form shared by HTTP codecs. */
+export function resolveHttpSubAgentMultipartBoundary(value?: string): string {
+  if (value !== undefined && typeof value !== 'string') {
+    throw new TypeError('HTTP multipart boundary must be a string.');
+  }
+  const boundary = value ?? `manee-${randomBytes(24).toString('base64url')}`;
+  assertBoundary(boundary);
+  return boundary;
 }
 
 function assertBoundary(value: string): void {
@@ -529,11 +657,11 @@ class MultipartCursor {
     );
   }
 
-  readUntilBoundary(maxBytes: number): Uint8Array {
+  readUntilBoundary(maxBytes: number, label: string): Uint8Array {
     const end = indexOfBytes(this.#body, this.#nextBoundary, this.#offset, maxBytes + 1);
-    if (end < 0) throw new TypeError('HTTP multipart packet JSON is not terminated.');
+    if (end < 0) throw new TypeError(`${label} is not terminated.`);
     if (end - this.#offset > maxBytes) {
-      throw new RangeError('HTTP multipart packet JSON exceeds the configured byte limit.');
+      throw new RangeError(`${label} exceeds the configured byte limit.`);
     }
     const result = this.#body.subarray(this.#offset, end);
     this.#offset = end + 2 + this.#boundary.byteLength;

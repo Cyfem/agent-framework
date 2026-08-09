@@ -401,6 +401,30 @@ describe('HTTP single-packet multipart boundary', () => {
     for (const boundary of ['', '-leading', 'contains space', 'contains\rcontrol', '边界']) {
       expect(() => encodeHttpSubAgentMultipartPacket(createPacket(), { boundary })).toThrow();
     }
+    expect(() =>
+      Reflect.apply(encodeHttpSubAgentMultipartPacket, undefined, [
+        createPacket(),
+        { boundary: 123 },
+      ]),
+    ).toThrow(TypeError);
+    let boundaryTrapReads = 0;
+    const hostileBoundary = new Proxy(Object.create(null), {
+      get() {
+        boundaryTrapReads += 1;
+        throw new Error('boundary coercion trap');
+      },
+      getPrototypeOf() {
+        boundaryTrapReads += 1;
+        throw new Error('boundary prototype trap');
+      },
+    });
+    expect(() =>
+      Reflect.apply(encodeHttpSubAgentMultipartPacket, undefined, [
+        createPacket(),
+        { boundary: hostileBoundary },
+      ]),
+    ).toThrow(TypeError);
+    expect(boundaryTrapReads).toBe(0);
 
     const firstHeaderBytes = bytes(
       'Content-Type: application/vnd.maneeagent.packet+json',

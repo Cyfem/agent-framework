@@ -2,27 +2,22 @@ import { types as nodeTypes } from 'node:util';
 
 import {
   DEFAULT_SUBAGENT_TRANSPORT_MAX_FRAME_BYTES,
-  DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_BYTES,
   DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_ITEM_BYTES,
-  DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECARS,
   canonicalJsonSha256,
   canonicalizeJson,
-  decodeSubAgentTransportArtifactSidecar,
-  decodeSubAgentTransportRpcFrame,
-  encodeSubAgentTransportRpcFrame,
   type JsonValue,
   type SubAgentTransportArtifactSidecar,
-  type SubAgentTransportArtifactSidecarDescriptor,
   type SubAgentTransportPeerPacket,
   type SubAgentTransportRpcEnvelope,
 } from '@ruixutong.manee/maneeagent-framework';
 
+import { copyHttpBytes, requireAllowedDataRecord, requireClosedDataRecord } from './http-internal';
 import {
-  copyHttpBytes,
-  requireAllowedDataRecord,
-  requireClosedDataRecord,
-  requireDenseDataArray,
-} from './http-internal';
+  HttpSubAgentOutboundPacketChannelMismatchError,
+  httpSubAgentPacketRetainedBytes,
+  ownHttpSubAgentOutboundPacket,
+  type OwnedHttpSubAgentOutboundPacket,
+} from './http-outbound-packet';
 import { HTTP_SUBAGENT_MAX_POLL_WAIT_MS } from './http-poll';
 import { decodeHttpSubAgentRoutedPacket, type HttpSubAgentRoutedPacket } from './http-route-policy';
 import type { HttpSubAgentRoute } from './http-route';
@@ -93,8 +88,6 @@ const DELIVERY_STATE_KEYS = Object.freeze([
   'outstandingDeliveries',
   'updatedAt',
 ] as const);
-const PEER_PACKET_KEYS = Object.freeze(['frame', 'sidecars'] as const);
-const SIDECAR_KEYS = Object.freeze(['descriptor', 'data'] as const);
 const JOB_RECORD_KEYS = Object.freeze([
   'recordVersion',
   'state',
@@ -655,7 +648,7 @@ export class MemoryHttpSubAgentJobStore implements HttpSubAgentJobDeliveryStore 
     ) {
       throw new HttpSubAgentJobStoreError('idempotency_conflict');
     }
-    const retainedBytes = packetRetainedBytes(normalized.identity.packet);
+    const retainedBytes = httpSubAgentPacketRetainedBytes(normalized.identity.packet);
     if (
       this.#jobsByCreateKey.size >= this.#capacity ||
       retainedBytes > this.#maxRetainedBytes - this.#retainedBytes
@@ -756,7 +749,15 @@ export class MemoryHttpSubAgentJobStore implements HttpSubAgentJobDeliveryStore 
     let entry = this.#requireEntry(header.scope);
     assertAttachment(entry, header.channelId, header.channelGeneration);
     this.#assertIoDeadline(context);
-    const owned = ownOutboundPacket(header.packet, header.channelId);
+    let owned: OwnedHttpSubAgentOutboundPacket;
+    try {
+      owned = ownHttpSubAgentOutboundPacket(header.packet, header.channelId);
+    } catch (error) {
+      if (error instanceof HttpSubAgentOutboundPacketChannelMismatchError) {
+        throw new HttpSubAgentJobStoreError('attachment_fenced');
+      }
+      throw error;
+    }
     this.#assertIoDeadline(context);
     const normalized = Object.freeze({
       scope: header.scope,
@@ -1098,13 +1099,6 @@ interface NormalizedWaitForOutboundInput {
   readonly waitMs: number;
 }
 
-interface OwnedOutboundPacket {
-  readonly envelope: SubAgentTransportRpcEnvelope;
-  readonly packet: SubAgentTransportPeerPacket;
-  readonly packetReceipt: string;
-  readonly retainedBytes: number;
-}
-
 interface NormalizedCreateInput {
   readonly principalId: string;
   readonly jobId: string;
@@ -1224,108 +1218,6 @@ function normalizeScopeFields(record: Record<string, unknown>): HttpSubAgentJobS
     ownerSessionId: requireBoundedIdentifier(record.ownerSessionId, 'HTTP job ownerSessionId'),
     jobId: requireOpaqueJobId(record.jobId, 'HTTP job jobId'),
   });
-}
-
-function ownOutboundPacket(value: unknown, expectedChannelId: string): OwnedOutboundPacket {
-  const record = requireClosedDataRecord(value, PEER_PACKET_KEYS, 'HTTP outbound Peer packet');
-  const frame = ownOutboundFrame(record.frame);
-  const envelope = decodeSubAgentTransportRpcFrame(frame, {
-    maxFrameBytes: DEFAULT_SUBAGENT_TRANSPORT_MAX_FRAME_BYTES,
-  });
-  assertOutboundRpcKind(envelope);
-  if (envelope.channelId !== expectedChannelId) {
-    throw new HttpSubAgentJobStoreError('attachment_fenced');
-  }
-  const canonicalFrame = encodeSubAgentTransportRpcFrame(envelope, {
-    maxFrameBytes: DEFAULT_SUBAGENT_TRANSPORT_MAX_FRAME_BYTES,
-  });
-  const sidecars = ownOutboundSidecars(record.sidecars);
-  const packet = Object.freeze({
-    frame: canonicalFrame,
-    sidecars,
-  }) satisfies SubAgentTransportPeerPacket;
-  const descriptors = [...sidecars.map((sidecar) => sidecar.descriptor)].sort(
-    compareDeliverySidecarDescriptors,
-  );
-  const packetReceipt = canonicalJsonSha256({
-    version: HTTP_SUBAGENT_JOB_DELIVERY_VERSION,
-    rpc: envelope,
-    sidecarDescriptorsSortedBySidecarId: descriptors,
-  } as unknown as JsonValue);
-  return Object.freeze({
-    envelope,
-    packet,
-    packetReceipt,
-    retainedBytes: packetRetainedBytes(packet),
-  });
-}
-
-function ownOutboundFrame(value: unknown): string | Uint8Array {
-  if (typeof value === 'string') return value;
-  if (nodeTypes.isProxy(value) || !nodeTypes.isUint8Array(value)) {
-    throw new TypeError('HTTP outbound Peer packet frame must be a string or Uint8Array.');
-  }
-  return copyHttpBytes(
-    value,
-    'HTTP outbound Peer packet frame',
-    DEFAULT_SUBAGENT_TRANSPORT_MAX_FRAME_BYTES,
-  );
-}
-
-function ownOutboundSidecars(value: unknown): readonly SubAgentTransportArtifactSidecar[] {
-  const candidates = requireDenseDataArray(value, 'HTTP outbound Peer packet sidecars');
-  if (candidates.length > DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECARS) {
-    throw new RangeError('HTTP outbound Peer packet exceeds the default sidecar count.');
-  }
-  const sidecars: SubAgentTransportArtifactSidecar[] = [];
-  const sidecarIds = new Set<string>();
-  let totalBytes = 0;
-  for (let index = 0; index < candidates.length; index += 1) {
-    const candidate = requireClosedDataRecord(
-      candidates[index],
-      SIDECAR_KEYS,
-      `HTTP outbound Peer packet sidecar ${index}`,
-    );
-    const sidecar = decodeSubAgentTransportArtifactSidecar(
-      candidate.descriptor,
-      candidate.data as Uint8Array | ArrayBuffer,
-      { maxBytes: DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_ITEM_BYTES },
-    );
-    if (sidecarIds.has(sidecar.descriptor.sidecarId)) {
-      throw new TypeError('HTTP outbound Peer packet contains duplicate sidecar IDs.');
-    }
-    if (sidecar.data.byteLength > DEFAULT_SUBAGENT_TRANSPORT_PEER_MAX_SIDECAR_BYTES - totalBytes) {
-      throw new RangeError('HTTP outbound Peer packet exceeds the aggregate sidecar limit.');
-    }
-    sidecarIds.add(sidecar.descriptor.sidecarId);
-    totalBytes += sidecar.data.byteLength;
-    sidecars.push(sidecar);
-  }
-  return Object.freeze(sidecars);
-}
-
-function compareDeliverySidecarDescriptors(
-  left: SubAgentTransportArtifactSidecarDescriptor,
-  right: SubAgentTransportArtifactSidecarDescriptor,
-): number {
-  return left.sidecarId < right.sidecarId ? -1 : left.sidecarId > right.sidecarId ? 1 : 0;
-}
-
-function assertOutboundRpcKind(envelope: SubAgentTransportRpcEnvelope): void {
-  switch (envelope.kind) {
-    case 'executor.accepted':
-    case 'executor.settled':
-    case 'cancel.ack':
-    case 'snapshot.reply':
-    case 'events.page':
-    case 'control.request':
-    case 'model.request':
-    case 'events.request':
-    case 'protocol.error':
-      return;
-    default:
-      throw new TypeError('HTTP outbound Peer packet RPC kind is not target-to-controller.');
-  }
 }
 
 function normalizeCreateInput(input: HttpSubAgentJobCreateInput): NormalizedCreateInput {
@@ -1666,32 +1558,6 @@ function principalOwnerTaskKey(input: {
     ownerSessionId: input.identity.ownerSessionId,
     taskId: input.identity.taskId,
   });
-}
-
-function packetRetainedBytes(packet: SubAgentTransportPeerPacket): number {
-  let total =
-    typeof packet.frame === 'string'
-      ? TEXT_ENCODER.encode(packet.frame).byteLength
-      : packet.frame.byteLength;
-  for (const sidecar of packet.sidecars) {
-    const descriptorBytes = TEXT_ENCODER.encode(
-      canonicalizeJson(sidecar.descriptor as unknown as JsonValue),
-    ).byteLength;
-    total = addRetainedBytes(total, descriptorBytes);
-    total = addRetainedBytes(total, sidecar.data.byteLength);
-  }
-  return total;
-}
-
-function addRetainedBytes(total: number, increment: number): number {
-  if (
-    !Number.isSafeInteger(increment) ||
-    increment < 0 ||
-    total > Number.MAX_SAFE_INTEGER - increment
-  ) {
-    throw new RangeError('HTTP job retained byte count exceeds safe integer range.');
-  }
-  return total + increment;
 }
 
 function requireBoundedIdentifier(value: unknown, label: string): string {
