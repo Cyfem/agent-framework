@@ -657,11 +657,16 @@ processExecutorNamespace.processFailpointForTest;
   if (packageName === '@ruixutong.manee/maneeagent-executor-http') {
     return `import * as httpExecutorNamespace from '${packageName}';
 import {
+  DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_CAPACITY,
+  DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_RECEIPT_CAPACITY,
   DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY,
+  DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_DELIVERY_RETAINED_BYTES,
   DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES,
+  DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_WAITER_CAPACITY,
   HTTP_SUBAGENT_AUTH_VERSION,
   HTTP_SUBAGENT_HMAC_SCHEME,
   HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION,
+  HTTP_SUBAGENT_JOB_DELIVERY_VERSION,
   HTTP_SUBAGENT_JOB_RECORD_VERSION,
   HTTP_SUBAGENT_MAX_POLL_BODY_BYTES,
   HTTP_SUBAGENT_MAX_POLL_WAIT_MS,
@@ -684,6 +689,7 @@ import {
   decodeHttpSubAgentRoutedPacket,
   encodeHttpSubAgentMultipartPacket,
   encodeHttpSubAgentPollCommand,
+  normalizeHttpSubAgentJobDeliveryState,
   normalizeHttpSubAgentJobRecord,
   parseHttpSubAgentRoute,
   type AdmitHttpSubAgentPacketOptions,
@@ -695,11 +701,21 @@ import {
   type HttpSubAgentJobCreateIdentityInput,
   type HttpSubAgentJobCreateInput,
   type HttpSubAgentJobCreateResult,
+  type HttpSubAgentJobDeliveryStateV1,
+  type HttpSubAgentJobDeliveryStore,
+  type HttpSubAgentJobEnqueueOutboundInput,
+  type HttpSubAgentJobEnqueueOutboundResult,
+  type HttpSubAgentJobOutboundDeliveryV1,
+  type HttpSubAgentJobPollOutboundInput,
+  type HttpSubAgentJobPollOutboundResult,
   type HttpSubAgentJobRecordV1,
   type HttpSubAgentJobScope,
   type HttpSubAgentJobStore,
   type HttpSubAgentJobStoreErrorCategory,
+  type HttpSubAgentJobStoreIoContext,
   type HttpSubAgentJobStoreMode,
+  type HttpSubAgentJobWaitForOutboundInput,
+  type HttpSubAgentJobWaitForOutboundResult,
   type HttpSubAgentMultipartLimits,
   type HttpSubAgentEncodedPollCommand,
   type HttpSubAgentPacketSemanticReceiptInput,
@@ -733,6 +749,7 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<typeof decodeHttpSubAgentRoutedPacket>>,
   AssertFalse<IsAny<typeof encodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof encodeHttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<typeof normalizeHttpSubAgentJobDeliveryState>>,
   AssertFalse<IsAny<typeof normalizeHttpSubAgentJobRecord>>,
   AssertFalse<IsAny<typeof parseHttpSubAgentRoute>>,
   AssertFalse<IsAny<AdmitHttpSubAgentPacketOptions>>,
@@ -744,11 +761,21 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<HttpSubAgentJobCreateIdentityInput>>,
   AssertFalse<IsAny<HttpSubAgentJobCreateInput>>,
   AssertFalse<IsAny<HttpSubAgentJobCreateResult>>,
+  AssertFalse<IsAny<HttpSubAgentJobDeliveryStateV1>>,
+  AssertFalse<IsAny<HttpSubAgentJobDeliveryStore>>,
+  AssertFalse<IsAny<HttpSubAgentJobEnqueueOutboundInput>>,
+  AssertFalse<IsAny<HttpSubAgentJobEnqueueOutboundResult>>,
+  AssertFalse<IsAny<HttpSubAgentJobOutboundDeliveryV1>>,
+  AssertFalse<IsAny<HttpSubAgentJobPollOutboundInput>>,
+  AssertFalse<IsAny<HttpSubAgentJobPollOutboundResult>>,
   AssertFalse<IsAny<HttpSubAgentJobRecordV1>>,
   AssertFalse<IsAny<HttpSubAgentJobScope>>,
   AssertFalse<IsAny<HttpSubAgentJobStore>>,
   AssertFalse<IsAny<HttpSubAgentJobStoreErrorCategory>>,
+  AssertFalse<IsAny<HttpSubAgentJobStoreIoContext>>,
   AssertFalse<IsAny<HttpSubAgentJobStoreMode>>,
+  AssertFalse<IsAny<HttpSubAgentJobWaitForOutboundInput>>,
+  AssertFalse<IsAny<HttpSubAgentJobWaitForOutboundResult>>,
   AssertFalse<IsAny<HttpSubAgentMultipartLimits>>,
   AssertFalse<IsAny<HttpSubAgentEncodedPollCommand>>,
   AssertFalse<IsAny<HttpSubAgentPacketSemanticReceiptInput>>,
@@ -769,9 +796,14 @@ type HttpContractAssertions = [
   AssertTrue<Equal<typeof HTTP_SUBAGENT_MAX_POLL_BODY_BYTES, 4096>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_MAX_POLL_WAIT_MS, 10000>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_JOB_RECORD_VERSION, '1'>>,
+  AssertTrue<Equal<typeof HTTP_SUBAGENT_JOB_DELIVERY_VERSION, '1'>>,
   AssertTrue<Equal<typeof HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION, '0'>>,
+  AssertTrue<Equal<typeof DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_CAPACITY, 10000>>,
+  AssertTrue<Equal<typeof DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_RECEIPT_CAPACITY, 100000>>,
   AssertTrue<Equal<typeof DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY, 10000>>,
+  AssertTrue<Equal<typeof DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_DELIVERY_RETAINED_BYTES, 268435456>>,
   AssertTrue<Equal<typeof DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES, 268435456>>,
+  AssertTrue<Equal<typeof DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_WAITER_CAPACITY, 1000>>,
 ];
 
 const publicValues = [
@@ -790,6 +822,7 @@ const publicValues = [
   decodeHttpSubAgentRoutedPacket,
   encodeHttpSubAgentMultipartPacket,
   encodeHttpSubAgentPollCommand,
+  normalizeHttpSubAgentJobDeliveryState,
   normalizeHttpSubAgentJobRecord,
   parseHttpSubAgentRoute,
 ] as const;
@@ -1079,6 +1112,7 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<typeof httpExecutor.decodeHttpSubAgentRoutedPacket>>,
   AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentMultipartPacket>>,
   AssertFalse<IsAny<typeof httpExecutor.encodeHttpSubAgentPollCommand>>,
+  AssertFalse<IsAny<typeof httpExecutor.normalizeHttpSubAgentJobDeliveryState>>,
   AssertFalse<IsAny<typeof httpExecutor.normalizeHttpSubAgentJobRecord>>,
   AssertFalse<IsAny<typeof httpExecutor.parseHttpSubAgentRoute>>,
   AssertFalse<IsAny<httpExecutor.AdmitHttpSubAgentPacketOptions>>,
@@ -1090,11 +1124,21 @@ type HttpContractAssertions = [
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobCreateIdentityInput>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobCreateInput>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobCreateResult>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobDeliveryStateV1>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobDeliveryStore>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobEnqueueOutboundInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobEnqueueOutboundResult>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobOutboundDeliveryV1>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobPollOutboundInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobPollOutboundResult>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobRecordV1>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobScope>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobStore>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobStoreErrorCategory>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobStoreIoContext>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentJobStoreMode>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobWaitForOutboundInput>>,
+  AssertFalse<IsAny<httpExecutor.HttpSubAgentJobWaitForOutboundResult>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentMultipartLimits>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentEncodedPollCommand>>,
   AssertFalse<IsAny<httpExecutor.HttpSubAgentPacketSemanticReceiptInput>>,
@@ -1115,9 +1159,14 @@ type HttpContractAssertions = [
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_MAX_POLL_BODY_BYTES, 4096>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_MAX_POLL_WAIT_MS, 10000>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_JOB_RECORD_VERSION, '1'>>,
+  AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_JOB_DELIVERY_VERSION, '1'>>,
   AssertTrue<Equal<typeof httpExecutor.HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION, '0'>>,
+  AssertTrue<Equal<typeof httpExecutor.DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_CAPACITY, 10000>>,
+  AssertTrue<Equal<typeof httpExecutor.DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_RECEIPT_CAPACITY, 100000>>,
   AssertTrue<Equal<typeof httpExecutor.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY, 10000>>,
+  AssertTrue<Equal<typeof httpExecutor.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_DELIVERY_RETAINED_BYTES, 268435456>>,
   AssertTrue<Equal<typeof httpExecutor.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES, 268435456>>,
+  AssertTrue<Equal<typeof httpExecutor.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_WAITER_CAPACITY, 1000>>,
 ];
 
 const publicValues = [
@@ -1136,6 +1185,7 @@ const publicValues = [
   httpExecutor.decodeHttpSubAgentRoutedPacket,
   httpExecutor.encodeHttpSubAgentMultipartPacket,
   httpExecutor.encodeHttpSubAgentPollCommand,
+  httpExecutor.normalizeHttpSubAgentJobDeliveryState,
   httpExecutor.normalizeHttpSubAgentJobRecord,
   httpExecutor.parseHttpSubAgentRoute,
 ] as const;
@@ -1331,6 +1381,7 @@ for (const name of [
       `[packageApi.decodeHttpSubAgentRoutedPacket, 'decodeHttpSubAgentRoutedPacket', 'function']`,
       `[packageApi.encodeHttpSubAgentMultipartPacket, 'encodeHttpSubAgentMultipartPacket', 'function']`,
       `[packageApi.encodeHttpSubAgentPollCommand, 'encodeHttpSubAgentPollCommand', 'function']`,
+      `[packageApi.normalizeHttpSubAgentJobDeliveryState, 'normalizeHttpSubAgentJobDeliveryState', 'function']`,
       `[packageApi.normalizeHttpSubAgentJobRecord, 'normalizeHttpSubAgentJobRecord', 'function']`,
       `[packageApi.parseHttpSubAgentRoute, 'parseHttpSubAgentRoute', 'function']`,
     );
@@ -1341,13 +1392,18 @@ function expectType([value, name, expected]) {
 for (const check of [${checks.join(', ')}]) expectType(check);
 const expectedHttpRuntimeExports = ${JSON.stringify(
       [
+        'DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_CAPACITY',
+        'DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_RECEIPT_CAPACITY',
         'DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY',
+        'DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_DELIVERY_RETAINED_BYTES',
         'DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES',
+        'DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_WAITER_CAPACITY',
         'HTTP_SUBAGENT_AUTH_HEADER_NAMES',
         'HTTP_SUBAGENT_AUTH_VERSION',
         'HTTP_SUBAGENT_DEFAULT_CLOCK_SKEW_MS',
         'HTTP_SUBAGENT_HMAC_SCHEME',
         'HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION',
+        'HTTP_SUBAGENT_JOB_DELIVERY_VERSION',
         'HTTP_SUBAGENT_JOB_RECORD_VERSION',
         'HTTP_SUBAGENT_MAX_MULTIPART_BODY_BYTES',
         'HTTP_SUBAGENT_MAX_PACKET_JSON_BYTES',
@@ -1374,6 +1430,7 @@ const expectedHttpRuntimeExports = ${JSON.stringify(
         'decodeHttpSubAgentRoutedPacket',
         'encodeHttpSubAgentMultipartPacket',
         'encodeHttpSubAgentPollCommand',
+        'normalizeHttpSubAgentJobDeliveryState',
         'normalizeHttpSubAgentJobRecord',
         'parseHttpSubAgentRoute',
       ].sort(),
@@ -1385,14 +1442,19 @@ if (
   packageApi.HTTP_SUBAGENT_PACKET_VERSION !== '1' ||
   packageApi.HTTP_SUBAGENT_AUTH_VERSION !== '1' ||
   packageApi.HTTP_SUBAGENT_POLL_VERSION !== '1' ||
+  packageApi.HTTP_SUBAGENT_JOB_DELIVERY_VERSION !== '1' ||
   packageApi.HTTP_SUBAGENT_JOB_RECORD_VERSION !== '1' ||
   packageApi.HTTP_SUBAGENT_INITIAL_CHANNEL_GENERATION !== '0'
 ) {
-  throw new Error('${packageName} HTTP packet, auth, poll and job record constants are invalid');
+  throw new Error('${packageName} HTTP packet, auth, poll and job constants are invalid');
 }
 if (
+  packageApi.DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_CAPACITY !== 10000 ||
+  packageApi.DEFAULT_MEMORY_HTTP_SUBAGENT_DELIVERY_RECEIPT_CAPACITY !== 100000 ||
   packageApi.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_CAPACITY !== 10000 ||
-  packageApi.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES !== 268435456
+  packageApi.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_DELIVERY_RETAINED_BYTES !== 268435456 ||
+  packageApi.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_MAX_RETAINED_BYTES !== 268435456 ||
+  packageApi.DEFAULT_MEMORY_HTTP_SUBAGENT_JOB_WAITER_CAPACITY !== 1000
 ) {
   throw new Error('${packageName} Memory HTTP job Store defaults are invalid');
 }

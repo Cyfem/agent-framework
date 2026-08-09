@@ -2336,6 +2336,17 @@
           }
         },
         {
+          "caseId": "C7C-HTTP-STORE04.l2.delivery-enqueue-cursor",
+          "variant": "message-receipt-monotonic-uint64",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-delivery-store.test.ts",
+            "testName": "[acceptance:C7C-HTTP-STORE04.l2.delivery-enqueue-cursor][variant:message-receipt-monotonic-uint64]"
+          }
+        },
+        {
           "caseId": "C7C-HTTP-STORE05.l1.owned-frozen-scope",
           "variant": "full-scope-and-authorization-resolution",
           "phase": "phase-2",
@@ -2355,6 +2366,17 @@
             "type": "vitest",
             "file": "packages/executor-http/test/http-job-store.test.ts",
             "testName": "[acceptance:C7C-HTTP-STORE06.l2.bounded-memory-retention][variant:count-bytes-no-lru-and-dispose]"
+          }
+        },
+        {
+          "caseId": "C7C-HTTP-STORE07.l2.waiter-lifecycle",
+          "variant": "lost-wake-abort-deadline-dispose",
+          "phase": "phase-2",
+          "layer": "L2",
+          "evidenceSource": {
+            "type": "vitest",
+            "file": "packages/executor-http/test/http-job-delivery-store.test.ts",
+            "testName": "[acceptance:C7C-HTTP-STORE07.l2.waiter-lifecycle][variant:lost-wake-abort-deadline-dispose]"
           }
         },
         {
